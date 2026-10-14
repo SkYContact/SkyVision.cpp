@@ -173,82 +173,6 @@ static std::vector<std::array<float,4>> md_detect(Engine & e, VisionModel & vm, 
     return boxes;
 }
 
-// ---- embedded UI ----
-static const char * MD_UI_HTML =
-R"HTML(<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>moondream.cpp</title>
-<style>
- body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;display:flex;justify-content:center}
- #app{width:100%;max-width:760px;padding:16px;display:flex;flex-direction:column;height:100vh;box-sizing:border-box}
- h1{font-size:18px;font-weight:600;color:#9fc3ff;margin:4px 0 12px}
- #log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:4px}
- .msg{padding:10px 14px;border-radius:10px;max-width:85%;white-space:pre-wrap;line-height:1.5}
- .user{align-self:flex-end;background:#2b4a7a}
- .bot{align-self:flex-start;background:#1d222c}
- #imgbox{position:relative;align-self:flex-start;max-width:340px;margin-bottom:4px;display:none}
- #imgbox img,#imgbox canvas{max-width:340px;border-radius:8px;display:block}
- #imgbox canvas{position:absolute;inset:0;width:100%;height:100%}
- #bar{display:flex;gap:8px;padding-top:10px}
- #bar.busy input,#bar.busy button{opacity:.4;pointer-events:none}
- input[type=text]{flex:1;background:#1a1f28;border:1px solid #2c3442;color:#e6e6e6;border-radius:8px;padding:10px 12px;font-size:14px}
- button{background:#2b4a7a;color:#fff;border:0;border-radius:8px;padding:10px 14px;cursor:pointer;font-size:14px}
- button.sec{background:#333b48}
- #file{display:none}
- .hint{font-size:11px;color:#667;margin:2px 0 6px}
-</style></head><body><div id="app">
-<h1>moondream.cpp &mdash; local VLM</h1>
-<div id="log"></div>
-<div id="imgbox"><img id="img"><canvas id="cv"></canvas></div>
-<div class="hint" id="hint">text chat; attach an image for vision QA; then type e.g. "detect: red car" for boxes</div>
-<div id="bar">
- <input type="text" id="q" placeholder="ask anything (with image: ask about it, or detect: &lt;object&gt;)" autocomplete="off">
- <button class="sec" onclick="document.getElementById('file').click()">img</button>
- <button onclick="send()">send</button>
- <input type="file" id="file" accept="image/*">
-</div></div>
-<script>
-let imgBytes=null, imgW=0, imgH=0;
-const log=document.getElementById('log'), bar=document.getElementById('bar');
-function add(t,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=t;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-document.getElementById('file').onchange=e=>{
-  const f=e.target.files[0]; if(!f)return;
-  imgBytes=f; const url=URL.createObjectURL(f);
-  const im=document.getElementById('img'); im.onload=()=>{imgW=im.naturalWidth;imgH=im.naturalHeight;};
-  im.src=url; document.getElementById('imgbox').style.display='block';
-  document.getElementById('cv').getContext('2d').clearRect(0,0,9999,9999);
-  add('(image attached: '+f.name+')','user');
-};
-async function send(){
-  const inp=document.getElementById('q'); const t=inp.value.trim(); if(!t)return;
-  inp.value=''; add(t,'user');
-  const det=imgBytes&&t.toLowerCase().startsWith('detect:');
-  const d=add('...','bot'); bar.classList.add('busy');
-  try{
-    if(det){
-      const obj=t.slice(7).trim();
-      const r=await fetch('/api/vision?q='+encodeURIComponent(obj)+'&mode=detect',{method:'POST',body:imgBytes});
-      const j=await r.json(); drawBoxes(j.boxes||[]);
-      d.textContent=(j.boxes&&j.boxes.length?j.boxes.length+' object(s) — boxes drawn on the image':'no objects found');
-    }else if(imgBytes){
-      const r=await fetch('/api/vision?q='+encodeURIComponent(t)+'&mode=ask',{method:'POST',body:imgBytes});
-      const j=await r.json(); d.textContent=j.text||'(no answer)';
-    }else{
-      const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({prompt:t,n:200})});
-      const j=await r.json(); d.textContent=j.text||'';
-    }
-  }catch(err){d.textContent='error: '+err;}
-  bar.classList.remove('busy'); log.scrollTop=log.scrollHeight;
-}
-function drawBoxes(boxes){
-  const im=document.getElementById('img'), cv=document.getElementById('cv');
-  cv.width=im.naturalWidth; cv.height=im.naturalHeight;
-  const c=cv.getContext('2d'); c.lineWidth=Math.max(2,im.naturalWidth/240); c.strokeStyle='#38ff9c'; c.font='14px sans-serif';
-  boxes.forEach(b=>{ c.strokeRect(b[0]*cv.width,b[1]*cv.height,(b[2]-b[0])*cv.width,(b[3]-b[1])*cv.height); });
-}
-document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
-</script></body></html>)HTML";
-
 // ---- minimal HTTP server ----
 struct MdHttpReq {
     std::string method, path, query, body;
@@ -359,7 +283,20 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
         if (!md_recv_all(c, req)) { closesocket(c); continue; }
 
         if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
-            md_send(c, "200 OK", "text/html; charset=utf-8", MD_UI_HTML);
+            static std::string ui_html;   // read once from web/index.html next to the exe
+            if (ui_html.empty()) {
+                FILE * f = fopen("web/index.html", "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                    ui_html.resize(sz);
+                    if (fread(ui_html.data(), 1, sz, f) != (size_t)sz) ui_html.clear();
+                    fclose(f);
+                }
+            }
+            if (ui_html.empty())
+                md_send(c, "404 Not Found", "text/plain", "web/index.html not found (run from the repo root)");
+            else
+                md_send(c, "200 OK", "text/html; charset=utf-8", ui_html);
         } else if (req.method == "POST" && req.path == "/api/ask") {
             std::string prompt = md_json_field(req.body, "prompt");
             long n = md_json_int(req.body, "n", 200);
@@ -375,8 +312,8 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
         } else if (req.method == "POST" && req.path == "/api/vision") {
             std::string q = md_query_param(req.query, "q");
             std::string mode = md_query_param(req.query, "mode");
-            if (req.body.size() < 64 || q.empty()) {
-                md_send(c, "400 Bad Request", "application/json", "{\"error\":\"need image body and ?q=\"}");
+            if (req.body.size() < 64 || (q.empty() && mode != "caption")) {
+                md_send(c, "400 Bad Request", "application/json", "{\"error\":\"need image body and ?q= (mode=caption needs no q)\"}");
                 continue;
             }
             e.reset();   // one conversation per request (no cross-request memory)
@@ -388,7 +325,24 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
             unsigned char * rgb = stbi_load_from_memory((const unsigned char *)req.body.data(),
                                                         (int)req.body.size(), &iw, &ih, &ic, 3);
             if (!rgb) { md_send(c, "400 Bad Request", "application/json", "{\"error\":\"image decode failed\"}"); closesocket(c); continue; }
-            if (mode == "detect") {
+            if (mode == "caption") {
+                // official caption templates: [1, 32708, 2, <12492|6382|4059>, 3]
+                std::string len = md_query_param(req.query, "len");
+                int t4 = len == "short" ? 12492 : (len == "long" ? 4059 : 6382);
+                std::vector<float> pfx;
+                md_prefill_image(e, vm, rgb, iw, ih, pfx);
+                std::vector<int> ctoks = { 1, 32708, 2, t4, 3 };
+                std::vector<int> out;
+                int cur = e.step(ctoks, nullptr);
+                out.push_back(cur);
+                for (int i = 1; i < 256; i++) {
+                    cur = e.step({ cur }, nullptr);
+                    if (cur == 0) break;
+                    out.push_back(cur);
+                }
+                std::string cap = e.tok.decode(out);
+                md_send(c, "200 OK", "application/json", "{\"text\":\"" + md_json_escape(cap) + "\"}");
+            } else if (mode == "detect") {
                 if (!rm_loaded) { rm.load(region_path); rm_loaded = true; }
                 auto boxes = md_detect(e, vm, rm, rgb, iw, ih, q);
                 std::string j = "{\"boxes\":[";
