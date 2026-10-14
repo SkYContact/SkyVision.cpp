@@ -208,6 +208,82 @@ static std::vector<std::array<float,4>> md_detect(Engine & e, VisionModel & vm, 
     return boxes;
 }
 
+// rows of the token embedding table -> raw f32 embeddings (f16 table)
+static void md_tok_embs(Engine & e, const std::vector<int> & toks, std::vector<float> & out) {
+    const int D = e.model.n_embd;
+    out.resize(toks.size() * D);
+    std::vector<ggml_fp16_t> row(D);
+    for (size_t i = 0; i < toks.size(); i++) {
+        ggml_backend_tensor_get(e.model.tok_embd, row.data(),
+                                (size_t)toks[i] * D * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t) * D);
+        for (int d = 0; d < D; d++) out[i * D + d] = ggml_fp16_to_fp32(row[d]);
+    }
+}
+
+// official point skill: template [1,2581,2] + " <obj>" + [3], no size, N points
+static std::vector<std::array<float,2>> md_point(Engine & e, VisionModel & vm, RegionModel & rm,
+                                                 const uint8_t * rgb, int w, int h,
+                                                 const std::string & obj) {
+    md_ensure_img_prefill(e, vm, rgb, w, h);
+    std::vector<int> dtoks = { 1, 2581, 2 };
+    std::string o = " " + obj;
+    auto oq = e.tok.encode(o);
+    dtoks.insert(dtoks.end(), oq.begin(), oq.end());
+    dtoks.push_back(3);
+    const int D = e.model.n_embd;
+    std::vector<float> hidden(D), emb(D), lv(e.model.n_vocab);
+    int next = e.step(dtoks, lv.data(), nullptr, 0, hidden.data(), false);
+    next = (lv[0] >= lv[5]) ? 0 : 5;
+    std::vector<std::array<float,2>> pts;
+    while (next != 0 && pts.size() < 20) {
+        float xl[1024];
+        rm.decode_coordinate(hidden.data(), xl);
+        float xc = RegionModel::logits_to_center(xl, 1024);
+        rm.encode_coordinate(&xc, 1, emb.data());
+        e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
+        rm.decode_coordinate(hidden.data(), xl);
+        float yc = RegionModel::logits_to_center(xl, 1024);
+        rm.encode_coordinate(&yc, 1, emb.data());
+        e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
+        pts.push_back({{ xc, yc }});
+        e.step({}, lv.data(), emb.data(), 1, nullptr, false);
+        next = (lv[0] >= lv[5]) ? 0 : 5;
+    }
+    return pts;
+}
+
+// official detect_gaze skill: embedding-level prompt
+//   emb("\n\nPoint:") + enc(x) + enc(y) + emb(" gaze\n\n")
+// then eos -> none, else one predicted (x,y) fixation point
+static bool md_gaze(Engine & e, VisionModel & vm, RegionModel & rm,
+                    const uint8_t * rgb, int w, int h, float sx, float sy,
+                    float & gx, float & gy) {
+    md_ensure_img_prefill(e, vm, rgb, w, h);
+    const int D = e.model.n_embd;
+    std::vector<float> a, b;
+    md_tok_embs(e, e.tok.encode("\n\nPoint:"), a);
+    md_tok_embs(e, e.tok.encode(" gaze\n\n"), b);
+    std::vector<float> xemb(D), yemb(D);   // encode_coordinate projects into model dim (2048)
+    rm.encode_coordinate(&sx, 1, xemb.data());
+    rm.encode_coordinate(&sy, 1, yemb.data());
+    std::vector<float> prompt(a);
+    prompt.insert(prompt.end(), xemb.begin(), xemb.end());
+    prompt.insert(prompt.end(), yemb.begin(), yemb.end());
+    prompt.insert(prompt.end(), b.begin(), b.end());
+    std::vector<float> hidden(D), emb(D), lv(e.model.n_vocab);
+    int nt = e.step({}, lv.data(), prompt.data(), (int)(prompt.size() / D), hidden.data(), false);
+    if (nt == 0) return false;   // eos (plain argmax, per official _detect_gaze)
+    // one (x,y) point, include_size=False path
+    float xl[1024];
+    rm.decode_coordinate(hidden.data(), xl);
+    gx = RegionModel::logits_to_center(xl, 1024);
+    rm.encode_coordinate(&gx, 1, emb.data());
+    e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
+    rm.decode_coordinate(hidden.data(), xl);
+    gy = RegionModel::logits_to_center(xl, 1024);
+    return true;
+}
+
 // ---- minimal HTTP server ----
 struct MdHttpReq {
     std::string method, path, query, body;
@@ -276,7 +352,8 @@ static std::string md_query_param(const std::string & q, const char * key) {
     return v;
 }
 
-static int run_server(Engine & e, const char * vision_path, const char * region_path, int port) {
+static int run_server(Engine & e, const char * vision_path, const char * region_path, int port,
+                      const char * bind_host = "127.0.0.1") {
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
@@ -287,7 +364,9 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // local only
+    addr.sin_addr.s_addr = bind_host && strcmp(bind_host, "0.0.0.0") == 0
+        ? htonl(INADDR_ANY)
+        : inet_addr(bind_host ? bind_host : "127.0.0.1");   // default: local only
     addr.sin_port = htons((u_short)port);
     if (bind(srv, (sockaddr *)&addr, sizeof(addr)) != 0) { fprintf(stderr, "bind failed on port %d\n", port); return 1; }
     if (listen(srv, 4) != 0) { fprintf(stderr, "listen failed\n"); return 1; }
@@ -351,7 +430,8 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
         } else if (req.method == "POST" && req.path == "/api/vision") {
             std::string q = md_query_param(req.query, "q");
             std::string mode = md_query_param(req.query, "mode");
-            if (req.body.size() < 64 || (q.empty() && mode != "caption")) {
+            bool need_q = mode == "ask" || mode == "detect" || mode == "point";
+            if (req.body.size() < 64 || (q.empty() && need_q)) {
                 md_send(c, "400 Bad Request", "application/json", "{\"error\":\"need image body and ?q= (mode=caption needs no q)\"}");
                 continue;
             }
@@ -398,6 +478,32 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
                 }
                 j += "]}";
                 md_send(c, "200 OK", "application/json", j);
+            } else if (mode == "point") {
+                if (!rm_loaded) { rm.load(region_path); rm_loaded = true; }
+                auto pts = md_point(e, vm, rm, rgb, iw, ih, q);
+                std::string j = "{\"points\":[";
+                for (size_t i = 0; i < pts.size(); i++) {
+                    char b[64];
+                    snprintf(b, sizeof(b), "[%g,%g]", pts[i][0], pts[i][1]);
+                    if (i) j += ",";
+                    j += b;
+                }
+                j += "]}";
+                md_send(c, "200 OK", "application/json", j);
+            } else if (mode == "gaze") {
+                if (!rm_loaded) { rm.load(region_path); rm_loaded = true; }
+                double sx = atof(md_query_param(req.query, "x").c_str());
+                double sy = atof(md_query_param(req.query, "y").c_str());
+                if (sx < 0 || sx > 1 || sy < 0 || sy > 1) {
+                    md_send(c, "400 Bad Request", "application/json", "{\"error\":\"mode=gaze needs ?x=&y= in [0,1]\"}");
+                } else {
+                    float gx, gy;
+                    bool ok = md_gaze(e, vm, rm, rgb, iw, ih, (float)sx, (float)sy, gx, gy);
+                    char b[96];
+                    if (ok) snprintf(b, sizeof(b), "{\"x\":%g,\"y\":%g}", gx, gy);
+                    else snprintf(b, sizeof(b), "{\"x\":null,\"y\":null}");
+                    md_send(c, "200 OK", "application/json", b);
+                }
             } else {
                 std::string out = md_vqa(e, vm, rgb, iw, ih, q, 200);
                 md_send(c, "200 OK", "application/json", "{\"text\":\"" + md_json_escape(out) + "\"}");

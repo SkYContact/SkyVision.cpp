@@ -961,6 +961,7 @@ int main(int argc, char ** argv) {
     const char * detect_obj = nullptr, * point_obj = nullptr;
     const char * batch_path = nullptr;
     int serve_port = 0;
+    const char * serve_host = "127.0.0.1";
     int n_gen = 32, n_ctx = 1024;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) gguf_path = argv[++i];
@@ -974,8 +975,9 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--point") && i + 1 < argc) point_obj = argv[++i];
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) region_path = argv[++i];
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch_path = argv[++i];
-        else if (!strcmp(argv[i], "--serve") && i + 1 < argc) serve_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--serve") && i + 1 < argc && atoi(argv[i+1]) > 0) serve_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--serve")) serve_port = 8080;
+        else if (!strcmp(argv[i], "--host") && i + 1 < argc) serve_host = argv[++i];
     }
     if (!tok_path) {
         fprintf(stderr, "usage: moondream-cli -m model.gguf -t tokenizer.json [-p prompt] [-n gen] [-c ctx] [-e text]\n");
@@ -1001,7 +1003,7 @@ int main(int argc, char ** argv) {
     if (!e.init(gguf_path, tok_path, n_ctx)) return 1;
 
     if (batch_path) return run_batch(e, batch_path, n_ctx, n_gen);   // moondream_batch.inc
-    if (serve_port > 0) return run_server(e, vision_path, region_path, serve_port);
+    if (serve_port > 0) return run_server(e, vision_path, region_path, serve_port, serve_host);
 
     // optional image: encode with the vision model, prefill [bos; 729 img tokens] as raw
     // embeddings (official: inputs_embeds = cat([bos_emb, img_emb]), prefix attends bidirectionally)

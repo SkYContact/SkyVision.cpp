@@ -68,10 +68,19 @@
      </div>
    </div>
    <div class="card">
-     <h2>目标检测</h2>
+     <h2>目标检测 / 定位</h2>
      <div class="row">
-       <input type="text" id="obj" placeholder="要框出的目标，如 red car" autocomplete="off">
-       <button onclick="detect()">检测</button>
+       <input type="text" id="obj" placeholder="目标，如 red car" autocomplete="off">
+       <button onclick="detect()">框选</button>
+       <button class="sec" onclick="point()">定位</button>
+     </div>
+   </div>
+   <div class="card">
+     <h2>注视点预测</h2>
+     <div class="row">
+       <span id="gaze-pt" style="flex:1;font-size:12px;color:#5b6472;align-self:center">点「选起点」后在图上点击眼睛/人脸</span>
+       <button class="sec" onclick="gazeArm(this)">选起点</button>
+       <button onclick="gaze()">预测注视点</button>
      </div>
    </div>
    <div class="card" style="flex:1">
@@ -112,7 +121,21 @@ function setImage(bytes){
 }
 function layoutCanvas(){cv.width=img.naturalWidth;cv.height=img.naturalHeight;}
 
-stage.onclick=()=>document.getElementById('file').click();
+stage.onclick=e=>{
+ if(gazeArmed&&imgBytes){   // gaze source-point pick mode
+   const ir=img.getBoundingClientRect();
+   const x=(e.clientX-ir.left)/ir.width, y=(e.clientY-ir.top)/ir.height;
+   if(x<0||x>1||y<0||y>1)return;
+   gazeSrc={x,y};
+   gazeArmed=false;
+   document.querySelectorAll('button').forEach(b=>{if(b.textContent.startsWith('选起点'))b.textContent='选起点';});
+   document.getElementById('gaze-pt').textContent=
+     '起点 ('+x.toFixed(3)+', '+y.toFixed(3)+')，点「预测注视点」';
+   clearBoxes();drawGazeMark(x,y,'#9fc3ff');
+   return;
+ }
+ document.getElementById('file').click();
+};
 document.getElementById('file').onchange=e=>{loadImage(e.target.files[0]);e.target.value='';};
 stage.ondragover=e=>{e.preventDefault();stage.classList.add('drag');};
 stage.ondragleave=()=>stage.classList.remove('drag');
@@ -169,6 +192,62 @@ async function detect(){
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')ask();});
 document.getElementById('obj').addEventListener('keydown',e=>{if(e.key==='Enter')detect();});
+
+// ---- point ----
+async function point(){
+ const o=document.getElementById('obj');const t=o.value.trim();if(!t)return;
+ o.value='';
+ if(!needImage()){addResult('定位',t);return;}
+ const d=addResult('定位 · '+t,'…');setBusy(true);setStatus('定位中…',true);clearBoxes();
+ try{
+   const j=await callVision('mode=point&q='+encodeURIComponent(t));
+   const pts=j.points||[];
+   if(pts.length){
+     layoutCanvas();const c=cv.getContext('2d');
+     c.lineWidth=Math.max(2,cv.width/220);c.strokeStyle='#ffd23f';
+     pts.forEach(p=>{
+       const px=p[0]*cv.width,py=p[1]*cv.height,r=Math.max(6,cv.width/80);
+       c.beginPath();c.arc(px,py,r,0,7);c.stroke();
+       c.beginPath();c.moveTo(px-r*1.6,py);c.lineTo(px+r*1.6,py);
+       c.moveTo(px,py-r*1.6);c.lineTo(px,py+r*1.6);c.stroke();
+     });
+     d.textContent='定位到 '+pts.length+' 个「'+t+'」（黄色十字）';
+   }else d.textContent='没有定位到「'+t+'」';
+ }catch(e){d.textContent='错误: '+e.message;d.classList.add('err');}
+ setBusy(false);setStatus('');
+}
+
+// ---- gaze ----
+let gazeSrc=null, gazeArmed=false;
+function gazeArm(btn){
+ gazeArmed=!gazeArmed;
+ btn.textContent=gazeArmed?'选起点 ✓（点图）':'选起点';
+ document.getElementById('gaze-pt').textContent=gazeArmed?'现在在图上点击眼睛/人脸':'点「选起点」后在图上点击眼睛/人脸';
+}
+function drawGazeMark(x,y,color){
+ layoutCanvas();const c=cv.getContext('2d');
+ c.lineWidth=Math.max(2,cv.width/220);c.strokeStyle=color;
+ const px=x*cv.width,py=y*cv.height,r=Math.max(7,cv.width/70);
+ c.beginPath();c.arc(px,py,r,0,7);c.stroke();
+ c.beginPath();c.moveTo(px-r*1.5,py);c.lineTo(px+r*1.5,py);
+ c.moveTo(px,py-r*1.5);c.lineTo(px,py+r*1.5);c.stroke();
+}
+async function gaze(){
+ if(!needImage())return;
+ if(!gazeSrc){addResult('提示','先在图上点击一个起点（眼睛/人脸）',true);return;}
+ const d=addResult('注视 · ('+gazeSrc.x.toFixed(2)+','+gazeSrc.y.toFixed(2)+')','…');
+ setBusy(true);setStatus('预测注视点…',true);clearBoxes();
+ drawGazeMark(gazeSrc.x,gazeSrc.y,'#9fc3ff');
+ try{
+   const j=await callVision('mode=gaze&x='+gazeSrc.x+'&y='+gazeSrc.y);
+   if(j.x==null){d.textContent='该点没有检测到注视（模型返回空）';}
+   else{
+     drawGazeMark(j.x,j.y,'#38ff9c');
+     d.textContent='注视点 ≈ ('+j.x.toFixed(3)+', '+j.y.toFixed(3)+')，绿十字已标出';
+   }
+ }catch(e){d.textContent='错误: '+e.message;d.classList.add('err');}
+ setBusy(false);setStatus('');
+}
 </script>
 </body>
 </html>
