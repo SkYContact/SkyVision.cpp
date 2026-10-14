@@ -115,13 +115,49 @@ static void md_prefill_image(Engine & e, VisionModel & vm, const uint8_t * rgb, 
     e.step({}, nullptr, prefix_emb.data(), 730, nullptr, true);
 }
 
+// ---- cross-request caches ---------------------------------------------------
+// same-image cache: repeating queries on one image (the typical web UI flow)
+// skip both the SigLIP encode AND the 730-token prefill by rewinding n_past
+// to 730 — the KV slots beyond it are simply overwritten by the next prompt.
+// same-question cache: repeated BPE encode of identical question text.
+struct MdReqCache {
+    uint64_t img_key = 0;             // FNV-1a of raw image body
+    std::vector<float> prefix;        // [730, D] bos+img embeddings
+    bool kv_valid = false;            // engine KV currently holds this prefix
+    uint64_t q_key = 0;
+    std::vector<int> q_toks;
+};
+static MdReqCache md_cache;
+
+static uint64_t md_fnv(const std::string & s) {
+    uint64_t h = 1469598103934665603ull;
+    for (char c : s) { h ^= (unsigned char)c; h *= 1099511628211ull; }
+    return h;
+}
+
+// make sure the engine holds THIS image's prefix at KV [0,730); n_past ends at 730
+static void md_ensure_img_prefill(Engine & e, VisionModel & vm, const uint8_t * rgb, int w, int h) {
+    if (md_cache.kv_valid) { e.n_past = 730; return; }       // rewind: reuse KV prefix
+    if (md_cache.prefix.empty()) {
+        md_prefill_image(e, vm, rgb, w, h, md_cache.prefix); // encode + prefill + fill cache
+    } else {
+        e.step({}, nullptr, md_cache.prefix.data(), 730, nullptr, true); // engine was reset, prefix hot
+    }
+    md_cache.kv_valid = true;
+}
+
 static std::string md_vqa(Engine & e, VisionModel & vm, const uint8_t * rgb, int w, int h,
                           const std::string & question, int n_gen) {
-    std::vector<float> prefix;
-    md_prefill_image(e, vm, rgb, w, h, prefix);
+    md_ensure_img_prefill(e, vm, rgb, w, h);
     std::vector<int> toks = { 1, 15381, 2 };
-    auto q = e.tok.encode(question);
-    toks.insert(toks.end(), q.begin(), q.end());
+    uint64_t qk = md_fnv(question);
+    if (qk == md_cache.q_key && !md_cache.q_toks.empty()) {
+        toks.insert(toks.end(), md_cache.q_toks.begin(), md_cache.q_toks.end());
+    } else {
+        md_cache.q_toks = e.tok.encode(question);
+        md_cache.q_key = qk;
+        toks.insert(toks.end(), md_cache.q_toks.begin(), md_cache.q_toks.end());
+    }
     toks.push_back(3);
     std::vector<int> out;
     int cur = e.step(toks, nullptr);
@@ -137,8 +173,7 @@ static std::string md_vqa(Engine & e, VisionModel & vm, const uint8_t * rgb, int
 static std::vector<std::array<float,4>> md_detect(Engine & e, VisionModel & vm, RegionModel & rm,
                                                   const uint8_t * rgb, int w, int h,
                                                   const std::string & obj) {
-    std::vector<float> prefix;
-    md_prefill_image(e, vm, rgb, w, h, prefix);
+    md_ensure_img_prefill(e, vm, rgb, w, h);
     std::vector<int> dtoks = { 1, 7235, 476, 2 };
     std::string o = " " + obj;
     auto oq = e.tok.encode(o);
@@ -303,6 +338,7 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
             if (n < 1) n = 1;
             if (n > 1000) n = 1000;
             e.reset();
+            md_cache.kv_valid = false;   // engine KV wiped -> image prefix must be rebuilt
             if (prompt.empty()) {
                 md_send(c, "400 Bad Request", "application/json", "{\"error\":\"empty prompt\"}");
             } else {
@@ -316,7 +352,13 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
                 md_send(c, "400 Bad Request", "application/json", "{\"error\":\"need image body and ?q= (mode=caption needs no q)\"}");
                 continue;
             }
-            e.reset();   // one conversation per request (no cross-request memory)
+            // image switch detection: same body hash -> reuse embeddings + KV prefix
+            if (md_fnv(req.body) != md_cache.img_key) {
+                e.reset();
+                md_cache.img_key = md_fnv(req.body);
+                md_cache.kv_valid = false;
+                md_cache.prefix.clear();
+            }
             if (!vm_loaded) {
                 if (!vm.load(vision_path, e.backend)) { md_send(c, "500 ERR", "application/json", "{\"error\":\"vision model load failed\"}"); closesocket(c); continue; }
                 vm_loaded = true;
@@ -329,8 +371,7 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
                 // official caption templates: [1, 32708, 2, <12492|6382|4059>, 3]
                 std::string len = md_query_param(req.query, "len");
                 int t4 = len == "short" ? 12492 : (len == "long" ? 4059 : 6382);
-                std::vector<float> pfx;
-                md_prefill_image(e, vm, rgb, iw, ih, pfx);
+                md_ensure_img_prefill(e, vm, rgb, iw, ih);
                 std::vector<int> ctoks = { 1, 32708, 2, t4, 3 };
                 std::vector<int> out;
                 int cur = e.step(ctoks, nullptr);
