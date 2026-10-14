@@ -1025,11 +1025,15 @@ int main(int argc, char ** argv) {
         stbi_image_free(rgb);
         if (crops.empty()) { fprintf(stderr, "prepare_crops failed\n"); return 1; }
         fprintf(stderr, "crops: %d (tiling %dx%d)\n", n_crops, th, tw);
+        double t_prep = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count();
         std::vector<float> enc = vm.encode_crops(crops.data(), n_crops, vm.n_layers, e.backend);
+        double t_enc = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count() - t_prep;
         std::vector<float> img_emb = vm.project(enc.data(), n_crops, th, tw, e.backend);   // [729, 2048]
         if (img_emb.empty()) { fprintf(stderr, "vision encode failed\n"); return 1; }
-        double vsecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count();
-        fprintf(stderr, "vision encoded 729 tokens in %.2fs\n", vsecs);
+        double t_proj = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count() - t_prep - t_enc;
+        fprintf(stderr, "vision: prep %.0fms | encode %.0fms | project %.0fms (total %.2fs)\n",
+                t_prep * 1000, t_enc * 1000, t_proj * 1000,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count());
         // bos embedding = tok_embd row 0
         const int D = e.model.n_embd;
         std::vector<ggml_fp16_t> bos16(D);

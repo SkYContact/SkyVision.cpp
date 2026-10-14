@@ -11,6 +11,8 @@
 //    nb[0]=4, nb[1]=D*4.
 
 #include "moondream_vision.hpp"
+#include <thread>
+#include <atomic>
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -420,19 +422,32 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
     const int D = M.enc_dim, H = M.n_heads, HD = M.head_dim;
     const int T = M.grid * M.grid;
 
-    // patch extraction on host for every crop -> [patch_dim, T, C] column-major
+    // patch extraction on host for every crop -> [patch_dim, T, C] column-major.
+    // ~4M scattered writes for 10 crops — parallel over crops to hide it.
     std::vector<float> patches((size_t)M.patch_dim * T * n_crops);
     const int CS = M.crop;
-    for (int c = 0; c < n_crops; c++) {
-        const float * crop_chw = crops + (size_t)c * M.in_ch * CS * CS;
-        float * pdst = patches.data() + (size_t)c * M.patch_dim * T;
-        for (int ch = 0; ch < M.in_ch; ch++)
-            for (int y = 0; y < CS; y++)
-                for (int x = 0; x < CS; x++) {
-                    int t = (y / M.patch) * M.grid + (x / M.patch);
-                    int f = ch * M.patch * M.patch + (y % M.patch) * M.patch + (x % M.patch);
-                    pdst[(size_t)t * M.patch_dim + f] = crop_chw[(size_t)ch * CS * CS + (size_t)y * CS + x];
+    {
+        int nthreads = std::min(n_crops, (int)std::thread::hardware_concurrency());
+        if (nthreads < 1) nthreads = 1;
+        std::vector<std::thread> pool;
+        std::atomic<int> next_crop{0};
+        for (int th = 0; th < nthreads; th++) {
+            pool.emplace_back([&]() {
+                int c;
+                while ((c = next_crop.fetch_add(1)) < n_crops) {
+                    const float * crop_chw = crops + (size_t)c * M.in_ch * CS * CS;
+                    float * pdst = patches.data() + (size_t)c * M.patch_dim * T;
+                    for (int ch = 0; ch < M.in_ch; ch++)
+                        for (int y = 0; y < CS; y++)
+                            for (int x = 0; x < CS; x++) {
+                                int t = (y / M.patch) * M.grid + (x / M.patch);
+                                int f = ch * M.patch * M.patch + (y % M.patch) * M.patch + (x % M.patch);
+                                pdst[(size_t)t * M.patch_dim + f] = crop_chw[(size_t)ch * CS * CS + (size_t)y * CS + x];
+                            }
                 }
+            });
+        }
+        for (auto & t : pool) t.join();
     }
 
     struct ggml_init_params ip = { 256ull * 1024 * 1024, NULL, /*no_alloc*/ true };
@@ -440,10 +455,29 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
     if (!gctx) return false;
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, 16384, false);
 
-    struct ggml_tensor * x = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, M.patch_dim, T, n_crops);
+    // fp16 activations: MEASURED SLOWER than f32 here (490 vs 429ms/10 crops) —
+    // ggml launches every cast as its own kernel, and cuBLAS already converts
+    // f32 activations in-kernel, so fused-framework wins don't transfer.
+    // Kept behind MD_VISION_F16ACT=1 for experimentation.
+    static int f16act = -1;
+    if (f16act < 0) {
+        const char * e = getenv("MD_VISION_F16ACT");
+        f16act = e ? atoi(e) : 0;
+    }
+    const ggml_type AT = f16act ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    auto to_act = [&](struct ggml_tensor * t) {   // -> activation dtype
+        return t->type == AT ? t : ggml_cast(gctx, t, AT);
+    };
+    auto ln_f32 = [&](struct ggml_tensor * t) {   // layer norm in fp32
+        struct ggml_tensor * f = t->type == GGML_TYPE_F32 ? t : ggml_cast(gctx, t, GGML_TYPE_F32);
+        return f;
+    };
+
+    struct ggml_tensor * x = ggml_new_tensor_3d(gctx, AT, M.patch_dim, T, n_crops);
     ggml_set_name(x, "patches_in");
 
-    x = ggml_mul_mat(gctx, W.patch_emb_w, x);          // [D, T, C]
+    x = ggml_mul_mat(gctx, W.patch_emb_w, x);          // [D, T, C] (f32 out)
+    x = to_act(x);
     x = ggml_add(gctx, x, W.patch_emb_b);
     x = ggml_add(gctx, x, W.pos_emb);                  // [D, T, 1] broadcasts over crops
     ggml_set_name(x, "h_emb");
@@ -451,37 +485,46 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
     for (int il = 0; il < max_layer; il++) {
         VisionLayer & L = W.layers[il];
 
-        struct ggml_tensor * l = ggml_norm(gctx, x, 1e-5f);
-        l = ggml_mul(gctx, l, L.ln1_w);
-        l = ggml_add(gctx, l, L.ln1_b);
+        struct ggml_tensor * l = ggml_norm(gctx, ln_f32(x), 1e-5f);
+        l = ggml_mul(gctx, l, ggml_cast(gctx, L.ln1_w, GGML_TYPE_F32));
+        l = ggml_add(gctx, l, ggml_cast(gctx, L.ln1_b, GGML_TYPE_F32));
+        l = to_act(l);
 
         struct ggml_tensor * qkv = ggml_mul_mat(gctx, L.qkv_w, l);
-        qkv = ggml_add(gctx, qkv, L.qkv_b);             // [3D, T, C]
+        qkv = to_act(qkv);
+        qkv = ggml_add(gctx, qkv, L.qkv_b);            // [3D, T, C]
 
         // q/k/v [HD, T, H, C]: within a token, heads live along ne0 (stride HD),
-        // q/k/v blocks are offsets D*4 apart; crops stride a whole qkv slab (nb[2])
+        // q/k/v blocks are offsets D apart; crops stride a whole qkv slab (nb[2])
+        const size_t ts = ggml_type_size(qkv->type);
         struct ggml_tensor * q4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * sizeof(float), qkv->nb[2], 0);
+                qkv->nb[1], HD * ts, qkv->nb[2], 0);
         struct ggml_tensor * k4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * sizeof(float), qkv->nb[2], (int64_t)H * HD * sizeof(float));
+                qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)H * HD * ts);
         struct ggml_tensor * v4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * sizeof(float), qkv->nb[2], (int64_t)2 * H * HD * sizeof(float));
-        struct ggml_tensor * fa = ggml_flash_attn_ext(gctx, q4, k4, v4, nullptr,
+                qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)2 * H * HD * ts);
+        struct ggml_tensor * fa = ggml_flash_attn_ext(gctx,
+                qkv->type == GGML_TYPE_F32 ? q4 : ggml_cast(gctx, q4, GGML_TYPE_F32),
+                k4, v4, nullptr,
                 1.0f / sqrtf((float)HD), 0.0f, 0.0f);   // [HD, T, H, C]
         // same head-merge layout the single-crop path relies on after reshape_2d
         struct ggml_tensor * attn = ggml_reshape_3d(gctx, fa, D, T, n_crops);
 
-        attn = ggml_mul_mat(gctx, L.attn_out_w, attn);
+        attn = ggml_mul_mat(gctx, L.attn_out_w, to_act(attn));
+        attn = to_act(attn);
         attn = ggml_add(gctx, attn, L.attn_out_b);
         x = ggml_add(gctx, x, attn);
 
-        struct ggml_tensor * l2 = ggml_norm(gctx, x, 1e-5f);
-        l2 = ggml_mul(gctx, l2, L.ln2_w);
-        l2 = ggml_add(gctx, l2, L.ln2_b);
+        struct ggml_tensor * l2 = ggml_norm(gctx, ln_f32(x), 1e-5f);
+        l2 = ggml_mul(gctx, l2, ggml_cast(gctx, L.ln2_w, GGML_TYPE_F32));
+        l2 = ggml_add(gctx, l2, ggml_cast(gctx, L.ln2_b, GGML_TYPE_F32));
+        l2 = to_act(l2);
         struct ggml_tensor * f = ggml_mul_mat(gctx, L.ffn_up_w, l2);
+        f = to_act(f);
         f = ggml_add(gctx, f, L.ffn_up_b);
         f = ggml_gelu(gctx, f);
         f = ggml_mul_mat(gctx, L.ffn_down_w, f);
+        f = to_act(f);
         f = ggml_add(gctx, f, L.ffn_down_b);
         x = ggml_add(gctx, x, f);
 
@@ -489,34 +532,43 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
         ggml_set_name(x, nm);
     }
 
-    if (max_layer == M.n_layers) {
-        x = ggml_norm(gctx, x, 1e-5f);
-        x = ggml_mul(gctx, x, W.post_ln_w);
-        x = ggml_add(gctx, x, W.post_ln_b);
-        ggml_set_name(x, "post_ln");
-    }
+    // final norm chain outputs F32 (norm is f32), so the fetch below is unchanged
+    x = ggml_norm(gctx, ln_f32(x), 1e-5f);
+    x = ggml_mul(gctx, x, ggml_cast(gctx, W.post_ln_w, GGML_TYPE_F32));
+    x = ggml_add(gctx, x, ggml_cast(gctx, W.post_ln_b, GGML_TYPE_F32));
+    ggml_set_name(x, "post_ln");
     ggml_build_forward_expand(gf, x);
 
+    static bool dbg = getenv("MD_VISION_T") != nullptr;
+    auto t_now = [&]() { return std::chrono::steady_clock::now(); };
+    auto t0 = t_now();
     if (!ggml_gallocr_alloc_graph(gallocr, gf)) { fprintf(stderr, "vision graph alloc failed\n"); ggml_free(gctx); return false; }
+    auto t1 = t_now();
 
     struct ggml_tensor * pin = ggml_graph_get_tensor(gf, "patches_in");
-    ggml_backend_tensor_set(pin, patches.data(), 0, sizeof(float) * patches.size());
-
+    if (AT == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> p16(patches.size());
+        for (size_t i = 0; i < patches.size(); i++) p16[i] = ggml_fp32_to_fp16(patches[i]);
+        ggml_backend_tensor_set(pin, p16.data(), 0, ggml_nbytes(pin));
+    } else {
+        ggml_backend_tensor_set(pin, patches.data(), 0, ggml_nbytes(pin));
+    }
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vision graph compute failed\n");
         ggml_free(gctx);
         return false;
     }
+    auto t2 = t_now();
 
-    // x is [D, T, C]; fetch whole buffer, then transpose per crop like the
-    // single-crop path: column-major [D,T] block == token-major [T,D]
-    std::vector<float> tmp(ggml_nelements(x));
-    ggml_backend_tensor_get(x, tmp.data(), 0, ggml_nbytes(x));
-    for (int c = 0; c < n_crops; c++)
-        for (int t = 0; t < T; t++)
-            for (int d = 0; d < D; d++)
-                out_token_major[(size_t)c * T * D + (size_t)t * D + d] =
-                    tmp[((size_t)c * T + t) * D + d];
+    // x is [D, T, C]; fetch whole buffer. The "transpose" index math is an
+    // identity: out[(c*T+t)*D+d] == tmp[(c*T+t)*D+d] — column-major [D,T] per
+    // crop IS token-major [T,D] in memory, so one memcpy replaces the loop.
+    ggml_backend_tensor_get(x, out_token_major, 0, ggml_nbytes(x));
+    if (dbg)
+        fprintf(stderr, "  [chunk %dc] build+alloc %.0fms | compute %.0fms | fetch %.0fms\n", n_crops,
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                std::chrono::duration<double, std::milli>(t_now() - t2).count());
     ggml_free(gctx);
     return true;
 }

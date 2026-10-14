@@ -300,8 +300,11 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
     RegionModel rm;
     bool vm_loaded = vm.load(vision_path, e.backend), rm_loaded = rm.load(region_path);
     if (vm_loaded) {
-        std::vector<float> dummy((size_t)3 * vm.crop * vm.crop, 0.0f);
-        auto w = vm.encode_crops(dummy.data(), 1, /*max_layer*/ 1, e.backend);
+        // full-depth warmup on dummy crops matching the common chunk shape (3):
+        // absorbs the one-time first-graph cost (cuBLAS workspace, CUDA graph
+        // capture) so the first real request doesn't pay it
+        std::vector<float> dummy((size_t)3 * 3 * vm.crop * vm.crop, 0.0f);
+        auto w = vm.encode_crops(dummy.data(), 3, vm.n_layers, e.backend);
         fprintf(stderr, "vision warmup: %zu values\n", w.size());
     }
     if (!vm_loaded) fprintf(stderr, "warning: vision model failed to load, /api/vision disabled\n");
