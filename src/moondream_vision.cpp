@@ -408,6 +408,119 @@ static bool run_encoder_crop(VisionModel & M, ggml_backend_t backend, struct ggm
     return true;
 }
 
+// batched variant: all C crops in ONE graph. Crops are independent, so the crop
+// index rides as batch dim ne[2] (weights broadcast), and flash-attn batches
+// heads and crops together in ne[2]/ne[3]. This amortizes kernel launches and
+// keeps the GPU busy across the whole SigLIP forward instead of C sequential
+// small graphs.
+static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, struct ggml_gallocr * gallocr,
+                                      const float * crops, int n_crops, float * out_token_major,
+                                      int max_layer) {
+    VisionWeights & W = g_w;
+    const int D = M.enc_dim, H = M.n_heads, HD = M.head_dim;
+    const int T = M.grid * M.grid;
+
+    // patch extraction on host for every crop -> [patch_dim, T, C] column-major
+    std::vector<float> patches((size_t)M.patch_dim * T * n_crops);
+    const int CS = M.crop;
+    for (int c = 0; c < n_crops; c++) {
+        const float * crop_chw = crops + (size_t)c * M.in_ch * CS * CS;
+        float * pdst = patches.data() + (size_t)c * M.patch_dim * T;
+        for (int ch = 0; ch < M.in_ch; ch++)
+            for (int y = 0; y < CS; y++)
+                for (int x = 0; x < CS; x++) {
+                    int t = (y / M.patch) * M.grid + (x / M.patch);
+                    int f = ch * M.patch * M.patch + (y % M.patch) * M.patch + (x % M.patch);
+                    pdst[(size_t)t * M.patch_dim + f] = crop_chw[(size_t)ch * CS * CS + (size_t)y * CS + x];
+                }
+    }
+
+    struct ggml_init_params ip = { 256ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    struct ggml_context * gctx = ggml_init(ip);
+    if (!gctx) return false;
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, 16384, false);
+
+    struct ggml_tensor * x = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, M.patch_dim, T, n_crops);
+    ggml_set_name(x, "patches_in");
+
+    x = ggml_mul_mat(gctx, W.patch_emb_w, x);          // [D, T, C]
+    x = ggml_add(gctx, x, W.patch_emb_b);
+    x = ggml_add(gctx, x, W.pos_emb);                  // [D, T, 1] broadcasts over crops
+    ggml_set_name(x, "h_emb");
+
+    for (int il = 0; il < max_layer; il++) {
+        VisionLayer & L = W.layers[il];
+
+        struct ggml_tensor * l = ggml_norm(gctx, x, 1e-5f);
+        l = ggml_mul(gctx, l, L.ln1_w);
+        l = ggml_add(gctx, l, L.ln1_b);
+
+        struct ggml_tensor * qkv = ggml_mul_mat(gctx, L.qkv_w, l);
+        qkv = ggml_add(gctx, qkv, L.qkv_b);             // [3D, T, C]
+
+        // q/k/v [HD, T, H, C]: within a token, heads live along ne0 (stride HD),
+        // q/k/v blocks are offsets D*4 apart; crops stride a whole qkv slab (nb[2])
+        struct ggml_tensor * q4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
+                qkv->nb[1], HD * sizeof(float), qkv->nb[2], 0);
+        struct ggml_tensor * k4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
+                qkv->nb[1], HD * sizeof(float), qkv->nb[2], (int64_t)H * HD * sizeof(float));
+        struct ggml_tensor * v4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
+                qkv->nb[1], HD * sizeof(float), qkv->nb[2], (int64_t)2 * H * HD * sizeof(float));
+        struct ggml_tensor * fa = ggml_flash_attn_ext(gctx, q4, k4, v4, nullptr,
+                1.0f / sqrtf((float)HD), 0.0f, 0.0f);   // [HD, T, H, C]
+        // same head-merge layout the single-crop path relies on after reshape_2d
+        struct ggml_tensor * attn = ggml_reshape_3d(gctx, fa, D, T, n_crops);
+
+        attn = ggml_mul_mat(gctx, L.attn_out_w, attn);
+        attn = ggml_add(gctx, attn, L.attn_out_b);
+        x = ggml_add(gctx, x, attn);
+
+        struct ggml_tensor * l2 = ggml_norm(gctx, x, 1e-5f);
+        l2 = ggml_mul(gctx, l2, L.ln2_w);
+        l2 = ggml_add(gctx, l2, L.ln2_b);
+        struct ggml_tensor * f = ggml_mul_mat(gctx, L.ffn_up_w, l2);
+        f = ggml_add(gctx, f, L.ffn_up_b);
+        f = ggml_gelu(gctx, f);
+        f = ggml_mul_mat(gctx, L.ffn_down_w, f);
+        f = ggml_add(gctx, f, L.ffn_down_b);
+        x = ggml_add(gctx, x, f);
+
+        char nm[32]; snprintf(nm, sizeof(nm), "h_L%d", il);
+        ggml_set_name(x, nm);
+    }
+
+    if (max_layer == M.n_layers) {
+        x = ggml_norm(gctx, x, 1e-5f);
+        x = ggml_mul(gctx, x, W.post_ln_w);
+        x = ggml_add(gctx, x, W.post_ln_b);
+        ggml_set_name(x, "post_ln");
+    }
+    ggml_build_forward_expand(gf, x);
+
+    if (!ggml_gallocr_alloc_graph(gallocr, gf)) { fprintf(stderr, "vision graph alloc failed\n"); ggml_free(gctx); return false; }
+
+    struct ggml_tensor * pin = ggml_graph_get_tensor(gf, "patches_in");
+    ggml_backend_tensor_set(pin, patches.data(), 0, sizeof(float) * patches.size());
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "vision graph compute failed\n");
+        ggml_free(gctx);
+        return false;
+    }
+
+    // x is [D, T, C]; fetch whole buffer, then transpose per crop like the
+    // single-crop path: column-major [D,T] block == token-major [T,D]
+    std::vector<float> tmp(ggml_nelements(x));
+    ggml_backend_tensor_get(x, tmp.data(), 0, ggml_nbytes(x));
+    for (int c = 0; c < n_crops; c++)
+        for (int t = 0; t < T; t++)
+            for (int d = 0; d < D; d++)
+                out_token_major[(size_t)c * T * D + (size_t)t * D + d] =
+                    tmp[((size_t)c * T + t) * D + d];
+    ggml_free(gctx);
+    return true;
+}
+
 std::vector<float> VisionModel::encode_crops(const float * crops, int n_crops, int max_layer,
                                              ggml_backend_t backend,
                                              std::vector<std::vector<float>> * per_layer_dump) {
@@ -415,6 +528,42 @@ std::vector<float> VisionModel::encode_crops(const float * crops, int n_crops, i
     const size_t T = (size_t)grid * grid;
     std::vector<float> out(n_crops * T * enc_dim);
     struct ggml_gallocr * gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    static int use_batch = -1;
+    if (use_batch < 0) {
+        const char * e = getenv("MD_VISION_BATCH");
+        use_batch = e ? atoi(e) : 1;
+    }
+    if (use_batch && !per_layer_dump) {
+        // all crops share weights and are independent -> batch them as ne[2].
+        // Activations of a 27-layer graph scale with the chunk size, so on a
+        // 12GB card (10.3GB weights + 0.9GB vision already resident) we chunk
+        // instead of one giant graph: identical shapes reuse the same pool, and
+        // a failed alloc (OOM) halves the chunk and retries with a fresh pool.
+        static int chunk_env = -1;
+        if (chunk_env < 0) {
+            const char * e = getenv("MD_VISION_CHUNK");
+            chunk_env = e ? atoi(e) : 4;
+        }
+        int chunk = chunk_env;
+        if (chunk < 1) chunk = 1;
+        while (chunk > 0) {
+            struct ggml_gallocr * ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            bool ok = true;
+            for (int off = 0; off < n_crops && ok; off += chunk) {
+                int n = std::min(chunk, n_crops - off);
+                if (!run_encoder_crops_batched(*this, backend, ga, crops + (size_t)off * crop_elems,
+                                               n, out.data() + (size_t)off * T * enc_dim, max_layer)) {
+                    ok = false;
+                }
+            }
+            ggml_gallocr_free(ga);
+            if (ok) return out;
+            if (chunk == 1) { fprintf(stderr, "vision batched encode failed even at chunk=1\n"); return {}; }
+            chunk /= 2;
+            fprintf(stderr, "vision batched encode OOM, retrying with chunk=%d\n", chunk);
+        }
+        return {};
+    }
     for (int c = 0; c < n_crops; c++) {
         if (!run_encoder_crop(*this, backend, gallocr, crops + c * crop_elems,
                               out.data() + c * T * enc_dim, per_layer_dump, c, max_layer)) {
