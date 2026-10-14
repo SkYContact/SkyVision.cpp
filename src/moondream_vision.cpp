@@ -524,10 +524,15 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
 std::vector<float> VisionModel::encode_crops(const float * crops, int n_crops, int max_layer,
                                              ggml_backend_t backend,
                                              std::vector<std::vector<float>> * per_layer_dump) {
+    // profiling knob: cap layer count to isolate per-layer cost (output is then
+    // garbage for real use — timing experiments only)
+    if (const char * e = getenv("MD_VISION_LAYERS")) {
+        int n = atoi(e);
+        if (n > 0 && n < max_layer) max_layer = n;
+    }
     const size_t crop_elems = (size_t)in_ch * crop * crop;
     const size_t T = (size_t)grid * grid;
     std::vector<float> out(n_crops * T * enc_dim);
-    struct ggml_gallocr * gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     static int use_batch = -1;
     if (use_batch < 0) {
         const char * e = getenv("MD_VISION_BATCH");
@@ -535,35 +540,48 @@ std::vector<float> VisionModel::encode_crops(const float * crops, int n_crops, i
     }
     if (use_batch && !per_layer_dump) {
         // all crops share weights and are independent -> batch them as ne[2].
-        // Activations of a 27-layer graph scale with the chunk size, so on a
-        // 12GB card (10.3GB weights + 0.9GB vision already resident) we chunk
-        // instead of one giant graph: identical shapes reuse the same pool, and
-        // a failed alloc (OOM) halves the chunk and retries with a fresh pool.
+        // Chunk size is bounded by FREE device memory, NOT by allocation failure:
+        // under Windows WDDM an oversized cudaMalloc does not fail — the driver
+        // silently demotes resident weight pages to shared system memory (PCIe
+        // reads), permanently slowing decode afterwards. So we query free VRAM
+        // up front and keep a safety margin. ~400MB/crop is a conservative
+        // activation estimate (measured ~1.2GB pool peak for 4 crops + fragmentation).
         static int chunk_env = -1;
         if (chunk_env < 0) {
             const char * e = getenv("MD_VISION_CHUNK");
-            chunk_env = e ? atoi(e) : 4;
+            chunk_env = e ? atoi(e) : 0;   // 0 = auto-size from free VRAM
         }
         int chunk = chunk_env;
-        if (chunk < 1) chunk = 1;
-        while (chunk > 0) {
-            struct ggml_gallocr * ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-            bool ok = true;
-            for (int off = 0; off < n_crops && ok; off += chunk) {
-                int n = std::min(chunk, n_crops - off);
-                if (!run_encoder_crops_batched(*this, backend, ga, crops + (size_t)off * crop_elems,
-                                               n, out.data() + (size_t)off * T * enc_dim, max_layer)) {
-                    ok = false;
+        if (chunk < 1) {
+            chunk = n_crops;
+#if defined(GGML_USE_CUDA)
+            if (ggml_backend_is_cuda(backend)) {
+                size_t dev = 0, free_b = 0, total_b = 0;
+                ggml_backend_cuda_get_device_memory(0, &free_b, &total_b);
+                const size_t margin = 600ull << 20, per_crop = 400ull << 20;
+                chunk = (int)std::min<size_t>(n_crops, free_b > margin ? (free_b - margin) / per_crop : 0);
+                if (chunk < 1) {
+                    fprintf(stderr, "vision: only %.2f GB free, falling back to chunk=1 "
+                            "(risk of WDDM paging)\n", free_b / 1073741824.0);
+                    chunk = 1;
                 }
             }
-            ggml_gallocr_free(ga);
-            if (ok) return out;
-            if (chunk == 1) { fprintf(stderr, "vision batched encode failed even at chunk=1\n"); return {}; }
-            chunk /= 2;
-            fprintf(stderr, "vision batched encode OOM, retrying with chunk=%d\n", chunk);
+#endif
+            fprintf(stderr, "vision: free-VRAM-aware chunk = %d\n", chunk);
         }
-        return {};
+        struct ggml_gallocr * ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        bool ok = true;
+        for (int off = 0; off < n_crops && ok; off += chunk) {
+            int n = std::min(chunk, n_crops - off);
+            if (!run_encoder_crops_batched(*this, backend, ga, crops + (size_t)off * crop_elems,
+                                           n, out.data() + (size_t)off * T * enc_dim, max_layer)) {
+                ok = false;
+            }
+        }
+        ggml_gallocr_free(ga);
+        return ok ? out : std::vector<float>();
     }
+    struct ggml_gallocr * gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     for (int c = 0; c < n_crops; c++) {
         if (!run_encoder_crop(*this, backend, gallocr, crops + c * crop_elems,
                               out.data() + c * T * enc_dim, per_layer_dump, c, max_layer)) {

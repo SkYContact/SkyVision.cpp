@@ -59,16 +59,19 @@ def dequant_fp8(raw: np.ndarray, scale: np.ndarray) -> np.ndarray:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--q4", action="store_true", help="quantize experts to Q4_K instead of Q8_0")
+    ap.add_argument("--q6", action="store_true", help="quantize experts to Q6_K instead of Q8_0")
     ap.add_argument("--q8-dense", action="store_true",
                     help="also quantize big dense linears (Wqkv/out_proj/fc1/fc2/lm_head) to Q8_0 "
                          "(halves their decode-time read bandwidth; norms/biases/tau/router stay F16)")
     ap.add_argument("-o", "--out", default=r"D:/moondream.cpp/moondream3.1-%s.gguf")
     args = ap.parse_args()
-    tag = "q4k" if args.q4 else "q8_0"
+    tag = "q6k" if args.q6 else ("q4k" if args.q4 else "q8_0")
     if args.q8_dense:
-        tag = "q4k_q8d" if args.q4 else "q8full"
+        tag = ("q6k_q8d" if args.q6 else "q4k_q8d" if args.q4 else "q8full")
     out_path = args.out % tag
-    eqtype = gguf.GGMLQuantizationType.Q4_K if args.q4 else gguf.GGMLQuantizationType.Q8_0
+    eqtype = (gguf.GGMLQuantizationType.Q6_K if args.q6 else
+              gguf.GGMLQuantizationType.Q4_K if args.q4 else
+              gguf.GGMLQuantizationType.Q8_0)
 
     def maybe_q8(arr_f32):
         return quants.quantize(arr_f32, gguf.GGMLQuantizationType.Q8_0) if args.q8_dense else arr_f32.astype(np.float16)
@@ -117,6 +120,9 @@ def main():
         up = (up * torch.from_numpy(get(scale_up))[:, :, None].float()).numpy()
         down = w.get_tensor(name_down).view(torch.uint8).view(torch.float8_e4m3fn).float()
         down = (down * torch.from_numpy(get(scale_down))[:, :, None].float()).numpy()
+        if args.q6:
+            import q6k
+            return q6k.quantize_q6_k(up), q6k.quantize_q6_k(down)
         return quants.quantize(up, eqtype), quants.quantize(down, eqtype)
 
     print("tokens...")
