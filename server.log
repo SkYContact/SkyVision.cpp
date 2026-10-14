@@ -1,0 +1,14 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12199 MiB):
+  Device 0: NVIDIA GeForce RTX 5070 Ti Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 12199 MiB
+backend: CUDA (CUDA0), free 11.58 GB / 12.79 GB
+model file: 10.07 GB
+f32-copied small tensors: 452.5 MB
+uploaded 10.30 GB weights to backend
+model loaded: 24 layers, 2048 embd, 51200 vocab, experts 64/8 from layer 4
+tokenizer: 51200 tokens
+tokenizer: 50939 merges
+moondream.cpp web UI: http://127.0.0.1:8080  (Ctrl+C to stop)
+vision model file: 0.90 GB
+uploaded 0.90 GB vision weights to backend
+vision model loaded: 27 layers, dim 1152, heads 16 (hd 72), ff 4304, proj 2304->2048
+D:\moondream.cpp\llama.cpp\ggml\src\ggml-cuda\ggml-cuda.cu:115: GGML_ASSERT(device >= 0 && device < info.device_count) failed

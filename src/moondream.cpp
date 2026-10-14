@@ -488,6 +488,12 @@ struct Engine {
     struct ggml_cgraph * bat_gf = nullptr;
     struct ggml_tensor * bat_tok_in = nullptr, * bat_pos_in = nullptr, * bat_mask_in = nullptr;
     int bat_n = 0;
+    // start a fresh conversation: clears the KV cache and position counter (the
+    // static decode/batch graphs keep working — only their input values depend on it)
+    void reset() {
+        n_past = 0;
+        if (kv_buf) ggml_backend_buffer_clear(kv_buf, 0);
+    }
     int step_batch(const std::vector<int> & toks, const std::vector<int> & posv,
                    const std::vector<int> & lo, const std::vector<int> & hi, float * logits_out);
 
@@ -545,6 +551,24 @@ bool Engine::init(const char * gguf_path, const char * tok_json, int n_ctx_) {
     if (!kv_buf) { fprintf(stderr, "kv cache alloc on backend failed\n"); return false; }
     ggml_backend_buffer_clear(kv_buf, 0);   // unused cache slots must be zero: flash-attn reads
     // the full fixed-size window and NaN garbage would poison softmax even under -inf mask
+
+    // Pre-grow the gallocr pool to the largest graph shape we will ever run
+    // (an embedding prefill of the full context). ggml_gallocr FREEs the whole
+    // pool whenever a new graph needs a larger chunk — any previously bound
+    // graph (e.g. the static decode graph) is left with dangling tensor->data
+    // pointers and the next tensor_set crashes with cudaMemcpy invalid-argument.
+    // Sizing the pool once up front means no later graph can trigger a realloc.
+    {
+        struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+        struct ggml_context * gctx = ggml_init(ip);
+        int * hb[2] = { nullptr, nullptr };
+        struct ggml_cgraph * gf = build_graph(gctx, nullptr, n_ctx, hb,
+                                              /*fixed_ctx*/ false, /*emb_input*/ true);
+        if (!gallocr) gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(gallocr, gf))
+            fprintf(stderr, "warning: gallocr pre-grow alloc failed\n");
+        ggml_free(gctx);
+    }
     return true;
 }
 
@@ -902,6 +926,7 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
 }
 
 #include "moondream_batch.inc"   // after the Engine definition; adds step_batch + run_batch
+#include "moondream_server.inc"  // adds run_server (embedded web UI, --serve)
 
 int main(int argc, char ** argv) {
     if (getenv("MD_VERBOSE")) {
@@ -935,6 +960,7 @@ int main(int argc, char ** argv) {
     const char * region_path = "moondream3.1-region.gguf";
     const char * detect_obj = nullptr, * point_obj = nullptr;
     const char * batch_path = nullptr;
+    int serve_port = 0;
     int n_gen = 32, n_ctx = 1024;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) gguf_path = argv[++i];
@@ -948,6 +974,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--point") && i + 1 < argc) point_obj = argv[++i];
         else if (!strcmp(argv[i], "--region") && i + 1 < argc) region_path = argv[++i];
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch_path = argv[++i];
+        else if (!strcmp(argv[i], "--serve") && i + 1 < argc) serve_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--serve")) serve_port = 8080;
     }
     if (!tok_path) {
         fprintf(stderr, "usage: moondream-cli -m model.gguf -t tokenizer.json [-p prompt] [-n gen] [-c ctx] [-e text]\n");
@@ -973,6 +1001,7 @@ int main(int argc, char ** argv) {
     if (!e.init(gguf_path, tok_path, n_ctx)) return 1;
 
     if (batch_path) return run_batch(e, batch_path, n_ctx, n_gen);   // moondream_batch.inc
+    if (serve_port > 0) return run_server(e, vision_path, region_path, serve_port);
 
     // optional image: encode with the vision model, prefill [bos; 729 img tokens] as raw
     // embeddings (official: inputs_embeds = cat([bos_emb, img_emb]), prefix attends bidirectionally)
