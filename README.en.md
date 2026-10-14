@@ -15,19 +15,19 @@ built our own engine, following the same standalone pattern as
 
 ## Status
 
-> **Work in progress.** Core text inference runs end-to-end on CPU today. Quality alignment,
-> GPU acceleration, and the vision encoder are under active development — contributions welcome.
+> Feature-complete: text + vision + all five official skills (caption / query / detect /
+> point / gaze) + embedded web UI + batch inference + streaming, on both CPU and CUDA.
 
 | | |
 |---|---|
-| Text decode (24 layers) | ✅ runs |
-| FP8 expert weights → Q8_0 / Q4_K GGUF | ✅ converter included |
-| tau attention, MoE (64 experts / 8 active) | ✅ implemented |
-| Quality parity vs official Photon | 🚧 in progress |
-| GPU backend (CUDA via ggml) | 🚧 planned |
-| SigLIP vision encoder | ✅ working (27 layers + projection, torch parity < 0.04; `moondream3.1-vision.gguf` + `moondream-vision-test`) |
-| detect / point heads | ✅ done: `--detect` / `--point` |
-| segment head | ➖ not provided by the model |
+| Text decode (24 layers) | ✅ quality parity with the official implementation (per-tensor diff ~1e-3), no reserved tokens |
+| GPU backend (CUDA via ggml) | ✅ ~106 tok/s single stream, 231 tok/s 8-way batch (5070 Ti Laptop, Q6_K; flash-attn + F16 KV + CUDA graph replay) |
+| CPU backend | ✅ 12.8 tok/s (16 threads, numerically identical to CUDA) |
+| SigLIP vision encoder | ✅ official multi-crop Lanczos preprocessing + batched encode, ~0.56 s/image (10 crops), parity < 0.04 |
+| All five official skills | ✅ caption (short/normal/long) / query / detect / point / gaze, token-for-token official templates |
+| Web UI (`--serve`) | ✅ image-first UI: drag/paste, 3 caption lengths, VQA, detect boxes, point crosshairs, gaze prediction; same-image cache hits in ~66 ms |
+| FP8 expert weights → Q8_0 / Q6_K / Q4_K | ✅ converter included (Q6_K ≈ 7.6 GB — the pick for 12 GB GPUs) |
+| Batch inference (`--batch`) / streaming | ✅ |
 
 ## Why a standalone engine?
 
@@ -53,7 +53,8 @@ The converter (`convert/`) reads the official FP8 checkpoint
 and produces standard GGUF:
 
 - FP8 expert tensors are decoded exactly (bit-identical to PyTorch's e4m3 decoding) and
-  requantized to Q8_0 — `--q4` gives Q4_K instead
+  requantized to Q8_0 — `--q6` gives Q6_K (~7.6 GB, recommended for 12 GB GPUs),
+  `--q4` gives Q4_K
 - BF16 tensors become F16
 - the per-channel FP8 scales are folded into the quantized blocks
 
@@ -61,6 +62,9 @@ and produces standard GGUF:
 pip install gguf safetensors torch
 huggingface-cli download moondream/moondream3.1-9B-A2B
 python convert/convert_hf_to_gguf.py            # → moondream3.1-q8_0.gguf (~10 GB)
+python convert/convert_hf_to_gguf.py --q6      # → moondream3.1-q6k.gguf (~7.6 GB)
+python convert/convert_vision.py               # → moondream3.1-vision.gguf (SigLIP tower)
+python convert/convert_region.py               # → moondream3.1-region.gguf (detect/point/gaze heads)
 ```
 
 Model weights are licensed separately under the
@@ -90,8 +94,29 @@ cmake --build build --config Release --target moondream-cli
 # tokenizer (byte-level BPE, from moondream/starmie-v1)
 curl -L https://huggingface.co/moondream/starmie-v1/resolve/main/tokenizer.json -o tokenizer.json
 
-build/Release/moondream-cli.exe -m moondream3.1-q8_0.gguf -t tokenizer.json -p "hi" -n 16
+# text only
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json -p "hi" -n 16
+
+# image VQA; --detect / --point return boxes/coordinates
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
+    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf \
+    -i image.png -p "What is in this image?"
+
+# web UI: http://127.0.0.1:8080 (--host 0.0.0.0 binds the LAN)
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
+    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf --serve
+
+# batch inference (list of text prompts, partitioned KV slots)
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
 ```
+
+The web UI covers all five official skills: caption (short/normal/long), query (VQA),
+detect (green boxes), point (yellow crosshairs), and gaze prediction (click a source
+point, predict the fixation point). Repeated queries on the same image reuse the
+vision encode and KV prefix (~1.2 s → ~66 ms).
+
+HTTP API: `POST /api/vision` with `mode=ask|caption|detect|point|gaze`
+(`caption` takes `len=short|normal|long`, `gaze` takes source `x=&y=`), image bytes as body.
 
 ## Architecture summary
 

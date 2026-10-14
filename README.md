@@ -14,19 +14,19 @@ moondream3.1 是 Moondream 团队推出的 90 亿参数混合专家（MoE）视�
 
 ## 当前状态
 
-> **开发中。** 文本推理已端到端跑通：生成质量与官方实现对齐（层 0 逐张量数值校验 ~1e-3），
-> CUDA 后端 61.6 tok/s（5070 Ti Laptop，贪心）。SigLIP 视觉编码器已跑通（parity < 0.04）。
+> 全部功能已就绪：文本 + 视觉 + 五个官方技能（caption / query / detect / point / gaze）
+> + 嵌入式 Web UI + 批量推理 + 流式输出，CPU / CUDA 双后端。
 
 | | |
 |---|---|
-| 文本 decode（24 层） | ✅ 已跑通，质量对齐（vs 官方 torch 前向逐张量 diff ~1e-3） |
-| FP8 专家权重 → Q8_0 / Q4_K GGUF | ✅ 转换器已就绪 |
-| tau attention、MoE（64 选 8） | ✅ 已实现 |
-| 对照官方 Photon 的质量对齐 | ✅ 完成（2026-10-14） |
-| GPU 后端（CUDA via ggml） | ✅ 完成：CUDA 61.6 tok/s / CPU 12.8 tok/s（flash-attn + F16 KV） |
-| SigLIP 视觉编码器 | ✅ 已跑通（27 层 + 投影，与 torch parity < 0.04；`moondream3.1-vision.gguf` + `moondream-vision-test`） |
-| detect / point 头 | ✅ 完成：`--detect` / `--point` 输出框/坐标 |
-| segment 头 | ➖ 官方模型不提供（region 只有 coordinate/size 头） |
+| 文本 decode（24 层） | ✅ 质量对齐官方（逐张量 diff ~1e-3），贪心输出无 reserved token |
+| GPU 后端（CUDA via ggml） | ✅ 单序列 ~106 tok/s，8 路批量 231 tok/s（5070 Ti Laptop，Q6_K；flash-attn + F16 KV + CUDA graph 回放） |
+| CPU 后端 | ✅ 12.8 tok/s（16 线程，与 CUDA 数值一致） |
+| SigLIP 视觉编码器 | ✅ 官方多 crop Lanczos 预处理 + 批量编码，~0.56s/图（10 crop），parity < 0.04 |
+| 五个官方技能 | ✅ caption（short/normal/long）/ query / detect / point / gaze，模板与官方逐 token 一致 |
+| Web UI（`--serve`） | ✅ 图像优先界面：拖拽/粘贴图片、三档描述、提问、检测绿框、定位十字、注视点预测；同图缓存命中 ~66ms |
+| FP8 专家权重 → Q8_0 / Q6_K / Q4_K | ✅ 转换器已就绪（Q6_K ≈ 7.6GB，12GB 显卡首选） |
+| 批量推理（`--batch`）/ 流式输出 | ✅ |
 
 ## 为什么做独立引擎？
 
@@ -51,7 +51,7 @@ moondream3.1 的架构和 llama.cpp 支持的任何模型都不一样：
 产出标准 GGUF：
 
 - FP8 专家张量逐位精确解码（与 PyTorch 的 e4m3 解码 bit 级一致）后重量化为 Q8_0，
-  `--q4` 可选 Q4_K
+  `--q6` 可选 Q6_K（约 7.6GB，12GB 显存首选）、`--q4` 可选 Q4_K
 - BF16 张量转 F16
 - FP8 的逐通道 scale 直接折叠进量化块
 
@@ -59,6 +59,9 @@ moondream3.1 的架构和 llama.cpp 支持的任何模型都不一样：
 pip install gguf safetensors torch
 huggingface-cli download moondream/moondream3.1-9B-A2B
 python convert/convert_hf_to_gguf.py            # → moondream3.1-q8_0.gguf（约 10GB）
+python convert/convert_hf_to_gguf.py --q6      # → moondream3.1-q6k.gguf（约 7.6GB）
+python convert/convert_vision.py               # → moondream3.1-vision.gguf（SigLIP 塔）
+python convert/convert_region.py               # → moondream3.1-region.gguf（detect/point/gaze 头）
 ```
 
 模型权重遵循单独的
@@ -87,8 +90,28 @@ cmake --build build --config Release --target moondream-cli
 # tokenizer（byte-level BPE，来自 moondream/starmie-v1）
 curl -L https://huggingface.co/moondream/starmie-v1/resolve/main/tokenizer.json -o tokenizer.json
 
-build/Release/moondream-cli.exe -m moondream3.1-q8_0.gguf -t tokenizer.json -p "hi" -n 16
+# 纯文本
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json -p "hi" -n 16
+
+# 看图问答（VQA）；--detect / --point 输出框/坐标
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
+    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf \
+    -i image.png -p "What is in this image?"
+
+# Web UI：http://127.0.0.1:8080（--host 0.0.0.0 监听局域网）
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
+    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf --serve
+
+# 批量推理（文本 prompt 列表，KV 槽位分段并行）
+moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
 ```
+
+Web UI 覆盖官方全部五个技能：图像描述（简短/标准/详细）、提问（VQA）、
+目标检测（绿框）、定位（黄色十字）、注视点预测（点选起点→预测注视点）。
+对同一张图连续提问时自动复用视觉编码与 KV 前缀（~1.2s → ~66ms）。
+
+HTTP API：`POST /api/vision`，`mode=ask|caption|detect|point|gaze`
+（caption 带 `len=short|normal|long`，gaze 带 `x=&y=` 起点坐标），body 为图片二进制。
 
 ## 架构速览
 
