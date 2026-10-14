@@ -1,0 +1,49 @@
+# models & weights
+*.gguf
+*.safetensors
+*.ckpt
+tokenizer.json
+
+# build artifacts
+build/
+build-*/
+build_log.txt
+build_cuda_log.txt
+*.obj
+*.pdb
+*.ilk
+
+# vendored dependencies (clone separately, see README)
+llama.cpp/
+
+# run logs & debug artifacts
+run*.log
+*_log.txt
+parity/
+
+# editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# python
+__pycache__/
+
+# misc artifacts
+convert/convert.log
+convert/reference_layers.py
+parity_fa/
+parity_ph/
+# ncu profiling scratch
+ncu*
+# parity scratch dirs
+parity_*/
+# dev scratch images (regenerate with scripts)
+test_image.png
+test_scene.png
+
+# dev notes & third-party reference code — kept locally, not for publication
+docs/
+convert/ref_*.py
