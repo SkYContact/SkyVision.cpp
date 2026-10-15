@@ -65,7 +65,7 @@ def main():
     if args.image:
         cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
         cfg.text_config.num_hidden_layers = args.layers
-        cfg.vision_config.attn_impl = "eager"   # flash_attention_2 needs bf16 + the flash-attn package
+        cfg.vision_config.attn_impl = "sdpa"   # flash_attention_2 needs bf16 + the flash-attn package
         cfg.dtype = "float32"
         cfg.text_config.dtype = "float32"
         cfg.vision_config.dtype = "float32"

@@ -24,18 +24,22 @@ tok = AutoTokenizer.from_pretrained(args.ckpt)
 cfg.vision_config.attn_impl = "eager"   # no flash-attn installed; math-exact path
 
 def smart_resize(h, w, factor, min_pixels, max_pixels):
-    def ceil_by(n, f): return int(math.ceil(n / f)) * f
-    def floor_by(n, f): return int(math.floor(n / f)) * f
-    h_bar = max(factor, ceil_by(h, factor))
-    w_bar = max(factor, ceil_by(w, factor))
+    # transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize: round,
+    # NOT ceil (an old version of this script used ceil and silently mismatched
+    # the engine's grid by one patch row/column)
+    def roundBy(n, f): return int(round(n / f)) * f
+    def floorBy(n, f): return int(math.floor(n / f)) * f
+    def ceilBy(n, f): return int(math.ceil(n / f)) * f
+    h_bar = max(factor, roundBy(h, factor))
+    w_bar = max(factor, roundBy(w, factor))
     if h_bar * w_bar > max_pixels:
         beta = math.sqrt(h * w / max_pixels)
-        h_bar = max(factor, floor_by(h / beta, factor))
-        w_bar = max(factor, floor_by(w / beta, factor))
+        h_bar = max(factor, floorBy(h / beta, factor))
+        w_bar = max(factor, floorBy(w / beta, factor))
     elif h_bar * w_bar < min_pixels:
         beta = math.sqrt(min_pixels / (h * w))
-        h_bar = max(factor, ceil_by(h * beta, factor))
-        w_bar = max(factor, ceil_by(w * beta, factor))
+        h_bar = max(factor, ceilBy(h * beta, factor))
+        w_bar = max(factor, ceilBy(w * beta, factor))
     return h_bar, w_bar
 
 files = sorted(glob.glob(args.frames + "/*.png") + glob.glob(args.frames + "/*.jpg"))
@@ -65,22 +69,20 @@ ids = tok(prompt, return_tensors="pt").input_ids.cuda()
 print("prompt tokens:", ids.shape[1])
 
 mv = importlib.import_module("vc3pkg.modeling_videochat3")
-model = mv.VideoChat3ForConditionalGeneration._from_config(cfg, dtype=torch.bfloat16).cuda().eval()
-import safetensors.torch
-sd = {}
-for fn in sorted(glob.glob(args.ckpt + "/*.safetensors")):
-    sd.update(safetensors.torch.load_file(fn))
-missing, unexpected = model.load_state_dict({k: v for k, v in sd.items() if not k.startswith("lm_head.")}, strict=False)
-print("missing:", missing[:5], "unexpected:", unexpected[:5])
+from ref_load import load_model_fast
+model = load_model_fast(args.ckpt, mv.VideoChat3ForConditionalGeneration, cfg=cfg)
 
 with torch.no_grad():
-    out = model.generate(
+    gen_kw = dict(
         input_ids=ids,
-        pixel_values_videos=pixel_values,
-        video_grid_thw=torch.tensor([[T, gh, gw]]).cuda(),
         max_new_tokens=args.max_tokens,
         do_sample=False,
         temperature=None, top_p=None, top_k=None,
     )
+    if args.image:
+        gen_kw.update(pixel_values=pixel_values, image_grid_thw=torch.tensor([[1, gh, gw]]).cuda())
+    else:
+        gen_kw.update(pixel_values_videos=pixel_values, video_grid_thw=torch.tensor([[T, gh, gw]]).cuda())
+    out = model.generate(**gen_kw)
 text = tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 print("OFFICIAL:", text)
