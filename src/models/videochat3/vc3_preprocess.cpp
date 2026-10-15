@@ -136,20 +136,27 @@ void patchify(const float * rgb, int h, int w, const VisConfig & vc,
     patches.assign((size_t)C * N, 0.0f);
 
     const float inv = 1.0f / 127.5f;   // (x/255 - 0.5)/0.5
-    // tokens in row-major (gh, gw) order - same as the reference conv output, and
-    // what pos_embed_for_grid / rope_2d_tables (and the merge reshape) assume.
-    // An earlier version emitted merge-block order (nh, nw, kh, kw), silently
-    // misaligning every token's position embedding and 2D rope.
-    for (int hi = 0; hi < gh; hi++) {
-        for (int wi = 0; wi < gw; wi++) {
-            const size_t n = (size_t)hi * gw + wi;
-            float * dst = &patches[n * C];
-            for (int c = 0; c < 3; c++) {
-                for (int ph = 0; ph < P; ph++) {
-                    const float * row = rgb + ((size_t)(hi * P + ph) * w + wi * P) * 3 + c;
-                    float * drow = dst + (size_t)(c * P + ph) * P;
-                    for (int pw = 0; pw < P; pw++) {
-                        drow[pw] = row[(size_t)pw * 3] * inv - 1.0f;
+    // tokens in merge-block order (nh, nw, kh, kw) — the official processor's
+    // layout (verified by exact-match against Qwen2VLImageProcessorFast output).
+    // The merger's reshape chain in encode_vision assumes this order; an earlier
+    // switch to row-major (gh, gw) fixed pos/rope alignment but silently made the
+    // 2x2 pooling mix patches from different grid rows — scene-level content
+    // survived, fine detail (small text) was destroyed.
+    for (int H2 = 0; H2 < nh; H2++) {
+        for (int W2 = 0; W2 < nw; W2++) {
+            for (int ph = 0; ph < M; ph++) {
+                for (int pw = 0; pw < M; pw++) {
+                    const int hi = H2 * M + ph, wi = W2 * M + pw;
+                    const size_t n = (size_t)((H2 * nw + W2) * M + ph) * M + pw;
+                    float * dst = &patches[n * C];
+                    for (int c = 0; c < 3; c++) {
+                        for (int p = 0; p < P; p++) {
+                            const float * row = rgb + ((size_t)(hi * P + p) * w + wi * P) * 3 + c;
+                            float * drow = dst + (size_t)(c * P + p) * P;
+                            for (int q = 0; q < P; q++) {
+                                drow[q] = row[(size_t)q * 3] * inv - 1.0f;
+                            }
+                        }
                     }
                 }
             }
@@ -225,6 +232,11 @@ void pos_embed_for_grid(const float * weight, const float * time_weight, const V
     }
     const size_t per_t = (size_t)h * w * D;
     out.assign(per_t * t, 0.0f);
+    // positions are assigned SEQUENTIALLY to the token stream: the official
+    // patch_embed consumes the interpolated (h, w) table row by row and the
+    // official rope does the same (freqs_cis[:h,:w].reshape(-1)), regardless of
+    // each token's true geometric position — the model was trained with the
+    // processor's merge-block token order paired with sequential positions
     for (int ti = 0; ti < t; ti++) {
         const float * tv = time_weight + (size_t)std::min(ti, vc.temporal_merge - 1) * D;
         float * dst = out.data() + (size_t)ti * per_t;

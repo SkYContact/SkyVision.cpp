@@ -85,10 +85,12 @@ struct MoondreamModel : vqa::Model {
             std::vector<int> out;
             int cur = e.step(ctoks, nullptr);
             out.push_back(cur);
+            if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
             for (int i = 1; i < std::min(gp.max_tokens, 512); i++) {
                 cur = e.step({ cur }, nullptr);
                 if (cur == 0) break;
                 out.push_back(cur);
+                if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
             }
             out_text = e.tok.decode(out);
             return true;
@@ -105,10 +107,12 @@ struct MoondreamModel : vqa::Model {
         std::vector<int> out;
         int cur = e.step(toks, nullptr);
         out.push_back(cur);
+        if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
         for (int i = 1; i < gp.max_tokens; i++) {
             cur = e.step({ cur }, nullptr);
             if (cur == 0) break;
             out.push_back(cur);
+            if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
         }
         out_text = e.tok.decode(out);
         return true;

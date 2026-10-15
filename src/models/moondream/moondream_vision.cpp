@@ -11,6 +11,7 @@
 //    nb[0]=4, nb[1]=D*4.
 
 #include "moondream_vision.hpp"
+#include "vit_block.hpp"
 #include <thread>
 #include <atomic>
 #include "ggml.h"
@@ -155,6 +156,19 @@ bool VisionModel::load(const char * path, ggml_backend_t backend) {
         }
         W.f32_cpu = f32data;
 
+        // patch-embedding bias folded into the position table: pos is F32 here,
+        // the fold is a host-side add, and the graph drops one [D, T] activation
+        // add per crop batch (exact — same trick as the VideoChat3 tower)
+        {
+            ggml_tensor * pos = ggml_get_tensor(W.wctx, "pos_emb.weight");
+            ggml_tensor * pb  = ggml_get_tensor(W.wctx, "patch_emb.bias");
+            if (pos && pb && pos->type == GGML_TYPE_F32 && pb->type == GGML_TYPE_F32 &&
+                pb->ne[0] == pos->ne[0] && pb->ne[1] == 1) {
+                vqa::vit::fold_patch_bias((float *)pos->data, (size_t)ggml_nelements(pos),
+                                          (int)pos->ne[0], (const float *)pb->data);
+            }
+        }
+
         if (ggml_backend_is_cpu(backend)) {
             struct ggml_backend_buffer * wbuf = ggml_backend_cpu_buffer_from_ptr(W.mm.ptr, W.mm.size);
             f32buf = total ? ggml_backend_cpu_buffer_from_ptr(f32data, total) : nullptr;
@@ -221,6 +235,78 @@ bool VisionModel::load(const char * path, ggml_backend_t backend) {
     return true;
 }
 
+// ---- shared ViT block plumbing (vqa::vit::block) --------------------------
+// The SigLIP block body lives in src/core/vit_block.hpp; each encoder path
+// supplies only its attention wiring (single-crop FA / batched crops FA) and,
+// for the batched path, the MD_VISION_F16ACT dtype casts.
+namespace {
+struct MdCropEnv {
+    ggml_context *gctx;
+    int D, H, HD, T, use_fa;
+};
+
+static ggml_tensor * md_crop_attention(void * ud_, ggml_tensor * qkv) {
+    MdCropEnv & e = *(MdCropEnv *)ud_;
+    ggml_context * gctx = e.gctx;
+    const int D = e.D, H = e.H, HD = e.HD, T = e.T;
+    // bidirectional attention; FA over [HD, T, H] views by default
+    // (MD_VISION_FA=0 falls back to batched-3D matmuls; layout follows
+    // llama.cpp clip.cpp build_attn)
+    if (e.use_fa) {
+        struct ggml_tensor * q3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), 0);
+        struct ggml_tensor * k3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), (int64_t)H * HD * sizeof(float));
+        struct ggml_tensor * v3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), (int64_t)2 * H * HD * sizeof(float));
+        return ggml_reshape_2d(gctx,
+                ggml_flash_attn_ext(gctx, q3, k3, v3, nullptr, 1.0f / sqrtf((float)HD), 0.0f, 0.0f), D, T);
+    }
+    struct ggml_tensor * q3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), 0);
+    struct ggml_tensor * k3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), (int64_t)H * HD * sizeof(float));
+    struct ggml_tensor * v3 = ggml_view_3d(gctx, qkv, HD, T, H, qkv->nb[1], HD * sizeof(float), (int64_t)2 * H * HD * sizeof(float));
+    // scores [T, T, H]: mul_mat res ne = [a.ne1, b.ne1, ne2]; softmax over ne0 = keys
+    struct ggml_tensor * s = ggml_soft_max_ext(gctx, ggml_mul_mat(gctx, k3, q3),
+            nullptr, 1.0f / sqrtf((float)HD), 0.0f);                    // [T, T, H]
+    // out = v^T [T,HD,H] · w [T,T,H] -> [HD, T, H]; then [HD,H,T] -> [D, T]
+    struct ggml_tensor * vt3 = ggml_cont(gctx, ggml_permute(gctx, v3, 1, 0, 2, 3));  // [T, HD, H]
+    return ggml_cont_2d(gctx,
+            ggml_permute(gctx, ggml_mul_mat(gctx, vt3, s), 0, 2, 1, 3), // [HD,T,H] -> [HD,H,T]
+            D, T);
+}
+
+struct MdBatchEnv {
+    ggml_context *gctx;
+    int D, H, HD, T, C;
+    ggml_type act_type = GGML_TYPE_F32;
+};
+
+static ggml_tensor * md_batch_attention(void * ud_, ggml_tensor * qkv) {
+    MdBatchEnv & e = *(MdBatchEnv *)ud_;
+    ggml_context * gctx = e.gctx;
+    const int H = e.H, HD = e.HD, T = e.T, C = e.C;
+    // q/k/v [HD, T, H, C]: within a token, heads live along ne0 (stride HD),
+    // q/k/v blocks are offsets D apart; crops stride a whole qkv slab (nb[2])
+    const size_t ts = ggml_type_size(qkv->type);
+    auto cast_f32 = [&](ggml_tensor * t) {
+        return qkv->type == GGML_TYPE_F32 ? t : ggml_cast(gctx, t, GGML_TYPE_F32);
+    };
+    struct ggml_tensor * q4 = ggml_view_4d(gctx, qkv, HD, T, H, C, qkv->nb[1], HD * ts, qkv->nb[2], 0);
+    struct ggml_tensor * k4 = ggml_view_4d(gctx, qkv, HD, T, H, C, qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)H * HD * ts);
+    struct ggml_tensor * v4 = ggml_view_4d(gctx, qkv, HD, T, H, C, qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)2 * H * HD * ts);
+    // FA wants q in F32 (k/v may stay F16 — same conditional as the old inline code)
+    struct ggml_tensor * fa = ggml_flash_attn_ext(gctx, cast_f32(q4), k4, v4,
+            nullptr, 1.0f / sqrtf((float)HD), 0.0f, 0.0f);   // [HD, T, H, C]
+    // same head-merge layout the single-crop path relies on after reshape_2d
+    return ggml_reshape_3d(gctx, fa, e.D, T, C);
+}
+
+static ggml_tensor * md_to_act(void * ud_, ggml_tensor * t) {
+    MdBatchEnv & e = *(MdBatchEnv *)ud_;
+    return t->type == e.act_type ? t : ggml_cast(e.gctx, t, e.act_type);
+}
+static ggml_tensor * md_to_f32(void * ud_, ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 ? t : ggml_cast(((MdBatchEnv *)ud_)->gctx, t, GGML_TYPE_F32);
+}
+}  // namespace
+
 // ---------------------------------------------------------------- encoder graph
 // runs ONE crop (grid*grid tokens) through blocks [0, max_layer); returns
 // [grid*grid, enc_dim] token-major F32. Layer outputs optionally dumped.
@@ -254,73 +340,28 @@ static bool run_encoder_crop(VisionModel & M, ggml_backend_t backend, struct ggm
     ggml_set_name(x, "patches_in");
 
     x = ggml_mul_mat(gctx, W.patch_emb_w, x);          // [D, T]
-    x = ggml_add(gctx, x, W.patch_emb_b);
+    // patch_emb_b is folded into pos_emb at load time (exact host F32 add)
     x = ggml_add(gctx, x, W.pos_emb);                  // pos_emb stored as ne=[D, T]
     ggml_set_name(x, "h_emb");
 
+    // flash attention by default on both backends (earlier "CPU fattn breaks on
+    // HD=72" was a misdiagnosis: the real bug was swapped view strides);
+    // MD_VISION_FA=0 falls back to batched-3D matmuls
+    static int use_fa = -1;
+    if (use_fa < 0) {
+        const char * e = getenv("MD_VISION_FA");
+        use_fa = e ? atoi(e) : 1;
+    }
+    MdCropEnv env{gctx, D, H, HD, T, use_fa};
     for (int il = 0; il < max_layer; il++) {
         VisionLayer & L = W.layers[il];
-
-        // attention
-        struct ggml_tensor * l = ggml_norm(gctx, x, 1e-5f);
-        l = ggml_mul(gctx, l, L.ln1_w);
-        l = ggml_add(gctx, l, L.ln1_b);
-
-        struct ggml_tensor * qkv = ggml_mul_mat(gctx, L.qkv_w, l);
-        qkv = ggml_add(gctx, qkv, L.qkv_b);             // [3D, T]
-
-        // bidirectional attention, batched 3D matmuls (all 16 heads in one mul_mat;
-        // flash_attn_ext is off-limits here: this ggml's fattn breaks on HD=72)
-        // layout follows llama.cpp clip.cpp build_attn: q/k [HD, T, H], v^T [T, HD, H]
-        // flash attention by default on both backends (earlier "CPU fattn breaks on
-        // HD=72" was a misdiagnosis: the real bug was swapped view strides);
-        // MD_VISION_FA=0 falls back to batched-3D matmuls
-        static int use_fa = -1;
-        if (use_fa < 0) {
-            const char * e = getenv("MD_VISION_FA");
-            use_fa = e ? atoi(e) : 1;
-        }
-        struct ggml_tensor * attn = nullptr;
-        if (use_fa) {
-            struct ggml_tensor * q3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                    qkv->nb[1], HD * sizeof(float), 0);
-            struct ggml_tensor * k3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                    qkv->nb[1], HD * sizeof(float), (int64_t)H * HD * sizeof(float));
-            struct ggml_tensor * v3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                    qkv->nb[1], HD * sizeof(float), (int64_t)2 * H * HD * sizeof(float));
-            attn = ggml_reshape_2d(gctx,
-                    ggml_flash_attn_ext(gctx, q3, k3, v3, nullptr,
-                            1.0f / sqrtf((float)HD), 0.0f, 0.0f), D, T);
-        } else {
-        struct ggml_tensor * q3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                qkv->nb[1], HD * sizeof(float), 0);
-        struct ggml_tensor * k3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                qkv->nb[1], HD * sizeof(float), (int64_t)H * HD * sizeof(float));
-        struct ggml_tensor * v3 = ggml_view_3d(gctx, qkv, HD, T, H,
-                qkv->nb[1], HD * sizeof(float), (int64_t)2 * H * HD * sizeof(float));
-        // scores [T, T, H]: mul_mat res ne = [a.ne1, b.ne1, ne2]; softmax over ne0 = keys
-        struct ggml_tensor * s = ggml_soft_max_ext(gctx, ggml_mul_mat(gctx, k3, q3),
-                nullptr, 1.0f / sqrtf((float)HD), 0.0f);                    // [T, T, H]
-        // out = v^T [T,HD,H] · w [T,T,H] -> [HD, T, H]; then [HD,H,T] -> [D, T]
-        struct ggml_tensor * vt3 = ggml_cont(gctx, ggml_permute(gctx, v3, 1, 0, 2, 3));  // [T, HD, H]
-        attn = ggml_cont_2d(gctx,
-                ggml_permute(gctx, ggml_mul_mat(gctx, vt3, s), 0, 2, 1, 3), // [HD,T,H] -> [HD,H,T]
-                D, T);
-        }
-        attn = ggml_mul_mat(gctx, L.attn_out_w, attn);
-        attn = ggml_add(gctx, attn, L.attn_out_b);
-        x = ggml_add(gctx, x, attn);
-
-        // mlp (gelu tanh-approx: official vision uses gelu_approx)
-        struct ggml_tensor * l2 = ggml_norm(gctx, x, 1e-5f);
-        l2 = ggml_mul(gctx, l2, L.ln2_w);
-        l2 = ggml_add(gctx, l2, L.ln2_b);
-        struct ggml_tensor * f = ggml_mul_mat(gctx, L.ffn_up_w, l2);
-        f = ggml_add(gctx, f, L.ffn_up_b);
-        f = ggml_gelu(gctx, f);
-        f = ggml_mul_mat(gctx, L.ffn_down_w, f);
-        f = ggml_add(gctx, f, L.ffn_down_b);
-        x = ggml_add(gctx, x, f);
+        vqa::vit::BlockWeights bw{L.ln1_w, L.ln1_b, L.qkv_w, L.qkv_b, L.attn_out_w, L.attn_out_b,
+                                  L.ln2_w, L.ln2_b, L.ffn_up_w, L.ffn_up_b, L.ffn_down_w, L.ffn_down_b};
+        vqa::vit::BlockHooks bh;
+        bh.attention = md_crop_attention;
+        bh.ud = &env;
+        x = vqa::vit::block(gctx, x, bw, 1e-5f, bh, il);
+        if (!x) { ggml_free(gctx); return false; }
 
         char nm[32]; snprintf(nm, sizeof(nm), "h_L%d", il);
         ggml_set_name(x, nm);
@@ -443,55 +484,22 @@ static bool run_encoder_crops_batched(VisionModel & M, ggml_backend_t backend, s
 
     x = ggml_mul_mat(gctx, W.patch_emb_w, x);          // [D, T, C] (f32 out)
     x = to_act(x);
-    x = ggml_add(gctx, x, W.patch_emb_b);
+    // patch_emb_b is folded into pos_emb at load time (exact host F32 add)
     x = ggml_add(gctx, x, W.pos_emb);                  // [D, T, 1] broadcasts over crops
     ggml_set_name(x, "h_emb");
 
+    MdBatchEnv benv{gctx, D, H, HD, T, n_crops, AT};
     for (int il = 0; il < max_layer; il++) {
         VisionLayer & L = W.layers[il];
-
-        struct ggml_tensor * l = ggml_norm(gctx, ln_f32(x), 1e-5f);
-        l = ggml_mul(gctx, l, ggml_cast(gctx, L.ln1_w, GGML_TYPE_F32));
-        l = ggml_add(gctx, l, ggml_cast(gctx, L.ln1_b, GGML_TYPE_F32));
-        l = to_act(l);
-
-        struct ggml_tensor * qkv = ggml_mul_mat(gctx, L.qkv_w, l);
-        qkv = to_act(qkv);
-        qkv = ggml_add(gctx, qkv, L.qkv_b);            // [3D, T, C]
-
-        // q/k/v [HD, T, H, C]: within a token, heads live along ne0 (stride HD),
-        // q/k/v blocks are offsets D apart; crops stride a whole qkv slab (nb[2])
-        const size_t ts = ggml_type_size(qkv->type);
-        struct ggml_tensor * q4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * ts, qkv->nb[2], 0);
-        struct ggml_tensor * k4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)H * HD * ts);
-        struct ggml_tensor * v4 = ggml_view_4d(gctx, qkv, HD, T, H, n_crops,
-                qkv->nb[1], HD * ts, qkv->nb[2], (int64_t)2 * H * HD * ts);
-        struct ggml_tensor * fa = ggml_flash_attn_ext(gctx,
-                qkv->type == GGML_TYPE_F32 ? q4 : ggml_cast(gctx, q4, GGML_TYPE_F32),
-                k4, v4, nullptr,
-                1.0f / sqrtf((float)HD), 0.0f, 0.0f);   // [HD, T, H, C]
-        // same head-merge layout the single-crop path relies on after reshape_2d
-        struct ggml_tensor * attn = ggml_reshape_3d(gctx, fa, D, T, n_crops);
-
-        attn = ggml_mul_mat(gctx, L.attn_out_w, to_act(attn));
-        attn = to_act(attn);
-        attn = ggml_add(gctx, attn, L.attn_out_b);
-        x = ggml_add(gctx, x, attn);
-
-        struct ggml_tensor * l2 = ggml_norm(gctx, ln_f32(x), 1e-5f);
-        l2 = ggml_mul(gctx, l2, ggml_cast(gctx, L.ln2_w, GGML_TYPE_F32));
-        l2 = ggml_add(gctx, l2, ggml_cast(gctx, L.ln2_b, GGML_TYPE_F32));
-        l2 = to_act(l2);
-        struct ggml_tensor * f = ggml_mul_mat(gctx, L.ffn_up_w, l2);
-        f = to_act(f);
-        f = ggml_add(gctx, f, L.ffn_up_b);
-        f = ggml_gelu(gctx, f);
-        f = ggml_mul_mat(gctx, L.ffn_down_w, f);
-        f = to_act(f);
-        f = ggml_add(gctx, f, L.ffn_down_b);
-        x = ggml_add(gctx, x, f);
+        vqa::vit::BlockWeights bw{L.ln1_w, L.ln1_b, L.qkv_w, L.qkv_b, L.attn_out_w, L.attn_out_b,
+                                  L.ln2_w, L.ln2_b, L.ffn_up_w, L.ffn_up_b, L.ffn_down_w, L.ffn_down_b};
+        vqa::vit::BlockHooks bh;
+        bh.attention = md_batch_attention;
+        bh.to_act = AT == GGML_TYPE_F32 ? nullptr : md_to_act;
+        bh.to_f32 = AT == GGML_TYPE_F32 ? nullptr : md_to_f32;
+        bh.ud = &benv;
+        x = vqa::vit::block(gctx, x, bw, 1e-5f, bh, il);
+        if (!x) { ggml_free(gctx); return false; }
 
         char nm[32]; snprintf(nm, sizeof(nm), "h_L%d", il);
         ggml_set_name(x, nm);

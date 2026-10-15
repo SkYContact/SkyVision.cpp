@@ -11,6 +11,9 @@
 //   * the vision tower runs as its own graph per clip: patch embed, 27 blocks
 //     with 2D rope and full (non causal) attention, final LN, merge, projector.
 #include "vqa.hpp"
+#include "vit_block.hpp"
+
+#include <functional>
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -85,8 +88,11 @@ private:
     bool load_weights(const char * path);
     bool alloc_kv();
     // clip_marks: per temporal clip (timestamp, token count) for prompt building
+    // token_budget > 0 clamps max_pixels so the merged vision token count fits the
+    // text context; images that cannot fit even at minimum resolution fail here,
+    // before the expensive vision encode (instead of the late run_text check)
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
-                       std::vector<std::pair<float,int>> * clip_marks = nullptr);
+                       std::vector<std::pair<float,int>> * clip_marks = nullptr, int token_budget = 0);
     bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false);
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<float> * img_feats,
                   const std::vector<int> * img_pos, std::vector<float> & logits_out);
@@ -108,7 +114,13 @@ private:
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;         // weights: mmap-backed (CPU) or uploaded
     ggml_backend_buffer_t wbuf_plain = nullptr;   // host f32 block holding the 1D tensors
+    ggml_backend_buffer_t wbuf_fold = nullptr;    // host block holding LN-folded vision weights (CPU path)
     std::vector<char> host_f32_storage;           // keeps that block alive on the CPU path
+    std::vector<char> fold_storage;               // keeps the folded weights alive (both paths)
+    bool fold_bias = false;                       // LN bias absorbed into the matmul bias (exact, F32)
+    bool fold_scale = false;                      // LN gain folded into the weight (VC3_FOLD_W=1; re-rounds F16, lossy)
+    bool wo_padded = false;                       // wo input rows padded to 80/head (exact; kills the FA de-pad copy)
+    std::vector<float> patch_bias;                // v.patch_embd.bias, folded into the host pos table
     vqa::MMap mm;
 
     std::vector<float> pos_emb_host, pos_time_host;
@@ -214,6 +226,7 @@ VideoChat3::~VideoChat3() {
     kv.free();
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wbuf_plain) ggml_backend_buffer_free(wbuf_plain);
+    if (wbuf_fold) ggml_backend_buffer_free(wbuf_fold);
     if (wctx) ggml_free(wctx);
     if (backend) ggml_backend_free(backend);
 }
@@ -344,6 +357,142 @@ bool VideoChat3::load_weights(const char * path) {
         fprintf(stderr, "f32-converted 1D tensors: %.1f MB\n", total / 1e6);
     }
 
+    // --- vision LayerNorm affine folding (opt-in) -----------------------------
+    //   W·(norm(x)*w + b) + B  ==  W·(norm(x)*w) + (W·b + B)   [bias fold]
+    //                            ==  (W·diag(w))·norm(x) + (W·b + B)  [+ scale fold]
+    // Neither variant is exact under ggml's f16 GEMM: mul_mat converts the
+    // activation to the weight's vec_dot_type (F16), so moving arithmetic across
+    // the GEMM boundary changes the rounding path - measured v_final drift ~1%
+    // (mean) over 27 layers and greedy divergence. Off by default; enable with
+    // VC3_FOLD_BIAS=1 / VC3_FOLD_W=1 to trade that precision for ~1/3 fewer
+    // elementwise kernels in the vision graph.
+    {
+        struct FoldRef { std::string w, b, nw, nb; };
+        std::vector<FoldRef> folds;
+        for (int i = 0; i < vc.n_layer; i++) {
+            const std::string p = "v.blk." + std::to_string(i) + ".";
+            folds.push_back({p + "wqkv.weight",      p + "wqkv.bias",      p + "norm0.weight", p + "norm0.bias"});
+            folds.push_back({p + "mlp.fc0.weight",   p + "mlp.fc0.bias",   p + "norm1.weight", p + "norm1.bias"});
+        }
+        folds.push_back({"mm.linear_1.weight", "mm.linear_1.bias", "mm.pre_norm.weight", "mm.pre_norm.bias"});
+
+        const bool want_bias = getenv("VC3_FOLD_BIAS") != nullptr;
+        const bool want_scale = getenv("VC3_FOLD_W") != nullptr;
+        bool ok = want_bias || want_scale;
+        if (ok) {
+            size_t store_bytes = 0;
+            for (auto & f : folds) {
+                ggml_tensor * W = ggml_get_tensor(wctx, f.w.c_str());
+                ggml_tensor * B = ggml_get_tensor(wctx, f.b.c_str());
+                if (!W || !B || !ggml_get_tensor(wctx, f.nw.c_str()) || !ggml_get_tensor(wctx, f.nb.c_str()))
+                    { ok = false; break; }
+                store_bytes += (size_t)ggml_nbytes(B);
+                if (want_scale) store_bytes += (size_t)ggml_nbytes(W);
+            }
+            if (ok) {
+                fold_storage.resize(store_bytes);
+                size_t off = 0;
+                for (auto & f : folds) {
+                    ggml_tensor * W  = ggml_get_tensor(wctx, f.w.c_str());
+                    ggml_tensor * B  = ggml_get_tensor(wctx, f.b.c_str());
+                    ggml_tensor * NW = ggml_get_tensor(wctx, f.nw.c_str());
+                    ggml_tensor * NB = ggml_get_tensor(wctx, f.nb.c_str());
+                    const int64_t in = W->ne[0], out = W->ne[1];
+                    const float * w = (const float *)NW->data;    // F32 after the 1D pass
+                    const float * b = (const float *)NB->data;
+                    float * bnew = (float *)(fold_storage.data() + off);
+                    off += (size_t)ggml_nbytes(B);
+                    char * wnew = nullptr;
+                    if (want_scale) { wnew = fold_storage.data() + off; off += (size_t)ggml_nbytes(W); }
+                    // one pass per column: W·b for the new bias (+ optional
+                    // w[i]·W[i,o]; input-dim scaling is orthogonal to the
+                    // rope_layout=2 row permutation on the output side)
+                    if (W->type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * src = (const ggml_fp16_t *)W->data;
+                        ggml_fp16_t * dst = (ggml_fp16_t *)wnew;
+                        for (int64_t o = 0; o < out; o++) {
+                            const ggml_fp16_t * col = src + (size_t)o * in;
+                            ggml_fp16_t * dcol = dst ? dst + (size_t)o * in : nullptr;
+                            float acc = 0.0f;
+                            for (int64_t i = 0; i < in; i++) {
+                                const float v = ggml_fp16_to_fp32(col[i]);
+                                acc += v * b[i];
+                                if (dcol) dcol[i] = ggml_fp32_to_fp16(v * w[i]);
+                            }
+                            bnew[o] = acc + ((const float *)B->data)[o];
+                        }
+                    } else if (W->type == GGML_TYPE_F32) {
+                        const float * src = (const float *)W->data;
+                        float * dst = (float *)wnew;
+                        for (int64_t o = 0; o < out; o++) {
+                            const float * col = src + (size_t)o * in;
+                            float * dcol = dst ? dst + (size_t)o * in : nullptr;
+                            float acc = 0.0f;
+                            for (int64_t i = 0; i < in; i++) {
+                                acc += col[i] * b[i];
+                                if (dcol) dcol[i] = col[i] * w[i];
+                            }
+                            bnew[o] = acc + ((const float *)B->data)[o];
+                        }
+                    } else { ok = false; break; }
+                    B->data = bnew;
+                    if (wnew) W->data = wnew;
+                }
+                if (!ok) fold_storage.clear();
+            }
+            if (ok) {
+                fold_bias = true;
+                fold_scale = want_scale;
+                fprintf(stderr, "vision LN %sfolded into wqkv/fc0/mm_l1 biases%s (%.1f MB host block)\n",
+                        want_scale ? "affines " : "bias ",
+                        want_scale ? " + gains" : "",
+                        (double)fold_storage.size() / 1e6);
+            }
+        }
+        // patch bias -> host pos table: host-side F32, exact, always on
+        {
+            ggml_tensor * pb = ggml_get_tensor(wctx, "v.patch_embd.bias");
+            if (pb && pb->type == GGML_TYPE_F32 && pb->ne[0] == vc.n_embd && pb->ne[1] == 1)
+                patch_bias.assign((const float *)pb->data, (const float *)pb->data + vc.n_embd);
+        }
+        // wo input rows: 72 -> 80 per head with zero rows. FA's pad columns are
+        // exact zeros (the converter zero-pads the wqkv rows and bias), so the
+        // extra dot-product terms are exact zeros — bitwise identical, and the
+        // graph drops the de-padding view+cont for single-clip inputs.
+        if (vc.n_embd / vc.n_head == 72 && getenv("VC3_NO_FOLD") == nullptr) {
+            const int64_t in_old = vc.n_embd, in_new = vc.n_head * 80;
+            const size_t w_bytes = (size_t)in_new * vc.n_embd * sizeof(ggml_fp16_t);
+            const size_t base = fold_storage.size();
+            fold_storage.resize(base + (size_t)vc.n_layer * w_bytes);
+            bool ok = true;
+            for (int i = 0; i < vc.n_layer && ok; i++) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "v.blk.%d.wo.weight", i);
+                ggml_tensor * W = ggml_get_tensor(wctx, buf);
+                if (!W || W->type != GGML_TYPE_F16 || W->ne[0] != in_old) { ok = false; break; }
+                const ggml_fp16_t * src = (const ggml_fp16_t *)W->data;
+                ggml_fp16_t * dst = (ggml_fp16_t *)(fold_storage.data() + base + (size_t)i * w_bytes);
+                const int64_t out = W->ne[1];
+                for (int64_t o = 0; o < out; o++) {
+                    for (int64_t h = 0; h < vc.n_head; h++) {
+                        const ggml_fp16_t * srow = src + (size_t)o * in_old + h * 72;
+                        ggml_fp16_t * drow = dst + (size_t)o * in_new + h * 80;
+                        for (int j = 0; j < 72; j++) drow[j] = srow[j];
+                        for (int j = 72; j < 80; j++) drow[j] = ggml_fp32_to_fp16(0.0f);
+                    }
+                }
+                W->ne[0] = in_new;
+                W->nb[0] = sizeof(ggml_fp16_t);
+                W->nb[1] = (size_t)in_new * sizeof(ggml_fp16_t);
+                W->nb[2] = W->nb[1];
+                W->nb[3] = W->nb[2];
+                W->data = dst;
+            }
+            if (ok) { wo_padded = true; fprintf(stderr, "wo input rows padded to %d/head (%.1f MB host block)\n",
+                                                (int)in_new / vc.n_head, (double)(vc.n_layer * w_bytes) / 1e6); }
+        }
+    }
+
     {
         ggml_tensor * pe = ggml_get_tensor(wctx, "v.pos_emb.weight");
         ggml_tensor * tw = ggml_get_tensor(wctx, "v.pos_emb.time_weight");
@@ -372,10 +521,14 @@ bool VideoChat3::load_weights(const char * path) {
             const char * f32_begin = host_f32.empty() ? nullptr : host_f32.data();
             const char * f32_end = f32_begin ? f32_begin + host_f32.size() : nullptr;
             if (f32_begin) wbuf_plain = ggml_backend_cpu_buffer_from_ptr(host_f32.data(), host_f32.size());
+            const char * fold_begin = fold_storage.empty() ? nullptr : fold_storage.data();
+            const char * fold_end = fold_begin ? fold_begin + fold_storage.size() : nullptr;
+            if (fold_begin) wbuf_fold = ggml_backend_cpu_buffer_from_ptr(fold_storage.data(), fold_storage.size());
             for (auto & u : uploads) {
                 ggml_tensor * t = u.first;
                 const char * p = (const char *)t->data;
-                t->buffer = (f32_begin && p >= f32_begin && p < f32_end) ? wbuf_plain : wbuf;
+                t->buffer = (f32_begin && p >= f32_begin && p < f32_end) ? wbuf_plain
+                          : (fold_begin && p >= fold_begin && p < fold_end) ? wbuf_fold : wbuf;
             }
             fprintf(stderr, "weights: %.2f GB zero-copy from mmap (%s)\n", total / 1e9,
                     f32_begin ? "1D tensors in host f32 block" : "all in mmap");
@@ -485,9 +638,114 @@ void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
     }
 }
 
+// ---- shared ViT block plumbing (vqa::vit::block) --------------------------
+// everything the attention hook and the layer-0 parity probes need from
+// encode_vision's scope; state = 1 after a successful truncated run
+namespace {
+struct Vc3VitEnv {
+    ggml_context *gctx;
+    ggml_cgraph *gf;
+    VisConfig *vc = nullptr;
+    ggml_tensor *t_vpos;
+    int N = 0, vhd = 0, vhd_f = 0, hw = 0, n_ctx = 0, layer = 0;
+    bool pad80 = false, wo_padded = false;
+    const std::vector<int> *clip_t = nullptr;
+    const char *stop_after = nullptr;
+    std::function<bool(const char *)> run;
+    int state = 0;
+};
+
+static ggml_tensor * vc3_vit_attention(void * ud_, ggml_tensor * qkv) {
+    Vc3VitEnv & e = *(Vc3VitEnv *)ud_;
+    ggml_context * gctx = e.gctx;
+    const VisConfig & vc = *e.vc;
+    const int il = e.layer, N = e.N, vhd = e.vhd, vhd_f = e.vhd_f;
+
+    // qkv packs the three padded projections along ne0; the converter pads and
+    // permutes the rows so each [80]-wide head slice works as-is - feed strided
+    // views straight into rope/FA, no cont(), no runtime padding copies
+    const size_t off = (size_t)vc.n_head * vhd_f * qkv->nb[0];
+    auto qkv_head_view = [&](int block) {
+        return ggml_view_3d(gctx, qkv, vhd_f, vc.n_head, N,
+                            (size_t)vhd_f * qkv->nb[0], qkv->nb[1], (size_t)block * off);
+    };
+    ggml_tensor * q = qkv_head_view(0);
+    ggml_tensor * k = qkv_head_view(1);
+    ggml_tensor * v = qkv_head_view(2);
+
+    // rope: the converter's 72->80 pad makes n_dims 40; rescale freq_base so
+    // each real pair keeps its exact frequency (theta**(-p/18) == (theta**(20/18))**(-2p/40))
+    int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
+    const float rope_base = e.pad80 ? powf(vc.rope_theta, (float)vhd_f / vhd) : vc.rope_theta;
+    q = ggml_rope_multi(gctx, q, e.t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
+                        e.n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    k = ggml_rope_multi(gctx, k, e.t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
+                        e.n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (il == 0) {
+        ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
+        if (e.stop_after && !strcmp(e.stop_after, "v_blk0_q_rope")) {
+            ggml_build_forward_expand(e.gf, q);
+            if (!e.run("v_blk0_q_rope")) e.state = 2; else e.state = 1;
+            return nullptr;
+        }
+    }
+
+    // attention runs clip-locally with NO mask: a masked flash-attn falls off
+    // the fast path, and clip tokens are contiguous, so per-clip unmasked FA
+    // (same trick as the SigLIP tower's multi-crop) is both exact and fast.
+    auto fa_in = [&](ggml_tensor * t, int n_tok, size_t tok_off) {
+        return ggml_view_3d(gctx, t, vhd_f, n_tok, vc.n_head, t->nb[2], t->nb[1], tok_off * t->nb[2]);
+    };
+    ggml_tensor * fa = nullptr;
+    if (e.clip_t->size() == 1) {
+        ggml_tensor * qf = fa_in(q, N, 0);
+        ggml_tensor * kf = fa_in(k, N, 0);
+        ggml_tensor * vf = fa_in(v, N, 0);
+        fa = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
+    } else {
+        size_t coff = 0;
+        for (int t : *e.clip_t) {
+            const int cn = t * e.hw;
+            ggml_tensor * qf = fa_in(q, cn, coff);
+            ggml_tensor * kf = fa_in(k, cn, coff);
+            ggml_tensor * vf = fa_in(v, cn, coff);
+            ggml_tensor * fc = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
+            fc = ggml_cont(gctx, fc);
+            fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;   // fa out is [hd, heads, tokens]: concat tokens (dim2)
+            coff += (size_t)cn;
+        }
+    }
+    // wo expects rows (head, d). For a single clip FA's contiguous output is
+    // exactly (token, head, d)-major, so with the load-time wo fold (8 zero
+    // input rows per head appended, exact since FA pad columns are zero) a
+    // plain reshape feeds it to the matmul — no de-padding view+cont pair.
+    // The multi-clip concat layout is left on the verified old path.
+    if (e.wo_padded && e.clip_t->size() == 1)
+        return ggml_reshape_2d(gctx, fa, (int64_t)vc.n_head * vhd_f, N);
+    ggml_tensor * attn_src = fa;
+    if (e.pad80)
+        attn_src = ggml_view_3d(gctx, fa, vhd, vc.n_head, N,
+                                (size_t)vhd_f * sizeof(float), (size_t)vhd_f * vc.n_head * sizeof(float), 0);
+    return ggml_reshape_2d(gctx, ggml_cont(gctx, attn_src), vc.n_embd, N);
+}
+
+static bool vc3_vit_probe(void * ud_, const char * stage, ggml_tensor * t) {
+    Vc3VitEnv & e = *(Vc3VitEnv *)ud_;
+    char nm[40];
+    snprintf(nm, sizeof(nm), "v_blk0_%s", stage);
+    ggml_set_name(t, nm);
+    if (e.stop_after && !strcmp(e.stop_after, nm)) {
+        ggml_build_forward_expand(e.gf, t);
+        if (!e.run(nm)) e.state = 2; else e.state = 1;
+        return true;   // truncated: encode_vision returns after freeing gctx
+    }
+    return false;
+}
+}  // namespace
+
 // ---------------------------------------------------------------- vision
 bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
-                               std::vector<std::pair<float,int>> * clip_marks) {
+                               std::vector<std::pair<float,int>> * clip_marks, int token_budget) {
     *n_tokens = 0;
     if (media.empty()) return true;
     const int T = (int)media.frames.size();
@@ -496,7 +754,25 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 
     int H = 0, W = 0;
     // qwen_vl_utils defaults used by the official demo: min 56*56, max 16384*28*28
-    if (!smart_resize(src_h, src_w, factor, 3136, 16384 * 28 * 28, &H, &W)) {
+    long long max_pixels = 16384LL * 28 * 28;
+    if (token_budget > 0) {
+        // merged tokens per clip = (H/28)*(W/28) = H*W/factor^2, and the merger
+        // mean-pools the time axis of each temporal clip
+        const int n_clips = (T + vc.temporal_merge - 1) / vc.temporal_merge;
+        const long long min_total = 4LL * n_clips;             // min_pixels 56*56 -> 2x2 grid
+        if (token_budget < min_total) {
+            fprintf(stderr, "image/video cannot fit in n_ctx: needs >= %d merged vision tokens "
+                            "(%d clip%s), budget %d -- raise --n-ctx or reduce --max-tokens\n",
+                    (int)min_total, n_clips, n_clips == 1 ? "" : "s", token_budget);
+            return false;
+        }
+        const long long per_grid = token_budget / n_clips;
+        max_pixels = std::min(max_pixels, per_grid * factor * factor);
+        if (max_pixels < 16384LL * 28 * 28)
+            fprintf(stderr, "vision budget %d tokens (%d clip%s): max_pixels clamped to %.2f MP\n",
+                    token_budget, n_clips, n_clips == 1 ? "" : "s", max_pixels / 1e6);
+    }
+    if (!smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
     }
@@ -539,6 +815,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         pos_embed_for_grid(pos_emb_host.data(), pos_time_host.data(), vc, t, gh, gw, pos_clip);
         pos.insert(pos.end(), pos_clip.begin(), pos_clip.end());
     }
+    if (!patch_bias.empty())   // patch bias folded here: one fewer graph add
+        for (size_t k = 0; k < pos.size(); k++) pos[k] += patch_bias[k % vc.n_embd];
 
     const int vhd = vc.n_embd / vc.n_head;
     const bool pad80 = vhd == 72;
@@ -546,8 +824,10 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     // permutes the wqkv q/k rows into its (x-pairs | y-pairs, re|im) layout, so
     // rope is one fused kernel instead of the former ~9-node rotation subgraph
     std::vector<int> vpos((size_t)N * 4, 0);   // 4 position columns, vision uses 2
+    // rope coordinates are also assigned sequentially over the token stream
+    // (official get_freqs_cis reshapes the row-major table flat), one grid per clip
     for (int s = 0; s < N; s++) {
-        const int g = s % hw;   // frame-local (h, w): clips restart the 2D grid
+        const int g = s % hw;   // frame-local: clips restart the 2D grid
         vpos[s] = g % gw;              // section 0 coordinate = x
         vpos[(size_t)N + s] = g / gw;          // section 1 coordinate = y
     }
@@ -567,7 +847,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     ggml_set_name(t_zmask, "vzmask");
 
     ggml_tensor * x = ggml_mul_mat(gctx, v_patch_w, t_patches);
-    x = ggml_add(gctx, x, v_patch_b);
+    if (patch_bias.empty())   // bias folded into the host pos table at load time
+        x = ggml_add(gctx, x, v_patch_b);
     x = ggml_add(gctx, x, t_pos);
     ggml_set_name(x, "v_patch_out");
 
@@ -617,7 +898,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             v_alloc += std::chrono::duration<double,std::milli>(rb-ra).count();
             v_input += std::chrono::duration<double,std::milli>(rc-rb).count();
             v_comp  += std::chrono::duration<double,std::milli>(rd-rc).count();
-            fprintf(stderr, "[vprof] run=%d alloc %.1fms input %.1fms compute %.1fms\n",
+            fprintf(stderr, "[vprof] run=%d alloc %.1fms input %.1fms compute %.1fms\n",
                     v_runs, v_alloc/v_runs, v_input/v_runs, v_comp/v_runs);
         }
         dump(gf, "patches");
@@ -658,114 +939,26 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 
     int vl_max = vc.n_layer;
     { const char * e = getenv("VC3_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
+    Vc3VitEnv env;
+    env.gctx = gctx; env.gf = gf; env.vc = &vc; env.t_vpos = t_vpos;
+    env.N = N; env.vhd = vhd; env.vhd_f = pad80 ? 80 : vhd; env.hw = hw; env.n_ctx = n_ctx;
+    env.pad80 = pad80; env.wo_padded = wo_padded; env.clip_t = &clip_t;
+    env.stop_after = stop_after; env.run = run;
     for (int il = 0; il < vl_max; il++) {
         VisLayer & L = vl[il];
-        ggml_tensor * l = ggml_norm(gctx, x, vc.layernorm_eps);
-        l = ggml_mul(gctx, l, L.norm0_w);
-        l = ggml_add(gctx, l, L.norm0_b);
-        ggml_tensor * qkv = ggml_mul_mat(gctx, L.wqkv_w, l);
-        qkv = ggml_add(gctx, qkv, L.wqkv_b);
-
-        // qkv packs the three padded projections along ne0; the converter pads and
-        // permutes the rows so each [80]-wide head slice works as-is - feed strided
-        // views straight into rope/FA, no cont(), no runtime padding copies
-        const int vhd_f = pad80 ? 80 : vhd;
-        const size_t off = (size_t)vc.n_head * vhd_f * qkv->nb[0];
-        auto qkv_head_view = [&](int block) {
-            return ggml_view_3d(gctx, qkv, vhd_f, vc.n_head, N,
-                                (size_t)vhd_f * qkv->nb[0], qkv->nb[1], (size_t)block * off);
-        };
-        ggml_tensor * q = qkv_head_view(0);
-        ggml_tensor * k = qkv_head_view(1);
-        ggml_tensor * v = qkv_head_view(2);
-        if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
-        if (il == 0 && stop_after && !strcmp(stop_after, "v_blk0_qkv")) {
-            ggml_build_forward_expand(gf, qkv);
-            if (!run("v_blk0_qkv")) { ggml_free(gctx); return false; }
+        vqa::vit::BlockWeights bw{L.norm0_w, L.norm0_b, L.wqkv_w, L.wqkv_b, L.wo_w, L.wo_b,
+                                  L.norm1_w, L.norm1_b, L.fc0_w, L.fc0_b, L.fc1_w, L.fc1_b};
+        vqa::vit::BlockHooks bh;
+        bh.attention = vc3_vit_attention;
+        bh.probe_layer0 = vc3_vit_probe;
+        bh.drop_ln_mul = fold_scale;   // gain folded into wqkv/fc0 (VC3_FOLD_W)
+        bh.drop_ln_add = fold_bias;    // bias folded into wqkv/fc0
+        bh.ud = &env;
+        env.layer = il;
+        x = vqa::vit::block(gctx, x, bw, vc.layernorm_eps, bh, il);
+        if (!x) {   // layer-0 probe truncated the graph (state 1) or failed (2)
             ggml_free(gctx);
-            return true;
-        }
-
-        // rope: the converter's 72->80 pad makes n_dims 40; rescale freq_base so
-        // each real pair keeps its exact frequency (theta**(-p/18) == (theta**(20/18))**(-2p/40))
-        int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
-        const float rope_base = pad80 ? powf(vc.rope_theta, (float)vhd_f / vhd) : vc.rope_theta;
-        q = ggml_rope_multi(gctx, q, t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
-                            n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k = ggml_rope_multi(gctx, k, t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
-                            n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (il == 0) {
-            ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
-            if (stop_after && !strcmp(stop_after, "v_blk0_q_rope")) {
-                ggml_build_forward_expand(gf, q);
-                if (!run("v_blk0_q_rope")) { ggml_free(gctx); return false; }
-                ggml_free(gctx);
-                return true;
-            }
-        }
-
-        // attention runs clip-locally with NO mask: a masked flash-attn falls off
-        // the fast path, and clip tokens are contiguous, so per-clip unmasked FA
-        // (same trick as SkyVision.cpp's multi-crop SigLIP) is both exact and fast.
-        auto fa_in = [&](ggml_tensor * t, int n_tok, size_t tok_off) {
-            return ggml_view_3d(gctx, t, vhd_f, n_tok, vc.n_head, t->nb[2], t->nb[1], tok_off * t->nb[2]);
-        };
-        ggml_tensor * fa = nullptr;
-        if (clip_t.size() == 1) {
-            ggml_tensor * qf = fa_in(q, N, 0);
-            ggml_tensor * kf = fa_in(k, N, 0);
-            ggml_tensor * vf = fa_in(v, N, 0);
-            fa = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-        } else {
-            size_t coff = 0;
-            for (int t : clip_t) {
-                const int cn = t * hw;
-                ggml_tensor * qf = fa_in(q, cn, coff);
-                ggml_tensor * kf = fa_in(k, cn, coff);
-                ggml_tensor * vf = fa_in(v, cn, coff);
-                ggml_tensor * fc = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-                fc = ggml_cont(gctx, fc);
-                fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;   // fa out is [hd, heads, tokens]: concat tokens (dim2)
-                coff += (size_t)cn;
-            }
-        }
-        // fa is [vhd_f, n_head, N]; drop the padding cols and lay out rows as tokens
-        ggml_tensor * attn_src = fa;
-        if (pad80)
-            attn_src = ggml_view_3d(gctx, fa, vhd, vc.n_head, N,
-                                    (size_t)vhd_f * sizeof(float), (size_t)vhd_f * vc.n_head * sizeof(float), 0);
-        ggml_tensor * attn =
-                ggml_reshape_2d(gctx, ggml_cont(gctx, attn_src), vc.n_embd, N);
-        attn = ggml_mul_mat(gctx, L.wo_w, attn);
-        attn = ggml_add(gctx, attn, L.wo_b);
-        x = ggml_add(gctx, x, attn);
-        if (il == 0) {
-            ggml_set_name(x, "v_blk0_attn_out");
-            if (stop_after && !strcmp(stop_after, "v_blk0_attn_out")) {
-                ggml_build_forward_expand(gf, x);
-                if (!run("v_blk0_attn_out")) { ggml_free(gctx); return false; }
-                ggml_free(gctx);
-                return true;
-            }
-        }
-
-        ggml_tensor * m = ggml_norm(gctx, x, vc.layernorm_eps);
-        m = ggml_mul(gctx, m, L.norm1_w);
-        m = ggml_add(gctx, m, L.norm1_b);
-        m = ggml_mul_mat(gctx, L.fc0_w, m);
-        m = ggml_add(gctx, m, L.fc0_b);
-        m = ggml_gelu(gctx, m);                       // gelu_pytorch_tanh
-        m = ggml_mul_mat(gctx, L.fc1_w, m);
-        m = ggml_add(gctx, m, L.fc1_b);
-        x = ggml_add(gctx, x, m);
-        if (il == 0) {
-            ggml_set_name(x, "v_blk0_out");
-            if (stop_after && !strcmp(stop_after, "v_blk0_out")) {
-                ggml_build_forward_expand(gf, x);
-                if (!run("v_blk0_out")) { ggml_free(gctx); return false; }
-                ggml_free(gctx);
-                return true;
-            }
+            return env.state == 1;
         }
     }
     x = ggml_norm(gctx, x, vc.layernorm_eps);
@@ -809,8 +1002,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             return true;
         }
         ggml_tensor * pn = ggml_norm(gctx, x3, 1e-5f);
-        pn = ggml_mul(gctx, pn, mm_pre_w);
-        pn = ggml_add(gctx, pn, mm_pre_b);
+        if (!fold_scale) pn = ggml_mul(gctx, pn, mm_pre_w);   // gain folded into mm_l1 (VC3_FOLD_W)
+        if (!fold_bias)  pn = ggml_add(gctx, pn, mm_pre_b);   // bias folded into mm_l1
         ggml_tensor * x2 = ggml_reshape_2d(gctx, pn, (int64_t)vc.n_embd * kw * kh, (int64_t)nh * nw * clip_t.size());
         ggml_tensor * h = ggml_mul_mat(gctx, mm_l1_w, x2);
         h = ggml_add(gctx, h, mm_l1_b);
@@ -1084,7 +1277,24 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
     int n_img = 0;
     const auto tv0 = std::chrono::steady_clock::now();
     std::vector<std::pair<float,int>> clip_marks;
-    if (!encode_vision(media, feats, &n_img, &clip_marks)) return false;
+    const bool video_kind = media.kind == vqa::MediaKind::Video;
+    // spend at most n_ctx - max_tokens - text on vision tokens; measure the text
+    // overhead with a 1-placeholder prompt (clip timestamps add a few tokens more,
+    // covered by the 16-token margin) so an oversized image is clamped or rejected
+    // before the multi-second vision encode instead of after it
+    {
+        const int text_overhead = (int)tok_.encode(render_prompt(1, prompt, video_kind, nullptr)).size();
+        // per-clip timestamp prompt ("<12.5 seconds>" etc.) costs ~10 tokens; the
+        // 1-placeholder probe above renders none of them, so reserve room for all clips
+        const int n_clips = (int)((media.frames.size() + vc.temporal_merge - 1) / vc.temporal_merge);
+        const int budget = n_ctx - gp.max_tokens - text_overhead - 16 - 12 * n_clips;
+        if (budget <= 0) {
+            fprintf(stderr, "n_ctx %d too small: prompt %d tokens + max_new %d leaves nothing for the image\n",
+                    n_ctx, text_overhead, gp.max_tokens);
+            return false;
+        }
+        if (!encode_vision(media, feats, &n_img, &clip_marks, budget)) return false;
+    }
     fprintf(stderr, "[perf] vision encode: %.0f ms (%d tokens)\n",
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
@@ -1100,6 +1310,13 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
         if (n_img > 0) return false;
     }
     fprintf(stderr, "prompt: %d tokens (%d image), max_new %d\n", (int)ids.size(), n_img, gp.max_tokens);
+    int max_new = gp.max_tokens;
+    if ((int)ids.size() + max_new > n_ctx) {
+        max_new = n_ctx - (int)ids.size();
+        fprintf(stderr, "warning: prompt %d + max_new %d > n_ctx %d, clamping max_new to %d\n",
+                (int)ids.size(), gp.max_tokens, n_ctx, max_new);
+        if (max_new <= 0) return false;
+    }
 
     n_past = 0;
     kv.clear();
@@ -1113,13 +1330,13 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
     out_text.clear();
     int next = sample(logits, gp);
     int n_dec = 0;
-    for (int step = 0; step < gp.max_tokens; step++) {
+    for (int step = 0; step < max_new; step++) {
         if (next == id_eos || next == id_endoftext) break;
         const std::string piece = tok_.decode({next});
         out_text += piece;
         if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
         n_dec++;
-        if (step + 1 >= gp.max_tokens) break;
+        if (step + 1 >= max_new) break;
         if (!run_text(g, {next}, nullptr, nullptr, logits)) break;
         next = sample(logits, gp);
     }
