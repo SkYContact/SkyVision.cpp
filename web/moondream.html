@@ -32,8 +32,8 @@
   <h1>__MODEL_ID__</h1>
   <div class="sub">moondream3.1-9B-A2B · caption / 提问 / 检测 / 定位</div>
 
-  <div id="drop">点击或拖入图片</div>
-  <input type="file" id="file" accept="image/*" hidden>
+  <label id="drop" for="file">点击或拖入图片</label>
+  <input type="file" id="file" accept="image/*" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden">
   <div id="imgbox"><img id="img" alt=""><svg id="overlay" width="100%" height="100%"></svg></div>
 
   <div class="row">
@@ -58,7 +58,6 @@ const imgbox = document.getElementById('imgbox'), img = document.getElementById(
 const overlay = document.getElementById('overlay');
 let blob = null, iw = 0, ih = 0;
 
-drop.onclick = () => file.click();
 drop.ondragover = e => { e.preventDefault(); drop.classList.add('on'); };
 drop.ondragleave = () => drop.classList.remove('on');
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove('on'); take(e.dataTransfer.files[0]); };

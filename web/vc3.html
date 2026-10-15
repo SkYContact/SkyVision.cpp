@@ -32,10 +32,10 @@
   <h1>__MODEL_ID__</h1>
   <div class="sub">VideoChat3-4B · 图像 / 视频问答（视频自动帧采样 + 时间戳）</div>
 
-  <div id="drop">点击或拖入图片 / 视频（mp4 等）</div>
+  <label id="drop" for="file">点击或拖入图片 / 视频（mp4 等）</label>
   <img id="preview" alt="">
   <video id="preview" controls style="display:none"></video>
-  <input type="file" id="file" accept="image/*,video/*" hidden>
+  <input type="file" id="file" accept="image/*,video/*" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden">
 
   <div class="row">
     <input type="text" id="q" placeholder="问点什么…（如：视频中第几秒颜色开始变化？）" value="Describe this media.">
@@ -56,7 +56,6 @@ const drop = document.getElementById('drop'), file = document.getElementById('fi
 const imgP = document.querySelector('img#preview'), vidP = document.querySelector('video#preview');
 let blob = null, isVideo = false;
 
-drop.onclick = () => file.click();
 drop.ondragover = e => { e.preventDefault(); drop.classList.add('on'); };
 drop.ondragleave = () => drop.classList.remove('on');
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove('on'); take(e.dataTransfer.files[0]); };
