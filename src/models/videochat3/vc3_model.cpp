@@ -14,6 +14,7 @@
 #include "vit_block.hpp"
 
 #include <functional>
+#include <array>
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -66,6 +67,9 @@ struct TextGraph {
     ggml_tensor *logits = nullptr;
 };
 
+// batch attention group: (col_start, col_count, kv_base, window)
+typedef std::array<int, 4> BatGroup;
+
 class VideoChat3 : public vqa::Model {
 public:
     ~VideoChat3() override;
@@ -93,7 +97,8 @@ private:
     // before the expensive vision encode (instead of the late run_text check)
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
                        std::vector<std::pair<float,int>> * clip_marks = nullptr, int token_budget = 0);
-    bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false);
+    bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false,
+                          const std::vector<BatGroup> * bat_groups = nullptr);
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<float> * img_feats,
                   const std::vector<int> * img_pos, std::vector<float> & logits_out);
     std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video,
@@ -142,8 +147,11 @@ private:
     ggml_context * bat_ctx = nullptr;
     ggml_cgraph * bat_gf = nullptr;
     ggml_tensor * bat_tok = nullptr, * bat_pos = nullptr, * bat_mask = nullptr;
+    int bat_win = 0;
+    std::vector<BatGroup> bat_groups;
     int step_batch(const std::vector<int> & toks, const std::vector<int> & posv,
-                   const std::vector<int> & lo, const std::vector<int> & hi, float * logits_out);
+                   const std::vector<int> & lo, const std::vector<int> & hi,
+                   const std::vector<BatGroup> & groups, int win, float * logits_out);
     int run_batch(const std::string & path, int n_gen);
     // static decode graph (T=1, fixed KV window per block): same gf object across
     // steps -> eligible for ggml CUDA graph capture (see moondream Engine::step)
@@ -1074,7 +1082,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 }
 
 // ---------------------------------------------------------------- text// ---------------------------------------------------------------- text
-bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all) {
+bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all,
+                               const std::vector<BatGroup> * bat_groups) {
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
@@ -1086,8 +1095,10 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
     ggml_set_name(g.tok_in, "tok_in");
     g.pos_in = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, T);
     ggml_set_name(g.pos_in, "pos_in");
-    g.mask_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, S, T);
-    ggml_set_name(g.mask_in, "mask_in");
+    if (!bat_groups) {
+        g.mask_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, S, T);
+        ggml_set_name(g.mask_in, "mask_in");
+    }
 
     // token embedding stays on the device (works with a quantized token_embd and
     // avoids one host round-trip per prompt token); image rows are scattered into
@@ -1103,6 +1114,21 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
     }
     ggml_set_name(x, "emb");
 
+    // batch group masks: ONE tensor per group, shared by every layer (creating
+    // them inside the layer loop made 36 same-named tensors and only the first
+    // ever got filled — the rest ran on uninitialized memory)
+    std::vector<ggml_tensor *> bat_mask_ts;
+    if (bat_groups) {
+        char mn[24];
+        for (const auto & gr : *bat_groups) {
+            snprintf(mn, sizeof(mn), "mask_b%d", gr[0]);
+            int w = (gr[3] + 31) & ~31;
+            if (gr[2] + w > n_ctx) w = n_ctx - gr[2];
+            ggml_tensor * m = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F16, w, gr[1]);
+            ggml_set_name(m, mn);
+            bat_mask_ts.push_back(m);
+        }
+    }
     int max_layers = n_layer;
     if (const char * e = getenv("VC3_MAX_LAYERS")) max_layers = std::min(max_layers, atoi(e));
     for (int il = 0; il < max_layers; il++) {
@@ -1138,13 +1164,46 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
         // q3 is [HD, NH, T]; flash attention wants [HD, n_q, n_head], so swap the
         // two trailing strides. The KV cache is [NKV*HD, n_ctx]: one position is
         // NKV*HD halves and one head inside it is HD halves.
+        ggml_tensor * fa = nullptr;
+        if (bat_groups) {
+            // batch layout: each group is one sequence with its own KV window
+            // view at its own base - attention work scales with the window, not
+            // with n_ctx (the old single masked FA swept all 8192 slots for
+            // every column, 7/8 of it masked-off garbage)
+            for (size_t gi = 0; gi < bat_groups->size(); gi++) {
+                const auto & gr = (*bat_groups)[gi];
+                const int cs = gr[0], cc = gr[1], cbase = gr[2];
+                // FA's CUDA kernels want the KV/mask width 32-aligned; pad the
+                // window and hide the tail slots with the mask
+                int cwin = (gr[3] + 31) & ~31;
+                if (cbase + cwin > n_ctx) cwin = n_ctx - cbase;
+                ggml_tensor * qs = ggml_view_3d(g.ctx, q3, HD, NH, cc, q3->nb[1], q3->nb[2],
+                                                (size_t)cs * q3->nb[2]);
+                ggml_tensor * qfs = ggml_view_3d(g.ctx, qs, HD, cc, NH, qs->nb[2], qs->nb[1], 0);
+                ggml_tensor * kfs = ggml_view_3d(g.ctx, kv.k[il], HD, cwin, NKV,
+                                                 kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t),
+                                                 (size_t)cbase * kv.k[il]->nb[1]);
+                ggml_tensor * vfs = ggml_view_3d(g.ctx, kv.v[il], HD, cwin, NKV,
+                                                 kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t),
+                                                 (size_t)cbase * kv.v[il]->nb[1]);
+                // NOTE: look the mask up by NAME only at input-set time; inside
+                // the build the tensors are not graph members yet, so use the
+                // pre-created pointer directly
+                ggml_tensor * ms = bat_mask_ts[gi];
+                ggml_tensor * fs = ggml_flash_attn_ext(g.ctx, qfs, kfs, vfs, ms,
+                                                       1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+                fa = fa ? ggml_concat(g.ctx, fa, fs, 1) : fs;
+            }
+        } else {
         ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
         ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[il], HD, S, NKV,
                                         kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
         ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[il], HD, S, NKV,
                                         kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
+        ggml_tensor * fa2 = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
                                                1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+        fa = fa2;
+        }
         ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
         if (il == 0) ggml_set_name(attn, "t_l0_attn");
         attn = ggml_mul_mat(g.ctx, L.o, attn);
