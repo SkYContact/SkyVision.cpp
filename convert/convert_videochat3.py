@@ -59,7 +59,8 @@ PATTERNS = ("model.safetensors.index.json", "model.safetensors")
 TEXT_CFG = dict(n_layer=36, n_embd=2560, n_head=32, n_kv_head=8, head_dim=128,
                 n_ff=9728, n_vocab=151936, rms_eps=1e-6, rope_theta=5e6, ctx=262144)
 VIS_CFG = dict(n_layer=27, n_embd=1152, n_head=16, n_ff=4304, patch=14, merge=2,
-               temporal_merge=4, pos_h=64, pos_w=64, eps=1e-5)
+               temporal_merge=4, pos_h=64, pos_w=64, eps=1e-5,
+               head_dim=72)   # 1152 / 16
 SPECIAL = dict(image_token_id=151655, video_token_id=151656, vision_start_token_id=151652,
                vision_end_token_id=151653, im_start_token_id=151644, im_end_token_id=151645,
                eos_token_id=151645, pad_token_id=151643)
@@ -134,6 +135,7 @@ def write_metadata(gw, text, vis, outtype):
     gw.add_uint32("videochat3.vision.pos_emb_width", vis["pos_w"])
     gw.add_float32("videochat3.vision.layer_norm_epsilon", vis["eps"])
     gw.add_float32("videochat3.vision.rope_theta", 10000.0)
+    gw.add_uint32("videochat3.vision.rope_layout", 1)   # 1 = VISION-rope row perm
     for key, value in SPECIAL.items():
         gw.add_uint32(f"videochat3.{key}", value)
 
@@ -245,10 +247,30 @@ def main():
     vision_suffixes = ("norm0.weight", "norm0.bias", "norm1.weight", "norm1.bias",
                        "wqkv.weight", "wqkv.bias", "wo.weight", "wo.bias",
                        "mlp.fc0.weight", "mlp.fc0.bias", "mlp.fc1.weight", "mlp.fc1.bias")
+    # Vision wqkv gets its q/k OUTPUT ROWS permuted per head so the engine can use
+    # ggml's fused GGML_ROPE_TYPE_VISION kernel: our interleaved pair order
+    # (x0,y0,x1,y1,...) becomes section blocks (x-pairs | y-pairs), each split into
+    # NEOX halves (re|im). See the rope handling in vc3_model.cpp.
+    half_pairs = vis["head_dim"] // 4          # pairs per section (72 -> 18)
+    perm = ([4 * i     for i in range(half_pairs)] +   # x re  -> pairs 0..17
+            [4 * i + 2 for i in range(half_pairs)] +   # y re  -> pairs 18..35
+            [4 * i + 1 for i in range(half_pairs)] +   # x im
+            [4 * i + 3 for i in range(half_pairs)])    # y im
+    assert len(perm) == vis["head_dim"]
+
     for i in range(vis["n_layer"]):
         p, b = f"{vt}.encoder.blocks.{i}", f"v.blk.{i}"
         for suffix in vision_suffixes:
-            add_tensor(f"{b}.{suffix}", f"{p}.{suffix}")
+            if suffix == "wqkv.weight":
+                w = np.ascontiguousarray(weights.get(f"{p}.{suffix}")).copy()
+                hd = vis["head_dim"]
+                for h in range(vis["n_head"] * 2):     # q rows then k rows (v untouched)
+                    base = h * hd
+                    w[base:base + hd] = w[[base + j for j in perm]]
+                _lib.add_f16(gw, f"{b}.{suffix}", w)
+                stats["f16"] += 1
+            else:
+                add_tensor(f"{b}.{suffix}", f"{p}.{suffix}")
         if not args.quiet:
             progress(i, vis["n_layer"], "vision layer", every=6)
 

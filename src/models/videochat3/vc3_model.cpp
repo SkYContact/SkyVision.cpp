@@ -298,6 +298,10 @@ bool VideoChat3::load_weights(const char * path) {
     vc.pos_w   = gguf_u32(gu, "videochat3.vision.pos_emb_width", vc.pos_w);
     vc.layernorm_eps = gguf_f32(gu, "videochat3.vision.layer_norm_epsilon", vc.layernorm_eps);
     vc.rope_theta = gguf_f32(gu, "videochat3.vision.rope_theta", vc.rope_theta);
+    if (gguf_u32(gu, "videochat3.vision.rope_layout", 0) != 1) {
+        fprintf(stderr, "this build expects a rope_layout=1 GGUF (wqkv rows permuted for the fused vision rope); re-run convert/convert_videochat3.py\n");
+        return false;
+    }
 
     const size_t data_off = gguf_get_data_offset(gu);
     const int64_t nt = gguf_get_n_tensors(gu);
@@ -520,26 +524,15 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     }
 
     const int vhd = vc.n_embd / vc.n_head;
-            const bool pad80 = vhd == 72;
-    std::vector<float> rcos, rsin;
-    rope_2d_tables(vhd, T, gh, gw, vc.rope_theta, rcos, rsin);
-    // expand [pairs, N] to [pairs, n_head, N] flat - rope_2d consumes same-shape tensors
-    {
-        const int pairs = vhd / 2, NH = vc.n_head;
-        // rope_2d_tables writes pair-major buffers (table[p*N + s]); the ggml
-        // [1, pairs, H, N] tensor is row-major, so index both sides explicitly
-        std::vector<float> ex((size_t)pairs * NH * N);
-        for (int h = 0; h < NH; h++)
-            for (int s = 0; s < N; s++)
-                for (int p = 0; p < pairs; p++)
-                    ex[(size_t)p + (size_t)pairs * ((size_t)h + (size_t)NH * s)] = rcos[(size_t)p * N + s];
-        rcos.swap(ex);
-        std::vector<float> ey((size_t)pairs * NH * N);
-        for (int h = 0; h < NH; h++)
-            for (int s = 0; s < N; s++)
-                for (int p = 0; p < pairs; p++)
-                    ey[(size_t)p + (size_t)pairs * ((size_t)h + (size_t)NH * s)] = rsin[(size_t)p * N + s];
-        rsin.swap(ey);
+    const bool pad80 = vhd == 72;
+    // 2D positions for ggml's fused GGML_ROPE_TYPE_VISION kernel: the converter
+    // permutes the wqkv q/k rows into its (x-pairs | y-pairs, re|im) layout, so
+    // rope is one fused kernel instead of the former ~9-node rotation subgraph
+    std::vector<int> vpos((size_t)N * 4, 0);   // 4 position columns, vision uses 2
+    for (int s = 0; s < N; s++) {
+        const int g = s % hw;   // frame-local (h, w): clips restart the 2D grid
+        vpos[s] = g % gw;              // section 0 coordinate = x
+        vpos[(size_t)N + s] = g / gw;          // section 1 coordinate = y
     }
 
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
@@ -551,10 +544,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     ggml_set_name(t_patches, "patches");
     ggml_tensor * t_pos = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vc.n_embd, N);
     ggml_set_name(t_pos, "vpos");
-    ggml_tensor * t_cos = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, vhd / 2, vc.n_head, N);
-    ggml_set_name(t_cos, "vcos");
-    ggml_tensor * t_sin = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, vhd / 2, vc.n_head, N);
-    ggml_set_name(t_sin, "vsin");
+    ggml_tensor * t_vpos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, (int64_t)N * 4);
+    ggml_set_name(t_vpos, "vxy");
     ggml_tensor * t_zmask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, N, N);
     ggml_set_name(t_zmask, "vzmask");
     ggml_tensor * t_pad80 = nullptr;
@@ -583,8 +574,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         // truncated graphs may leave unused inputs unallocated (buffer == NULL)
         if (t_patches->buffer) ggml_backend_tensor_set(t_patches, patches.data(), 0, sizeof(float) * patches.size());
         if (t_pos->buffer)     ggml_backend_tensor_set(t_pos, pos.data(), 0, sizeof(float) * pos.size());
-        if (t_cos->buffer)     ggml_backend_tensor_set(t_cos, rcos.data(), 0, sizeof(float) * rcos.size());
-        if (t_sin->buffer)     ggml_backend_tensor_set(t_sin, rsin.data(), 0, sizeof(float) * rsin.size());
+        if (t_vpos->buffer) ggml_backend_tensor_set(t_vpos, vpos.data(), 0, sizeof(int) * vpos.size());
         fprintf(stderr, "[run] inputs set\n");
         if (t_pad80 && t_pad80->buffer) {
             std::vector<float> zeros(ggml_nelements(t_pad80), 0.0f);
@@ -686,8 +676,11 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             return true;
         }
 
-        q = rope_2d(gctx, gf, q, t_cos, t_sin);
-        k = rope_2d(gctx, gf, k, t_cos, t_sin);
+        int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
+        q = ggml_rope_multi(gctx, q, t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
+                            n_ctx, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_multi(gctx, k, t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
+                            n_ctx, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         if (il == 0) {
             ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
             if (stop_after && !strcmp(stop_after, "v_blk0_q_rope")) {
