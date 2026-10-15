@@ -715,12 +715,12 @@ static ggml_tensor * vc3_vit_attention(void * ud_, ggml_tensor * qkv) {
             coff += (size_t)cn;
         }
     }
-    // wo expects rows (head, d). For a single clip FA's contiguous output is
-    // exactly (token, head, d)-major, so with the load-time wo fold (8 zero
-    // input rows per head appended, exact since FA pad columns are zero) a
-    // plain reshape feeds it to the matmul — no de-padding view+cont pair.
-    // The multi-clip concat layout is left on the verified old path.
-    if (e.wo_padded && e.clip_t->size() == 1)
+    // wo expects rows (head, d). FA's contiguous output is already laid out
+    // (d fastest, head second, token outermost) — globally so even across the
+    // per-clip concat — so with the load-time wo fold (8 zero input rows per
+    // head appended, exact since FA pad columns are zero) a plain reshape
+    // feeds it to the matmul with no de-padding view+cont pair.
+    if (e.wo_padded)
         return ggml_reshape_2d(gctx, fa, (int64_t)vc.n_head * vhd_f, N);
     ggml_tensor * attn_src = fa;
     if (e.pad80)

@@ -269,7 +269,16 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 } else {
                     ok = vqa::load_image_from_memory(req.body, media);
                 }
-                if (!ok) { send_error(c, "media decode failed"); return true; }
+                if (!ok) {
+                    // stream requests expect NDJSON: a bare JSON error has no
+                    // trailing newline and the page's line splitter never sees it
+                    if (stream) {
+                        send_stream_head(c, "application/x-ndjson");
+                        send_chunk_str(c, "{\"error\":\"media decode failed (video needs ffmpeg; check FFMPEG)\"}\n");
+                        send_stream_end(c);
+                    } else send_error(c, "media decode failed");
+                    return true;
+                }
             }
             vqa::GenParams gp;
             gp.max_tokens = atoi(query_param(req.query, "n").c_str());
