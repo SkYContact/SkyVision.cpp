@@ -776,6 +776,28 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
     }
+    // VRAM guard: the tower runs at PATCH level, so the activation footprint
+    // scales with (H/patch)*(W/patch)*T — the token budget above only bounds the
+    // text context. A 16-frame 1820x840 clip is within budget but needs ~5 GB
+    // of vision activations, which aborts the whole process on a 12 GB card.
+    // Cap the patch count (~48k rows ≈ 2 GB of f32 activations) by shrinking
+    // the per-frame resolution.
+    {
+        const long long n_patches = (long long)(H / vc.patch) * (W / vc.patch) * T;
+        const long long n_max = 48000;
+        if (n_patches > n_max) {
+            const double scale = (double)n_max / (double)n_patches;
+            max_pixels = std::min(max_pixels, (long long)(max_pixels * scale));
+            int H2, W2;
+            if (!smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H2, &W2)) {
+                fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
+                return false;
+            }
+            fprintf(stderr, "vision VRAM guard: %lld patches > %lld, shrinking %dx%d -> %dx%d each\n",
+                    n_patches, n_max, W, H, W2, H2);
+            H = H2; W = W2;
+        }
+    }
     if (media.kind == vqa::MediaKind::Video)
         fprintf(stderr, "video %d frame%s %dx%d -> %dx%d each\n", T, T == 1 ? "" : "s", src_w, src_h, W, H);
     else
