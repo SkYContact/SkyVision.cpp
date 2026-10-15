@@ -84,11 +84,14 @@ private:
     bool init_backend();
     bool load_weights(const char * path);
     bool alloc_kv();
-    bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens);
+    // clip_marks: per temporal clip (timestamp, token count) for prompt building
+    bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
+                       std::vector<std::pair<float,int>> * clip_marks = nullptr);
     bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false);
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<float> * img_feats,
                   const std::vector<int> * img_pos, std::vector<float> & logits_out);
-    std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video) const;
+    std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video,
+                               const std::vector<std::pair<float,int>> * clip_marks = nullptr) const;
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     float randf();
     void dump(const ggml_cgraph * gf, const char * name);
@@ -483,7 +486,8 @@ void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
 }
 
 // ---------------------------------------------------------------- vision
-bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens) {
+bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
+                               std::vector<std::pair<float,int>> * clip_marks) {
     *n_tokens = 0;
     if (media.empty()) return true;
     const int T = (int)media.frames.size();
@@ -507,6 +511,19 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     std::vector<int> clip_t;
     for (int off = 0; off < T; off += vc.temporal_merge)
         clip_t.push_back(std::min(vc.temporal_merge, T - off));
+    // per-clip prompt timestamps: mean of the first/last frame time in the clip
+    // (VideoChat3Processor._calculate_timestamps semantics)
+    std::vector<std::pair<float,int>> marks;
+    if (media.kind == vqa::MediaKind::Video) {
+        const double def_fps = media.fps > 0 ? media.fps : 1.0;
+        int off = 0;
+        for (int t : clip_t) {
+            const double t0 = off < (int)media.timestamps.size() ? media.timestamps[off] : off / def_fps;
+            const double t1 = (off + t - 1) < (int)media.timestamps.size() ? media.timestamps[off + t - 1] : (off + t - 1) / def_fps;
+            marks.push_back({ (float)((t0 + t1) / 2.0), 0 });   // token count filled after patchify
+            off += t;
+        }
+    }
 
     std::vector<float> rgb, patches, pos, pos_clip;
     int gh = 0, gw = 0;
@@ -623,6 +640,11 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         feats.resize((size_t)n * d);
         ggml_backend_tensor_get(out, feats.data(), 0, sizeof(float) * feats.size());
         *n_tokens = n;
+    {
+        const int per_clip_tok = (gh / vc.merge) * (gw / vc.merge);
+        for (auto & m : marks) m.second = per_clip_tok;
+        if (clip_marks) *clip_marks = marks;
+    }
         fprintf(stderr, "vision: %d patches (%dx%d) -> %d tokens%s\n", N, gh, gw, n,
                 stop_after ? " (truncated for parity)" : "");
         return true;
@@ -1025,14 +1047,27 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
     return true;
 }
 
-std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user_text, bool video) const {
+std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user_text, bool video,
+                                       const std::vector<std::pair<float,int>> * clip_marks) const {
     std::string s = "<|im_start|>user\n";
     if (n_img_tokens > 0) {
-        // chat_template.jinja: image -> <|image_pad|>, video -> <|video_pad|>
         const char * pad = video ? "<|video_pad|>" : "<|image_pad|>";
-        s += "<|vision_start|>";
-        for (int i = 0; i < n_img_tokens; i++) s += pad;
-        s += "<|vision_end|>";
+        if (video && clip_marks && !clip_marks->empty()) {
+            // official processor format: one timestamped segment per temporal clip
+            // ("<t seconds>" = mean of the clip's first/last frame times)
+            char ts[32];
+            for (const auto & m : *clip_marks) {
+                snprintf(ts, sizeof(ts), "<%.1f seconds>", m.first);
+                s += ts;
+                s += "<|vision_start|>";
+                for (int i = 0; i < m.second; i++) s += pad;
+                s += "<|vision_end|>";
+            }
+        } else {
+            s += "<|vision_start|>";
+            for (int i = 0; i < n_img_tokens; i++) s += pad;
+            s += "<|vision_end|>";
+        }
     }
     s += user_text;
     s += "<|im_end|>\n<|im_start|>assistant\n";
@@ -1048,12 +1083,13 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
     std::vector<float> feats;
     int n_img = 0;
     const auto tv0 = std::chrono::steady_clock::now();
-    if (!encode_vision(media, feats, &n_img)) return false;
+    std::vector<std::pair<float,int>> clip_marks;
+    if (!encode_vision(media, feats, &n_img, &clip_marks)) return false;
     fprintf(stderr, "[perf] vision encode: %.0f ms (%d tokens)\n",
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
     const bool video = media.kind == vqa::MediaKind::Video;
-    const std::string text = render_prompt(n_img, prompt, video);
+    const std::string text = render_prompt(n_img, prompt, video, &clip_marks);
     const std::vector<int> ids = tok_.encode(text);
     const int pad_id = video ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;

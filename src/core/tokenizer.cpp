@@ -294,6 +294,24 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
             size_t alen = 0;
             int sid = match_added(text, i, alen);
             if (sid >= 0) { out.push_back(sid); i += alen; continue; }
+            // hard stop at the next added-token occurrence: a pretoken starting
+            // here must never swallow a special marker (HF splits on added tokens
+            // first; a greedy punctuation run like " ><|video_pad|>" used to eat
+            // the marker when it was only matched per-position)
+            size_t stop = text.size();
+            for (const auto & a : added) {
+                if (a.first.empty()) continue;
+                size_t p = text.find(a.first, i + 1);
+                if (p != std::string::npos && p < stop) stop = p;
+            }
+            while (i < stop) {
+                size_t n = use_pretokenizer ? pretoken_len(text, i) : (stop - i);
+                if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
+                if (i + n > stop) n = stop - i;   // safe: added tokens start with ASCII
+                encode_piece(text.substr(i, n), out);
+                i += n;
+            }
+            continue;
         }
         size_t n = use_pretokenizer ? pretoken_len(text, i) : (text.size() - i);
         if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
