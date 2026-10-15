@@ -41,7 +41,7 @@
 #include <chrono>
 #include <thread>
 
-#define STB_IMAGE_IMPLEMENTATION
+// stb_image is declared here and implemented once in src/core/media_io.cpp
 #include "stb_image.h"
 #include "moondream_vision.hpp"
 #include "moondream_preprocess.hpp"
@@ -58,225 +58,17 @@
 #   include <unistd.h>
 #endif
 
-// ---------------------------------------------------------------- mmap
-struct MMap {
-    void * ptr = nullptr;
-    size_t size = 0;
-    bool load(const char * path) {
-#ifdef _WIN32
-        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (!f) return false;
-        LARGE_INTEGER sz; GetFileSizeEx(f, &sz); size = (size_t)sz.QuadPart;
-        HANDLE m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
-        CloseHandle(f);
-        if (!m) return false;
-        ptr = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(m);
-        return ptr != nullptr;
-#else
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) return false;
-        size = lseek(fd, 0, SEEK_END);
-        ptr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        return ptr != MAP_FAILED;
-#endif
-    }
-    void release() {
-        if (!ptr) return;
-#ifdef _WIN32
-        UnmapViewOfFile(ptr);
-#else
-        munmap(ptr, size);
-#endif
-        ptr = nullptr;
-    }
-};
+// ---------------------------------------------------------------- shared core
+// The mmap, the byte-level BPE tokenizer and the utf8/json helpers live in
+// src/core so that every backend shares one implementation. vqa::Tokenizer
+// defaults to the plain GPT-2 mode this vocabulary expects (no Qwen-style
+// regex pre-tokenizer, no <|...|> specials).
+#include "tokenizer.hpp"
+#include "vqa_util.hpp"
+using vqa::MMap;
+using vqa::Tokenizer;
+using vqa::init_byte_table;
 
-// ---------------------------------------------------------------- tokenizer
-struct Tokenizer {
-    std::unordered_map<std::string, int> vocab;
-    std::vector<std::string> id_to_piece;
-    std::map<std::pair<std::string,std::string>, int> merge_rank;   // BPE merges
-
-    bool load(const char * path);
-    std::vector<int> encode(const std::string & text) const;
-    std::string decode(const std::vector<int> & toks) const;
-};
-
-// GPT-2 style bytes<->unicode mapping (vocab pieces use it)
-static std::vector<int> g_byte_to_cp;      // byte -> codepoint (idx+256 for non-printables)
-static std::vector<int> g_cp_to_byte;      // 256-entry map for cp in [33..323]
-
-static void init_byte_table() {
-    g_byte_to_cp.assign(256, 0);
-    std::vector<int> cs;
-    for (int b = 0; b < 256; b++) {
-        if ((b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
-            { g_byte_to_cp[b] = b; cs.push_back(b); }
-    }
-    // mark used
-    std::vector<bool> used(256, false);
-    for (int b : cs) used[b] = true;
-    int n = 0;
-    for (int b = 0; b < 256; b++) {
-        if (!used[b]) { g_byte_to_cp[b] = 256 + n; cs.push_back(b); n++; }
-    }
-    g_cp_to_byte.assign(256 + n, -1);
-    for (int b = 0; b < 256; b++) g_cp_to_byte[g_byte_to_cp[b]] = b;
-}
-
-static void append_utf8(std::string & out, uint32_t cp) {
-    if (cp < 0x80) out += (char)cp;
-    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
-    else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-    else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-}
-
-static uint32_t utf8_next(const unsigned char * s, size_t len, size_t & i) {
-    unsigned char c = s[i];
-    if (c < 0x80) { i += 1; return c; }
-    if ((c & 0xE0) == 0xC0) { uint32_t v = c & 0x1F; i += 1; if (i < len) { v = (v << 6) | (s[i] & 0x3F); i += 1; } return v; }
-    if ((c & 0xF0) == 0xE0) { uint32_t v = c & 0x0F; i += 1; for (int k = 0; k < 2 && i < len; k++) { v = (v << 6) | (s[i] & 0x3F); i += 1; } return v; }
-    uint32_t v = c & 0x07; i += 1;
-    for (int k = 0; k < 3 && i < len; k++) { v = (v << 6) | (s[i] & 0x3F); i += 1; }
-    return v;
-}
-
-// parse a JSON string starting at js[i]=='"'; returns decoded content; i advanced past closing quote
-static std::string json_parse_string(const std::string & js, size_t & i) {
-    std::string out;
-    i++;    // skip opening quote
-    for (; i < js.size(); i++) {
-        char c = js[i];
-        if (c == '"') { i++; return out; }
-        if (c != '\\') { out += c; continue; }
-        char e = js[++i];
-        switch (e) {
-            case 'n': out += '\n'; break;
-            case 't': out += '\t'; break;
-            case 'r': out += '\r'; break;
-            case 'b': out += '\b'; break;
-            case 'f': out += '\f'; break;
-            case '"': out += '"'; break;
-            case '\\': out += '\\'; break;
-            case '/': out += '/'; break;
-            case 'u': {
-                if (i + 4 >= js.size()) return out;
-                uint32_t cp = (uint32_t)strtol(js.substr(i + 1, 4).c_str(), nullptr, 16);
-                i += 4;
-                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < js.size() && js[i + 1] == 'u') {
-                    uint32_t lo = (uint32_t)strtol(js.substr(i + 3, 4).c_str(), nullptr, 16);
-                    if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i += 6; }
-                }
-                append_utf8(out, cp);
-                break;
-            }
-            default: out += e;
-        }
-    }
-    return out;
-}
-
-// minimal extraction of "vocab": { piece: id, ... } from tokenizer.json
-bool Tokenizer::load(const char * path) {
-    FILE * f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "tokenizer.json not found: %s\n", path); return false; }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::string js(sz, 0);
-    if (fread(js.data(), 1, sz, f) != (size_t)sz) { fclose(f); return false; }
-    fclose(f);
-
-    size_t vp = js.find("\"vocab\"");
-    if (vp == std::string::npos) { fprintf(stderr, "no vocab in tokenizer.json\n"); return false; }
-    vp = js.find('{', vp);
-
-    int depth = 0;
-    for (size_t i = vp; i < js.size(); i++) {
-        char c = js[i];
-        if (c == '"') {
-            std::string key = json_parse_string(js, i);
-            // find ':' then number
-            size_t j = js.find(':', i);
-            if (j == std::string::npos) break;
-            int id = atoi(js.c_str() + j + 1);
-            if ((int)id_to_piece.size() <= id) id_to_piece.resize(id + 1);
-            id_to_piece[id] = key;
-            vocab[key] = id;
-            i = j;
-            continue;
-        }
-        if (c == '{' || c == '[') depth++;
-        if (c == '}' || c == ']') { if (--depth == 0) break; }
-    }
-    fprintf(stderr, "tokenizer: %zu tokens\n", id_to_piece.size());
-
-    // parse "merges": [["A","B"], ...] (nested inside "model") for proper BPE encoding
-    size_t mp = js.find("\"merges\"");
-    if (mp != std::string::npos) {
-        mp = js.find('[', mp);
-        bool have1 = false; std::string s1;
-        int rank = 0, depth = 1;
-        for (size_t i = mp + 1; i < js.size(); i++) {
-            char c = js[i];
-            if (c == '"') {
-                std::string s = json_parse_string(js, i);
-                i--;
-                if (!have1) { s1 = s; have1 = true; }
-                else { merge_rank[{s1, s}] = rank++; have1 = false; }
-                continue;
-            }
-            if (c == '[') { depth++; continue; }
-            if (c == ']') { if (--depth == 0) break; continue; }
-        }
-    }
-    fprintf(stderr, "tokenizer: %zu merges\n", merge_rank.size());
-    return !id_to_piece.empty();
-}
-
-std::string Tokenizer::decode(const std::vector<int> & toks) const {
-    std::string out;
-    for (int t : toks) {
-        if (t < 0 || t >= (int)id_to_piece.size()) continue;
-        const std::string & piece = id_to_piece[t];
-        size_t i = 0;
-        while (i < piece.size()) {
-            uint32_t cp = utf8_next((const unsigned char *)piece.data(), piece.size(), i);
-            if (cp < g_cp_to_byte.size() && g_cp_to_byte[cp] >= 0) out += (char)g_cp_to_byte[cp];
-            else append_utf8(out, cp);
-        }
-    }
-    return out;
-}
-
-std::vector<int> Tokenizer::encode(const std::string & text) const {
-    // byte -> GPT-2 unicode chars
-    std::vector<std::string> parts;
-    for (unsigned char c : text) {
-        std::string ch;
-        append_utf8(ch, (uint32_t)g_byte_to_cp[c]);
-        parts.push_back(ch);
-    }
-    // BPE: repeatedly merge the adjacent pair with the lowest merge rank
-    while (parts.size() > 1) {
-        int best_rank = 1 << 30; size_t best_i = 0;
-        for (size_t i = 0; i + 1 < parts.size(); i++) {
-            auto it = merge_rank.find({parts[i], parts[i + 1]});
-            if (it != merge_rank.end() && it->second < best_rank) { best_rank = it->second; best_i = i; }
-        }
-        if (best_rank == (1 << 30)) break;
-        parts[best_i] += parts[best_i + 1];
-        parts.erase(parts.begin() + best_i + 1);
-    }
-    std::vector<int> out;
-    for (auto & p : parts) {
-        auto it = vocab.find(p);
-        out.push_back(it != vocab.end() ? it->second : -1);
-    }
-    return out;
-}
 
 // ---------------------------------------------------------------- model
 struct Layer {
@@ -928,15 +720,18 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
 #include "moondream_batch.inc"   // after the Engine definition; adds step_batch + run_batch
 #include "moondream_server.inc"  // adds run_server (embedded web UI, --serve)
 
-int main(int argc, char ** argv) {
+// entry point shared by the standalone moondream-cli and the unified vqa-cli
+// (see src/models/moondream/moondream_main.hpp)
+int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
     if (getenv("MD_VERBOSE")) {
         ggml_log_set([](ggml_log_level level, const char * text, void *) {
             fprintf(stderr, "[ggml] %s", text);
         }, nullptr);
     }
 #ifdef _WIN32
-    // rebuild argv as UTF-8 (default ANSI argv mangles CJK prompts)
-    {
+    // rebuild argv as UTF-8 (default ANSI argv mangles CJK prompts); skipped when
+    // the caller (vqa-cli) already did it
+    if (!argv_is_utf8) {
         int wargc = 0;
         LPWSTR * wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
         if (wargv) {

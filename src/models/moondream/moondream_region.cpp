@@ -3,6 +3,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "vqa_util.hpp"   // vqa::MMap
 
 #include <algorithm>
 #include <cmath>
@@ -39,47 +40,8 @@ void RegionModel::bins_to_size(const int * bins, float * sizes) {
 }
 
 // ---------------------------------------------------------------- load
-namespace {
-
-struct RegionMMap {
-    void * ptr = nullptr;
-    size_t size = 0;
-    bool load(const char * path) {
-#ifdef _WIN32
-        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                               OPEN_EXISTING, 0, NULL);
-        if (!f) return false;
-        LARGE_INTEGER sz; GetFileSizeEx(f, &sz); size = (size_t)sz.QuadPart;
-        HANDLE m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
-        CloseHandle(f);
-        if (!m) return false;
-        ptr = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(m);
-        return ptr != nullptr;
-#else
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) return false;
-        size = lseek(fd, 0, SEEK_END);
-        ptr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        return ptr != MAP_FAILED;
-#endif
-    }
-    void release() {
-        if (!ptr) return;
-#ifdef _WIN32
-        UnmapViewOfFile(ptr);
-#else
-        munmap(ptr, size);
-#endif
-        ptr = nullptr;
-    }
-};
-
-} // namespace
-
 bool RegionModel::load(const char * path) {
-    RegionMMap mm;
+    vqa::MMap mm;   // shared helper (src/core/vqa_util)
     if (!mm.load(path)) {
         fprintf(stderr, "region gguf mmap failed: %s\n", path);
         return false;

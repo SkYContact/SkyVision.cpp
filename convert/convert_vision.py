@@ -1,7 +1,7 @@
 """Convert moondream3.1-9B-A2B vision tower (SigLIP + projection) to a standalone GGUF.
 
 Usage:
-  python convert/convert_vision.py [-o D:/moondream.cpp/moondream3.1-vision.gguf]
+  python convert/convert_vision.py [--src DIR] [-o moondream3.1-vision.gguf]
 
 Source keys (HF model.safetensors)                    -> GGUF keys
 --------------------------------------------------------+----------------------------------------
@@ -22,14 +22,13 @@ pos_emb is stored pre-transposed [1152,729] so the C++ graph can add it to the
 [enc_dim, n_patch] activation without a runtime permute (ggml permute+add traps).
 """
 import argparse
-import glob
 import json
 import struct
 
 import numpy as np
 import gguf
 
-SRC = glob.glob(r"C:/Users/41601/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B/snapshots/*/model.safetensors")[0]
+import hf_source
 
 
 class SfReader:
@@ -72,13 +71,16 @@ PROJ_INNER = 8192
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-o", "--out", default=r"D:/moondream.cpp/moondream3.1-vision.gguf")
+    ap.add_argument("-o", "--out", default="moondream3.1-vision.gguf")
+    hf_source.add_src_argument(ap)
     args = ap.parse_args()
 
-    w = SfReader(SRC)
+    src = hf_source.find_model_safetensors(args.src)
+    print(f"source: {src}")
+    print(f"output: {args.out}")
+    w = SfReader(src)
 
-    gw = gguf.GGUFWriter(args.out, "moondream3-vision")
-    gw.add_architecture()
+    gw = gguf.GGUFWriter(args.out, "moondream3-vision")   # GGUFWriter writes general.architecture
     gw.add_name("moondream3.1-9B-A2B-vision")
     gw.add_file_type(gguf.LlamaFileType.MOSTLY_F16)
     gw.add_uint32(gguf.Keys.LLM.BLOCK_COUNT, N_LAYERS)

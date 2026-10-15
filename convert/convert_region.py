@@ -1,7 +1,7 @@
 """Convert the moondream3.1 region head (detect/point) to a standalone GGUF.
 
 Usage:
-  python convert/convert_region.py [-o D:/moondream.cpp/moondream3.1-region.gguf]
+  python convert/convert_region.py [--src DIR] [-o moondream3.1-region.gguf]
 
 Source keys (HF model.safetensors)         -> GGUF keys
 -------------------------------------------+--------------------------------
@@ -24,14 +24,13 @@ math convention used by ref_region.py: x @ W with W [in, out_per_freq]:
   size_features:  checkpoint [256,2] -> transposed [2,256]
 """
 import argparse
-import glob
 import json
 import struct
 
 import numpy as np
 import gguf
 
-SRC = glob.glob(r"C:/Users/41601/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B/snapshots/*/model.safetensors")[0]
+import hf_source
 
 
 class SfReader:
@@ -63,13 +62,16 @@ SIZE_OUT_DIM = 2048
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-o", "--out", default=r"D:/moondream.cpp/moondream3.1-region.gguf")
+    ap.add_argument("-o", "--out", default="moondream3.1-region.gguf")
+    hf_source.add_src_argument(ap)
     args = ap.parse_args()
 
-    w = SfReader(SRC)
+    src = hf_source.find_model_safetensors(args.src)
+    print(f"source: {src}")
+    print(f"output: {args.out}")
+    w = SfReader(src)
 
-    gw = gguf.GGUFWriter(args.out, "moondream3-region")
-    gw.add_architecture()
+    gw = gguf.GGUFWriter(args.out, "moondream3-region")   # GGUFWriter writes general.architecture
     gw.add_name("moondream3.1-9B-A2B-region")
     r = "moondream3.region."
     gw.add_uint32(r + "dim", DIM)

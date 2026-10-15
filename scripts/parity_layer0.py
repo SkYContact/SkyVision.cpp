@@ -1,17 +1,21 @@
 """Layer-0 parity check: embedding + block 0 (dense MLP, tau attention) in torch,
 using the official 3.1 math (vikhyat/moondream text.py). Dumps tensors to parity/*.npy
 for comparison against moondream-cli's MD_DUMP output."""
-import os, json, math
+import math
+import os
+import sys
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-ST = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B"
-    "/snapshots/1da27e6c2d2f9118de14560df456881dc62d91f3/model.safetensors"
-)
-OUT = os.path.join(os.path.dirname(__file__), "..", "parity")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "convert"))
+import hf_source
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+ST = hf_source.find_model_safetensors()
+OUT = os.path.join(ROOT, "parity")
 os.makedirs(OUT, exist_ok=True)
 
 f = safe_open(ST, framework="pt", device="cpu")
@@ -22,7 +26,7 @@ def get(name):
 
 # --- official tokenizer encode ---
 from tokenizers import Tokenizer
-tk = Tokenizer.from_file(os.path.join(os.path.dirname(__file__), "..", "tokenizer.json"))
+tk = Tokenizer.from_file(os.path.join(ROOT, "tokenizer.json"))
 question = "What color is an apple?"
 q_ids = tk.encode(question).ids
 toks = [0] + [1, 15381, 2] + q_ids + [3]

@@ -14,12 +14,16 @@ build_cuda_log.txt
 *.ilk
 
 # vendored dependencies (clone separately, see README)
-llama.cpp/
+ggml/
 
 # run logs & debug artifacts
 run*.log
 *_log.txt
 parity/
+
+# local model downloads / dev scratch
+models/
+test_shapes.png
 
 # editors / OS
 .vs/
@@ -30,6 +34,11 @@ Thumbs.db
 
 # python
 __pycache__/
+*.pyc
+.venv/
+
+# local environment setup logs (pip install output, etc.)
+install*.log
 
 # misc artifacts
 convert/convert.log

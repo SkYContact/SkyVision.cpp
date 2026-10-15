@@ -1,0 +1,22 @@
+# Normalize line endings in the repository (LF in the index) and check out the
+# platform default. Without this the result depends on each contributor's
+# core.autocrlf setting.
+* text=auto
+
+# Windows launchers are CRLF-only in practice
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# model artifacts, images and binaries: never convert or merge them
+*.gguf binary
+*.safetensors binary
+*.bin binary
+*.onnx binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+
+# the vendored single-header decoder is third-party: keep it byte-identical on
+# every platform and out of diffs/review noise
+vendor/stb/stb_image.h text eol=lf -diff linguist-vendored

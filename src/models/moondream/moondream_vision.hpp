@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "vqa_util.hpp"   // vqa::MMap
+
 struct VisionModel {
     // config (defaults = official VisionConfig; overridden by GGUF metadata)
     int enc_dim = 1152, patch = 14, n_layers = 27, ff = 4304, n_heads = 16;
@@ -32,7 +34,7 @@ struct VisionModel {
     struct ggml_context * wctx = nullptr;
     struct ggml_backend_buffer * wbuf = nullptr;
     void * f32_cpu = nullptr;
-    struct MMap * mm = nullptr;   // opaque mmap handle (defined in the .cpp)
+    vqa::MMap mm;                 // shared mmap helper (src/core/vqa_util)
 
     bool load(const char * gguf_path, ggml_backend_t backend);
 

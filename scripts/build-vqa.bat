@@ -1,0 +1,27 @@
+@echo off
+rem Build the unified image/video VQA front end (vqa-cli) with MSVC + Ninja.
+rem Extra cmake args can be appended, e.g.: scripts\build-vqa.bat -DGGML_CUDA=ON
+setlocal
+cd /d "%~dp0.."
+
+set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" set "VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" (
+  echo [build-vqa] vcvars64.bat not found - edit this script for your VS install
+  exit /b 1
+)
+call "%VCVARS%" >nul
+
+set "NINJA=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+if not exist "%NINJA%" set "NINJA=ninja"
+
+cmake -S . -B build-ninja -G Ninja ^
+  -DCMAKE_MAKE_PROGRAM="%NINJA%" ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DGGML_NATIVE=ON -DGGML_OPENMP=OFF -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF ^
+  %*
+if errorlevel 1 exit /b 1
+
+rem vqa-cli: unified front end   moondream-cli: moondream3.1 standalone binary
+rem add more targets on the command line, e.g.:  scripts\build-vqa.bat --target all
+cmake --build build-ninja --target vqa-cli moondream-cli %*

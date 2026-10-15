@@ -1,0 +1,12 @@
+# dependencies of the HF -> GGUF converters in this directory
+#
+#   pip install -r convert/requirements.txt
+#
+# numpy/safetensors/torch are used by every converter (torch only to read bf16
+# safetensors and to run the Q6_K quantizer); gguf-py ships the GGUF writer and
+# the quantization blocks (Q4_K/Q6_K are decode-only upstream, see q6k.py).
+# A CUDA build of torch speeds up --outtype q6_k conversions significantly.
+gguf>=0.10
+numpy>=1.24
+safetensors>=0.4
+torch>=2.0

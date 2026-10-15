@@ -15,31 +15,36 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
-ROOT = r"D:/moondream.cpp"
-GGUF = ROOT + "/moondream3.1-vision.gguf"
-EXE = ROOT + "/build/Release/moondream-vision-test.exe"
-PARITY_DIR = ROOT + "/parity_vision"
-ST = glob_str = None
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "convert"))
+import hf_source
 
-import glob
-ST = glob.glob(r"C:/Users/41601/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B/snapshots/*/model.safetensors")[0]
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+GGUF = os.path.join(ROOT, "moondream3.1-vision.gguf")
+EXE = os.path.join(ROOT, "build", "Release", "moondream-vision-test.exe")
+PARITY_DIR = os.path.join(ROOT, "parity_vision")
+ST = hf_source.find_model_safetensors()
 
-# official image_crops.py (fetched from vikhyat/moondream; no relative imports)
+# official image_crops.py (from vikhyat/moondream; no relative imports)
+IMAGE_CROPS_ENV = "MD31_IMAGE_CROPS"
 _crops_py = None
-for _p in ("/tmp/md31_image_crops.py",
-           os.path.expandvars(r"%LOCALAPPDATA%/Temp/md31_image_crops.py"),
-           r"C:/Users/41601/AppData/Local/Temp/md31_image_crops.py"):
-    if os.path.exists(_p):
+for _p in (os.environ.get(IMAGE_CROPS_ENV),
+           os.path.join(ROOT, "md31_image_crops.py"),
+           "md31_image_crops.py",
+           os.path.join(tempfile.gettempdir(), "md31_image_crops.py"),
+           "/tmp/md31_image_crops.py"):
+    if _p and os.path.exists(_p):
         _crops_py = _p
         break
 if not _crops_py:
-    sys.exit("md31_image_crops.py not found (see task notes: curl from vikhyat/moondream)")
+    sys.exit(f"md31_image_crops.py not found - fetch it from vikhyat/moondream and either "
+             f"drop it in the repo root or set {IMAGE_CROPS_ENV}=<path>")
 spec = importlib.util.spec_from_file_location("md31_image_crops", _crops_py)
 image_crops = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(image_crops)

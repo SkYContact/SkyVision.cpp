@@ -40,41 +40,6 @@
 #   include <unistd.h>
 #endif
 
-// ---------------------------------------------------------------- mmap
-struct MMap {
-    void * ptr = nullptr;
-    size_t size = 0;
-    bool load(const char * path) {
-#ifdef _WIN32
-        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (!f) return false;
-        LARGE_INTEGER sz; GetFileSizeEx(f, &sz); size = (size_t)sz.QuadPart;
-        HANDLE m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL);
-        CloseHandle(f);
-        if (!m) return false;
-        ptr = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(m);
-        return ptr != nullptr;
-#else
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) return false;
-        size = lseek(fd, 0, SEEK_END);
-        ptr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        return ptr != MAP_FAILED;
-#endif
-    }
-    void release() {
-        if (!ptr) return;
-#ifdef _WIN32
-        UnmapViewOfFile(ptr);
-#else
-        munmap(ptr, size);
-#endif
-        ptr = nullptr;
-    }
-};
-
 ggml_backend_t vision_pick_backend() {
 #ifdef GGML_USE_CUDA
     if (!getenv("MD_CPU")) {
@@ -109,7 +74,7 @@ struct VisionWeights {
     struct ggml_tensor * proj_fc1_w = nullptr, * proj_fc1_b = nullptr;
     struct ggml_tensor * proj_fc2_w = nullptr, * proj_fc2_b = nullptr;
     std::vector<VisionLayer> layers;
-    MMap mm;
+    vqa::MMap mm;
     struct ggml_context * wctx = nullptr;
     void * f32_cpu = nullptr;
 };

@@ -9,23 +9,28 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-ROOT = r"D:/moondream.cpp"
-EXE = ROOT + "/build/Release/moondream-preprocess-test.exe"
-PARITY_DIR = ROOT + "/parity_preprocess"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+EXE = os.path.join(ROOT, "build", "Release", "moondream-preprocess-test.exe")
+PARITY_DIR = os.path.join(ROOT, "parity_preprocess")
 
+IMAGE_CROPS_ENV = "MD31_IMAGE_CROPS"
 _crops_py = None
-for _p in ("/tmp/md31_image_crops.py",
-           os.path.expandvars(r"%LOCALAPPDATA%/Temp/md31_image_crops.py"),
-           r"C:/Users/41601/AppData/Local/Temp/md31_image_crops.py"):
-    if os.path.exists(_p):
+for _p in (os.environ.get(IMAGE_CROPS_ENV),
+           os.path.join(ROOT, "md31_image_crops.py"),
+           "md31_image_crops.py",
+           os.path.join(tempfile.gettempdir(), "md31_image_crops.py"),
+           "/tmp/md31_image_crops.py"):
+    if _p and os.path.exists(_p):
         _crops_py = _p
         break
 if not _crops_py:
-    sys.exit("md31_image_crops.py not found")
+    sys.exit(f"md31_image_crops.py not found - fetch it from vikhyat/moondream and either "
+             f"drop it in the repo root or set {IMAGE_CROPS_ENV}=<path>")
 spec = importlib.util.spec_from_file_location("md31_image_crops", _crops_py)
 image_crops = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(image_crops)

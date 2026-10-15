@@ -7,7 +7,6 @@
 
 target: maxabs < 1e-3 (both sides F32, same weights)
 """
-import glob
 import os
 import struct
 import subprocess
@@ -17,11 +16,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-ROOT = r"D:/moondream.cpp"
-GGUF = ROOT + "/moondream3.1-region.gguf"
-EXE = ROOT + "/build/Release/moondream-region-test.exe"
-PARITY_DIR = ROOT + "/parity_region"
-ST = glob.glob(r"C:/Users/41601/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B/snapshots/*/model.safetensors")[0]
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "convert"))
+import hf_source
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root
+GGUF = os.path.join(ROOT, "moondream3.1-region.gguf")
+EXE = os.path.join(ROOT, "build", "Release", "moondream-region-test.exe")
+PARITY_DIR = os.path.join(ROOT, "parity_region")
+ST = hf_source.find_model_safetensors()
 
 DIM, COORD_FEAT, COORD_OUT = 2048, 256, 1024
 SIZE_FEAT, SIZE_OUT = 512, 2048

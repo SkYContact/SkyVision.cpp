@@ -1,16 +1,17 @@
 """Convert moondream3.1-9B-A2B HF safetensors (FP8 MoE) to GGUF for moondream.cpp.
 
 Usage:
-  python convert_hf_to_gguf.py [--q4] [-o out.gguf]
+  python convert/convert_hf_to_gguf.py [--q6 | --q4] [--q8-dense] [--src DIR] [-o OUT.gguf]
+
+-o is a format string expanded with the quantization tag, so the default writes
+moondream3.1-q8_0.gguf / -q6k.gguf / -q4k.gguf into the current directory.
 
 - BF16 tensors -> F16 (dropped: kv_quantizer, region_model)
-- FP8 experts  -> Q8_0 (default) or Q4_K with per-channel scales folded in
+- FP8 experts  -> Q8_0 (default), Q6_K with --q6 or Q4_K with --q4, with the
+  per-channel scales folded in
 """
 import argparse
-import glob
-import json
-import struct
-import sys
+import os
 
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ from safetensors import safe_open
 import gguf
 from gguf import quants
 
-SRC = glob.glob(r"C:/Users/41601/.cache/huggingface/hub/models--moondream--moondream3.1-9B-A2B/snapshots/*/model.safetensors")[0]
+import hf_source
 
 N_LAYERS = 24
 N_DENSE = 4          # layers 0..3 dense MLP
@@ -37,16 +38,9 @@ ROPE_THETA = 1.5e6
 def dequant_fp8(raw: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """FP8 e4m3 bytes -> float32, times per-(expert, out-channel) scale."""
     uint8 = raw.view(np.uint8)
-    f32 = uint8.astype(np.uint32) << 23
     # e4m3fn decode: sign, exp bias 7, no inf; mantissa
-    sign = ((uint8 & 0x80).astype(np.uint32)) << 24
     exp = (uint8 >> 3) & 0x0F
     man = uint8 & 0x07
-    val = np.where(
-        exp == 0,
-        (man.astype(np.float32) * (2.0 ** -3)) * (2.0 ** -6),      # subnormal
-        ((1.0 + man.astype(np.float32) / 8.0) * (2.0 ** (exp.astype(np.int32) - 7))),
-    )
     val = np.where(
         exp == 0,
         (man.astype(np.float32) * (2.0 ** -3)) * (2.0 ** -6),      # subnormal
@@ -58,17 +52,25 @@ def dequant_fp8(raw: np.ndarray, scale: np.ndarray) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--q4", action="store_true", help="quantize experts to Q4_K instead of Q8_0")
-    ap.add_argument("--q6", action="store_true", help="quantize experts to Q6_K instead of Q8_0")
+    eq = ap.add_mutually_exclusive_group()
+    eq.add_argument("--q4", action="store_true", help="quantize experts to Q4_K instead of Q8_0")
+    eq.add_argument("--q6", action="store_true", help="quantize experts to Q6_K instead of Q8_0")
     ap.add_argument("--q8-dense", action="store_true",
                     help="also quantize big dense linears (Wqkv/out_proj/fc1/fc2/lm_head) to Q8_0 "
                          "(halves their decode-time read bandwidth; norms/biases/tau/router stay F16)")
-    ap.add_argument("-o", "--out", default=r"D:/moondream.cpp/moondream3.1-%s.gguf")
+    ap.add_argument("-o", "--out", default="moondream3.1-%s.gguf",
+                    help="output file; %%s is replaced by the quantization tag")
+    hf_source.add_src_argument(ap)
     args = ap.parse_args()
     tag = "q6k" if args.q6 else ("q4k" if args.q4 else "q8_0")
     if args.q8_dense:
         tag = ("q6k_q8d" if args.q6 else "q4k_q8d" if args.q4 else "q8full")
-    out_path = args.out % tag
+    if "%s" in args.out:
+        out_path = args.out % tag
+    else:
+        # a plain path is fine too: splice the quantization tag in front of the suffix
+        root, ext = os.path.splitext(args.out)
+        out_path = f"{root}-{tag}{ext}"
     eqtype = (gguf.GGMLQuantizationType.Q6_K if args.q6 else
               gguf.GGMLQuantizationType.Q4_K if args.q4 else
               gguf.GGMLQuantizationType.Q8_0)
@@ -76,7 +78,10 @@ def main():
     def maybe_q8(arr_f32):
         return quants.quantize(arr_f32, gguf.GGMLQuantizationType.Q8_0) if args.q8_dense else arr_f32.astype(np.float16)
 
-    w = safe_open(SRC, framework="pt")
+    src = hf_source.find_model_safetensors(args.src)
+    print(f"source: {src}")
+    print(f"output: {out_path}")
+    w = safe_open(src, framework="pt")
 
     def get(name):
         t = w.get_tensor(name)
@@ -86,9 +91,10 @@ def main():
             t = t.view(torch.uint8)
         return t.contiguous().numpy()
 
-    gw = gguf.GGUFWriter(out_path, "moondream3")
-    gw.add_architecture()
-    gw.add_file_type(gguf.LlamaFileType.MOSTLY_Q8_0 if not args.q4 else gguf.LlamaFileType.MOSTLY_Q4_K_M)
+    gw = gguf.GGUFWriter(out_path, "moondream3")   # GGUFWriter writes general.architecture
+    gw.add_file_type(gguf.LlamaFileType.MOSTLY_Q6_K if args.q6 else
+                     gguf.LlamaFileType.MOSTLY_Q4_K_M if args.q4 else
+                     gguf.LlamaFileType.MOSTLY_Q8_0)
     gw.add_name("moondream3.1-9B-A2B")
 
     k = gguf.Keys
