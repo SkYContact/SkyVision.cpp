@@ -105,6 +105,7 @@ btn.onclick = async () => {
         if (!line) continue;
         const ev = JSON.parse(line);
         if (ev.error) throw new Error(ev.error);
+        if (ev.stage) { status.textContent = '视觉编码 ' + ev.done + '/' + ev.total + '…'; continue; }
         if (ev.phase) { t0v = performance.now(); continue; }
         if (ev.t) {
           if (!nt) { status.textContent = '生成中…'; t0v = performance.now(); }

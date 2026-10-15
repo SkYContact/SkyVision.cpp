@@ -40,6 +40,9 @@ struct GenParams {
     bool stream = true;
     void (*on_token)(const char * piece, void * ud) = nullptr;   // optional streaming sink
     void * on_token_ud = nullptr;
+    // optional coarse progress (e.g. per vision clip: "vision", done, total)
+    void (*on_stage)(const char * stage, int done, int total, void * ud) = nullptr;
+    void * on_stage_ud = nullptr;
 };
 
 // Load-time configuration shared by every backend.

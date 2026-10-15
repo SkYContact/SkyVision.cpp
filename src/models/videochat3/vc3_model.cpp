@@ -120,6 +120,8 @@ private:
     bool fold_bias = false;                       // LN bias absorbed into the matmul bias (exact, F32)
     bool fold_scale = false;                      // LN gain folded into the weight (VC3_FOLD_W=1; re-rounds F16, lossy)
     bool wo_padded = false;                       // wo input rows padded to 80/head (exact; kills the FA de-pad copy)
+    void (*stage_cb)(const char *, int, int, void *) = nullptr;   // per-clip vision progress
+    void * stage_ud = nullptr;
     std::vector<float> patch_bias;                // v.patch_embd.bias, folded into the host pos table
     vqa::MMap mm;
 
@@ -982,6 +984,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         tower_out.insert(tower_out.end(), chunk_out.begin(), chunk_out.end());
         ggml_free(gctx);
         frame0 += t;
+        if (stage_cb) stage_cb("vision", (int)(c + 1), (int)clip_t.size(), stage_ud);
     }
 
     // ---- merger + projector over the concatenated tower output
@@ -1323,6 +1326,8 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
                      const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
     std::vector<float> feats;
     int n_img = 0;
+    stage_cb = gp.on_stage;
+    stage_ud = gp.on_stage_ud;
     const auto tv0 = std::chrono::steady_clock::now();
     std::vector<std::pair<float,int>> clip_marks;
     const bool video_kind = media.kind == vqa::MediaKind::Video;

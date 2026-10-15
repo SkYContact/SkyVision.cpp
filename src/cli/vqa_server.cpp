@@ -326,6 +326,14 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                     }
                 };
                 gp.on_token_ud = &c;
+                if (stream) {
+                    gp.on_stage = [](const char * stage, int done, int total, void * ud) {
+                        char ev[96];
+                        int n = snprintf(ev, sizeof(ev), "{\"stage\":\"%s\",\"done\":%d,\"total\":%d}", stage, done, total);
+                        if (n > 0) { ev[n] = 10; ev[n+1] = 0; send_chunk_str(*(HttpSock *)ud, ev); }
+                    };
+                    gp.on_stage_ud = &c;
+                }
             }
             std::string out;
             if (!g_loaded->ask(media, q, mode, gp, out)) {
