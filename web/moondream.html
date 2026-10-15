@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>__MODEL_ID__ — SkyVision.cpp</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 24px; }
+  a.back { color: #7aa2f7; font-size: 13px; text-decoration: none; }
+  h1 { font-size: 18px; margin: 10px 0 4px; word-break: break-all; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 20px; }
+  #drop { border: 2px dashed #333a48; border-radius: 12px; padding: 26px; text-align: center;
+          color: #7d8798; cursor: pointer; }
+  #drop:hover, #drop.on { border-color: #7aa2f7; }
+  #imgbox { position: relative; display: none; margin-top: 12px; }
+  #img { max-width: 100%; border-radius: 8px; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
+  .row { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 200px; background: #171a21; border: 1px solid #262b36; color: #e6e6e6;
+                     border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+  select, button { background: #171a21; border: 1px solid #262b36; color: #e6e6e6; border-radius: 8px; padding: 10px; }
+  button.primary { background: #7aa2f7; border: none; color: #0f1115; font-weight: 700; padding: 10px 22px; }
+  button:disabled { opacity: .5; cursor: default; }
+  #out { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 16px;
+         margin-top: 18px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; min-height: 20px; }
+  #status { color: #888; font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; 所有模型</a>
+  <h1>__MODEL_ID__</h1>
+  <div class="sub">moondream3.1-9B-A2B · caption / 提问 / 检测 / 定位</div>
+
+  <div id="drop">点击或拖入图片</div>
+  <input type="file" id="file" accept="image/*" hidden>
+  <div id="imgbox"><img id="img" alt=""><svg id="overlay" width="100%" height="100%"></svg></div>
+
+  <div class="row">
+    <select id="mode">
+      <option value="ask">提问</option>
+      <option value="caption-short">描述（短）</option>
+      <option value="caption-normal">描述（标准）</option>
+      <option value="caption-long">描述（长）</option>
+      <option value="detect">目标检测</option>
+      <option value="point">目标定位</option>
+    </select>
+    <input type="text" id="q" placeholder="问题 / 目标名（如 person, clock）">
+    <button class="primary" id="go">运行</button>
+  </div>
+  <div id="status"></div>
+  <div id="out"></div>
+</div>
+<script>
+const MODEL = '__MODEL_ID__';
+const drop = document.getElementById('drop'), file = document.getElementById('file');
+const imgbox = document.getElementById('imgbox'), img = document.getElementById('img');
+const overlay = document.getElementById('overlay');
+let blob = null, iw = 0, ih = 0;
+
+drop.onclick = () => file.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('on'); };
+drop.ondragleave = () => drop.classList.remove('on');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('on'); take(e.dataTransfer.files[0]); };
+file.onchange = () => take(file.files[0]);
+img.onload = () => { iw = img.naturalWidth; ih = img.naturalHeight; };
+
+function take(f) {
+  if (!f) return;
+  blob = f;
+  drop.textContent = f.name + ' — 点击替换';
+  img.src = URL.createObjectURL(f);
+  imgbox.style.display = 'block';
+}
+
+function draw(boxes, points) {
+  let s = '';
+  const W = overlay.clientWidth, H = overlay.clientHeight;
+  for (const b of boxes)
+    s += `<rect x="${b[0]*W}" y="${b[1]*H}" width="${(b[2]-b[0])*W}" height="${(b[3]-b[1])*H}"
+           fill="none" stroke="#4ade80" stroke-width="2"/>`;
+  for (const p of points)
+    s += `<line x1="${p[0]*W-8}" y1="${p[1]*H}" x2="${p[0]*W+8}" y2="${p[1]*H}" stroke="#f87171" stroke-width="2"/>
+          <line x1="${p[0]*W}" y1="${p[1]*H-8}" x2="${p[0]*W}" y2="${p[1]*H+8}" stroke="#f87171" stroke-width="2"/>`;
+  overlay.innerHTML = s;
+}
+
+const btn = document.getElementById('go'), out = document.getElementById('out'), status = document.getElementById('status');
+btn.onclick = async () => {
+  const sel = document.getElementById('mode').value;
+  const qtext = document.getElementById('q').value;
+  let mode = 'ask', q = qtext, n = 300;
+  if (sel.startsWith('caption')) { mode = 'caption'; q = sel.split('-')[1]; n = 400; }
+  else if (sel !== 'ask') { mode = sel; if (!qtext) { out.textContent = '检测/定位需要在输入框里填目标名'; return; } }
+  else if (!qtext && !blob) return;
+  btn.disabled = true;
+  out.textContent = '';
+  draw([], []);
+  const t0 = performance.now();
+  try {
+    status.textContent = '加载模型（首次约 30 秒）…';
+    let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).error || 'load failed');
+    status.textContent = '推理中…';
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) +
+                    '/ask?mode=' + mode + '&q=' + encodeURIComponent(q) + '&n=' + n,
+                    { method: 'POST', body: blob || new Uint8Array(0) });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const text = d.text || '';
+    if (mode === 'detect') {
+      const v = text.replace('boxes:', '').trim().split(/[\s,]+/).filter(Boolean).map(Number);
+      const boxes = [];
+      for (let i = 0; i + 3 < v.length; i += 4) boxes.push([v[i], v[i+1], v[i+2], v[i+3]]);
+      draw(boxes, []);
+      out.textContent = boxes.length ? '检测到 ' + boxes.length + ' 个目标（归一化坐标）' : '未检测到目标';
+    } else if (mode === 'point') {
+      const v = text.replace('points:', '').trim().split(/[\s,]+/).filter(Boolean).map(Number);
+      const pts = [];
+      for (let i = 0; i + 1 < v.length; i += 2) pts.push([v[i], v[i+1]]);
+      draw([], pts);
+      out.textContent = pts.length ? '定位到 ' + pts.length + ' 个点' : '未定位到目标';
+    } else {
+      out.textContent = text;
+    }
+    status.textContent = '完成，耗时 ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s';
+  } catch (e) {
+    out.textContent = '错误：' + e.message;
+    status.textContent = '';
+  }
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>

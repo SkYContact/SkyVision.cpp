@@ -58,6 +58,7 @@ set(VIDEOCHAT3_SRC
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
+    src/cli/vqa_server.cpp
     ${VQA_CORE_SRC}
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC})

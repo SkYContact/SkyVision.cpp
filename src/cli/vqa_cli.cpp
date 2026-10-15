@@ -110,6 +110,8 @@ int main(int argc, char ** argv) {
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f;
     int max_frames = 32;
+    int serve_port = 0;
+    std::string serve_host = "127.0.0.1";
     bool use_gpu = true, quiet = false, dump_ids = false;   // CUDA preferred, CPU fallback
 
     for (int i = 1; i < argc; i++) {
@@ -126,6 +128,8 @@ int main(int argc, char ** argv) {
         else if (a == "--fps") fps = (float)atof(next("--fps"));
         else if (a == "--video") video_path = next("--video");
         else if (a == "--max-frames") max_frames = atoi(next("--max-frames"));
+        else if (a == "--serve") { serve_port = atoi(next("--serve")); if (serve_port <= 0) serve_port = 8899; }
+        else if (a == "--host") serve_host = next("--host");
         else if (a == "--batch") batch_path = next("--batch");
         else if (a == "--ask" || a == "-p") ask_text = next("--ask");
         else if (a == "--mode") mode = next("--mode");
@@ -145,6 +149,10 @@ int main(int argc, char ** argv) {
         else if (a == "--quiet") quiet = true;
         else { fprintf(stderr, "unknown argument: %s\n", a.c_str()); usage(); return 2; }
     }
+    if (serve_port > 0) {
+        return vqa::run_web_ui(serve_port, ".", "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
+    }
+
     if (model_path.empty()) { usage(); return 2; }
 
     std::string arch = arch_override.empty() ? vqa::architecture_of(model_path.c_str()) : arch_override;

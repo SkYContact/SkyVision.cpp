@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>SkyVision.cpp — 模型</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 40px 24px; }
+  h1 { font-size: 22px; font-weight: 600; }
+  h1 span { color: #7aa2f7; }
+  .sub { color: #888; font-size: 13px; margin-bottom: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+  .card { background: #171a21; border: 1px solid #262b36; border-radius: 12px; padding: 18px 20px;
+          cursor: pointer; transition: border-color .15s, transform .15s; text-decoration: none; color: inherit; display: block; }
+  .card:hover { border-color: #7aa2f7; transform: translateY(-2px); }
+  .arch { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #7aa2f7; font-weight: 700; }
+  .name { font-size: 16px; font-weight: 600; margin: 6px 0 10px; word-break: break-all; }
+  .meta { font-size: 12px; color: #888; }
+  .meta b { color: #b9c2d0; font-weight: 600; }
+  .empty { color: #666; margin-top: 30px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Sky<span>Vision</span>.cpp</h1>
+  <div class="sub">本地多模型视觉推理 · 只显示可运行的模型</div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" style="display:none">
+    没有发现可运行的模型。把 *.gguf（及 moondream 的 *-vision.gguf、tokenizer.json）放到启动目录后刷新。
+  </div>
+</div>
+<script>
+fetch('/api/models').then(r => r.json()).then(d => {
+  const grid = document.getElementById('grid');
+  if (!d.models.length) { document.getElementById('empty').style.display = 'block'; return; }
+  for (const m of d.models) {
+    const gb = (m.size / 1073741824).toFixed(1);
+    const a = document.createElement('a');
+    a.className = 'card';
+    a.href = '/model/' + encodeURIComponent(m.id);
+    a.innerHTML = `<div class="arch">${m.arch}</div>
+      <div class="name">${m.id}</div>
+      <div class="meta"><b>${gb} GB</b> · ${m.quant} · ${m.arch === 'moondream3' ? '五技能 · 图像' : '图像 + 视频'}</div>`;
+    grid.appendChild(a);
+  }
+});
+</script>
+</body>
+</html>

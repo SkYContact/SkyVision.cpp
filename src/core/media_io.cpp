@@ -40,6 +40,23 @@ bool load_image(const std::string & path, MediaInput & out) {
     return true;
 }
 
+bool load_image_from_memory(const std::string & bytes, MediaInput & out) {
+    int w = 0, h = 0, comp = 0;
+    unsigned char * data = stbi_load_from_memory((const stbi_uc *)bytes.data(), (int)bytes.size(), &w, &h, &comp, 3);
+    if (!data) return false;
+    out.kind = MediaKind::Image;
+    out.width = w;
+    out.height = h;
+    out.fps = 0.0;
+    out.timestamps.clear();
+    out.frames.clear();
+    Frame f;
+    f.rgb.assign(data, data + (size_t)w * h * 3);
+    out.frames.push_back(std::move(f));
+    stbi_image_free(data);
+    return true;
+}
+
 bool load_frame_dir(const std::string & dir, double fps, MediaInput & out) {
     std::vector<std::string> files;
 #ifdef _WIN32

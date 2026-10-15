@@ -945,3 +945,5 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
     fprintf(stderr, "generated %zu tokens in %.1fs (%.2f tok/s)\n", out.size() + (cur == 0 ? 1 : 0), secs, (out.size() + 1) / secs);
     return 0;
 }
+
+#include "moondream_vqa_adapter.inc"   // vqa::Model adapter (unified front end)

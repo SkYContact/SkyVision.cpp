@@ -50,6 +50,7 @@ struct LoadOptions {
                            // when the build has no GGML_CUDA (same convention as
                            // the moondream engine, where only MD_CPU forces CPU)
     std::string dump_dir;  // write intermediate tensors here (parity debugging)
+    std::string vision_path, region_path;   // moondream3 side models (gguf siblings)
 };
 
 struct Capabilities {
@@ -96,6 +97,10 @@ Model * create_videochat3();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);
+
+// unified Web UI (vqa-cli --serve); returns process exit code
+int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
+               const std::string & tokenizer, const char * bind_host);
 
 // Peek "general.architecture" in a GGUF file without loading tensors.
 // Returns "" when the file cannot be read.

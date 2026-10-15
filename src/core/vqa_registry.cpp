@@ -54,10 +54,12 @@ namespace vqa {
 // The moondream3 engine still lives in its own binary (moondream-cli); it is wired
 // behind this same interface in a follow-up step. Until then the factory reports it
 // as unavailable instead of failing to link.
-Model * create_moondream() { return nullptr; }
+// create_moondream() is defined by the moondream backend adapter
+// (moondream_vqa_adapter.inc) once linked into the same binary.
 
 Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
+    if (arch == "moondream3") return create_moondream();
     return nullptr;
 }
 
