@@ -39,7 +39,7 @@
 唯一第三方依赖是 ggml 本体（它同时提供 gguf）：
 
 ```bash
-git clone https://github.com/<you>/SkyVision.cpp
+git clone https://github.com/SkYContact/SkyVision.cpp
 cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
@@ -57,6 +57,10 @@ cmake --build build --config Release --target vqa-cli moondream-cli
 CUDA 构建下引擎默认优先使用 GPU，`--cpu`（或 moondream 的 `MD_CPU=1`）可强制 CPU。
 
 ### 2. 取权重
+
+预转好的 GGUF 免转换直接下：[魔搭 ModelScope](https://modelscope.cn/collections/SkyContact/SkyVisioncpp) · [Hugging Face](https://huggingface.co/collections/SkyContact/skyvisioncpp)
+
+想自己转，或者要别的量化档位：
 
 ```bash
 pip install -r convert/requirements.txt

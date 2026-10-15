@@ -40,7 +40,7 @@ needed to run it.
 The only third-party dependency is ggml itself (it ships gguf too):
 
 ```bash
-git clone https://github.com/<you>/SkyVision.cpp
+git clone https://github.com/SkYContact/SkyVision.cpp
 cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
@@ -59,6 +59,10 @@ engine code. In a CUDA build the engine prefers the GPU; `--cpu` (or `MD_CPU=1` 
 moondream binary) forces the CPU backend.
 
 ### 2. Get the weights
+
+Prebuilt GGUF files, no conversion needed: [ModelScope](https://modelscope.cn/collections/SkyContact/SkyVisioncpp) · [Hugging Face](https://huggingface.co/collections/SkyContact/skyvisioncpp)
+
+Or convert them yourself, or for other quantization levels:
 
 ```bash
 pip install -r convert/requirements.txt
