@@ -65,6 +65,7 @@ file.onchange = () => take(file.files[0]);
 function take(f) {
   if (!f) return;
   blob = f;
+  file.value = '';   // allow re-picking the same file (mobile skips change otherwise)
   isVideo = f.type.startsWith('video');
   drop.textContent = f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB) — 点击替换';
   imgP.style.display = vidP.style.display = 'none';

@@ -68,6 +68,7 @@ img.onload = () => { iw = img.naturalWidth; ih = img.naturalHeight; };
 function take(f) {
   if (!f) return;
   blob = f;
+  file.value = '';   // allow re-picking the same file (mobile skips change otherwise)
   drop.textContent = f.name + ' — 点击替换';
   img.src = URL.createObjectURL(f);
   imgbox.style.display = 'block';
