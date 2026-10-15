@@ -864,6 +864,9 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 
     std::vector<float> tower_out;          // [n_embd, N]: concatenated v_final rows
     int frame0 = 0;
+    // immediate first tick so the UI shows the total before clip 0 finishes
+    // (one clip of a full-resolution video can take seconds)
+    if (stage_cb) stage_cb("vision", 0, (int)clip_t.size(), stage_ud);
     for (size_t c = 0; c < clip_t.size(); c++) {
         const int t = clip_t[c];
         const int Nc = hw * t;

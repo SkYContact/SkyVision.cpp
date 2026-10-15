@@ -253,32 +253,49 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             std::string err;
             if (!ensure_loaded(*e, err)) { send(c, "500 Internal Server Error", "application/json", "{\"error\":\"" + json_escape(err) + "\"}"); return true; }
             const bool stream = query_param(req.query, "stream") == "1";
-            vqa::MediaInput media;
             const std::string kind = query_param(req.query, "kind");
+            // raw-upload cache: decode (image parse or an ffmpeg pipe for videos)
+            // ran on EVERY request even when the vision features were cached -
+            // and video decode costs seconds. Key the decoded frames on the
+            // uploaded bytes + decode parameters instead.
+            static struct {
+                uint64_t key = 0;
+                vqa::MediaInput media;
+            } upload_cache;
+            uint64_t ukey = 1469598103934665603ull;
+            for (unsigned char ch : req.body) { ukey ^= ch; ukey *= 1099511628211ull; }
+            ukey ^= (uint64_t)req.body.size() ^ (kind == "video" ? 0x9e3779b97f4a7c15ull : 0);
+            const bool want_video = (kind == "video");
+            double fps_d = 0; int mf_i = 0;
+            if (want_video) {
+                fps_d = atof(query_param(req.query, "fps").c_str());
+                mf_i = atoi(query_param(req.query, "max-frames").c_str());
+                ukey ^= (uint64_t)(int)(fps_d * 1000) << 20 ^ (uint64_t)mf_i;
+            }
+            vqa::MediaInput media;
             bool ok = false;
-            if (!req.body.empty()) {
-                if (kind == "video") {
-                    // raw video file: dump to a temp file for the ffmpeg pipe
+            if (!req.body.empty() && upload_cache.key == ukey && !upload_cache.media.empty()) {
+                media = upload_cache.media;
+                ok = true;
+            } else if (!req.body.empty()) {
+                if (want_video) {
                     std::string tmp = "serve_upload.tmp";
                     FILE * f = fopen(tmp.c_str(), "wb");
                     if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
-                    double fps = atof(query_param(req.query, "fps").c_str());
-                    int mf = atoi(query_param(req.query, "max-frames").c_str());
-                    ok = vqa::load_video_file(tmp, fps, mf, media);
+                    ok = vqa::load_video_file(tmp, fps_d, mf_i, media);
                     remove(tmp.c_str());
                 } else {
                     ok = vqa::load_image_from_memory(req.body, media);
                 }
-                if (!ok) {
-                    // stream requests expect NDJSON: a bare JSON error has no
-                    // trailing newline and the page's line splitter never sees it
-                    if (stream) {
-                        send_stream_head(c, "application/x-ndjson");
-                        send_chunk_str(c, "{\"error\":\"media decode failed (video needs ffmpeg; check FFMPEG)\"}\n");
-                        send_stream_end(c);
-                    } else send_error(c, "media decode failed");
-                    return true;
-                }
+                if (ok) { upload_cache.key = ukey; upload_cache.media = media; }
+            }
+            if (!req.body.empty() && !ok) {
+                if (stream) {
+                    send_stream_head(c, "application/x-ndjson");
+                    send_chunk_str(c, "{\"error\":\"media decode failed (video needs ffmpeg; check FFMPEG)\"}\n");
+                    send_stream_end(c);
+                } else send_error(c, "media decode failed");
+                return true;
             }
             vqa::GenParams gp;
             gp.max_tokens = atoi(query_param(req.query, "n").c_str());
