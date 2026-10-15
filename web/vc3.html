@@ -82,17 +82,42 @@ btn.onclick = async () => {
   try {
     let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
     if (!r.ok) throw new Error((await r.json()).error || 'load failed');
-    status.textContent = '推理中…';
+    status.textContent = '视觉编码…';
     const q = encodeURIComponent(document.getElementById('q').value);
     const mf = document.getElementById('mf').value;
     const kind = isVideo ? '&kind=video&fps=2&max-frames=' + mf : '';
-    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + kind + '&n=300', {
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + kind + '&n=300&stream=1', {
       method: 'POST', body: blob || new Uint8Array(0)
     });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    out.textContent = d.text;
-    status.textContent = '完成，耗时 ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s';
+    // NDJSON stream: {"phase":"vision"} then {"t":".."} per token, {"done"|"error"} at the end
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', text = '', t0v = 0, nt = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.error) throw new Error(ev.error);
+        if (ev.phase) { t0v = performance.now(); continue; }
+        if (ev.t) {
+          if (!nt) { status.textContent = '生成中…'; t0v = performance.now(); }
+          text += ev.t; nt++;
+          out.textContent = text;
+        }
+        if (ev.done) {
+          const tv = ((performance.now() - t0v) / 1000).toFixed(1);
+          status.textContent = '完成，' + nt + ' token / ' + tv + ' s' +
+                               (nt > 5 ? '（' + (nt / tv).toFixed(1) + ' tok/s）' : '');
+        }
+      }
+    }
+    if (!text && !status.textContent.startsWith('完成')) throw new Error('empty response');
   } catch (e) {
     out.textContent = '错误：' + e.message;
     status.textContent = '';

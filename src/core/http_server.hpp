@@ -95,6 +95,24 @@ inline void send_error(HttpSock s, const std::string & msg) {
     send(s, "400 Bad Request", "application/json", "{\"error\":\"" + json_escape(msg) + "\"}");
 }
 
+// --- chunked streaming (Connection: close; one chunk per event) ---
+inline void send_stream_head(HttpSock s, const char * ctype) {
+    std::string h = std::string("HTTP/1.1 200 OK\r\nContent-Type: ") + ctype +
+                    "\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store"
+                    "\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+    ::send(s, h.data(), (int)h.size(), 0);
+}
+
+// returns false when the peer went away (browser tab closed / aborted fetch)
+inline bool send_chunk_str(HttpSock s, const std::string & data) {
+    char head[16];
+    snprintf(head, sizeof(head), "%zx\r\n", data.size());
+    std::string chunk = std::string(head) + data + "\r\n";
+    return ::send(s, chunk.data(), (int)chunk.size(), 0) > 0;
+}
+
+inline void send_stream_end(HttpSock s) { ::send(s, "0\r\n\r\n", 5, 0); }
+
 inline bool recv_all(HttpSock s, Request & req) {
     std::string buf;
     char tmp[8192];

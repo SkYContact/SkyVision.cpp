@@ -101,13 +101,35 @@ btn.onclick = async () => {
     status.textContent = '加载模型（首次约 30 秒）…';
     let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
     if (!r.ok) throw new Error((await r.json()).error || 'load failed');
-    status.textContent = '推理中…';
+    status.textContent = '视觉编码…';
     r = await fetch('/api/model/' + encodeURIComponent(MODEL) +
-                    '/ask?mode=' + mode + '&q=' + encodeURIComponent(q) + '&n=' + n,
+                    '/ask?mode=' + mode + '&q=' + encodeURIComponent(q) + '&n=' + n + '&stream=1',
                     { method: 'POST', body: blob || new Uint8Array(0) });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    const text = d.text || '';
+    // NDJSON stream: {"phase":"vision"} then {"t":".."} per token, {"done"|"error"} at the end
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', text = '', nt = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('
+')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.error) throw new Error(ev.error);
+        if (ev.phase) continue;
+        if (ev.t) {
+          text += ev.t; nt++;
+          if (mode === 'ask' || mode === 'caption') out.textContent = text;
+          else out.textContent = '生成中… ' + nt + ' token';
+        }
+      }
+    }
+    if (!text && (mode === 'ask' || mode === 'caption')) throw new Error('empty response');
     if (mode === 'detect') {
       const v = text.replace('boxes:', '').trim().split(/[\s,]+/).filter(Boolean).map(Number);
       const boxes = [];

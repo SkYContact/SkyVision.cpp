@@ -252,6 +252,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             std::lock_guard<std::mutex> lk(g_mu);
             std::string err;
             if (!ensure_loaded(*e, err)) { send(c, "500 Internal Server Error", "application/json", "{\"error\":\"" + json_escape(err) + "\"}"); return true; }
+            const bool stream = query_param(req.query, "stream") == "1";
             vqa::MediaInput media;
             const std::string kind = query_param(req.query, "kind");
             bool ok = false;
@@ -276,9 +277,48 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             std::string q = query_param(req.query, "q");
             std::string mode = query_param(req.query, "mode");
             if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
+            if (stream) {
+                // NDJSON events: {"phase":"vision"} once the media is decoded,
+                // {"t":".."} per generated piece, then {"done":true} / {"error":".."}
+                // Chinese (any multibyte UTF-8) is often split across two tokens;
+                // a raw partial sequence would render as U+FFFD forever, so only
+                // complete characters are emitted and the tail is carried over.
+                send_stream_head(c, "application/x-ndjson");
+                send_chunk_str(c, "{\"phase\":\"vision\"}\n");
+                static thread_local std::string carry;
+                carry.clear();
+                gp.on_token = [](const char * piece, void * ud) {
+                    std::string s = carry + piece;
+                    carry.clear();
+                    size_t emit = s.size();
+                    // find the last complete UTF-8 boundary: scan back at most
+                    // 4 bytes (max sequence length) for an ASCII byte or a lead
+                    // byte whose sequence has enough bytes after it
+                    const size_t lo = s.size() > 4 ? s.size() - 4 : 0;
+                    for (size_t k = s.size(); k > lo; k--) {
+                        const unsigned char b = (unsigned char)s[k - 1];
+                        if (b < 0x80) break;   // ASCII: everything before is complete
+                        if (b >= 0xC0) {      // lead byte: complete only if not truncated
+                            const size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : 2;
+                            if (s.size() - (k - 1) < need) emit = k - 1;
+                            break;
+                        }
+                        // continuation byte (0x80..0xBF): keep scanning back
+                    }
+                    if (emit < s.size()) { carry = s.substr(emit); s.resize(emit); }
+                    if (!s.empty())
+                        send_chunk_str(*(HttpSock *)ud, std::string("{\"t\":\"") + json_escape(s) + "\"}\n");
+                };
+                gp.on_token_ud = &c;
+            }
             std::string out;
-            if (!g_loaded->ask(media, q, mode, gp, out)) { send_error(c, "inference failed"); return true; }
-            send_json(c, "{\"text\":\"" + json_escape(out) + "\"}");
+            if (!g_loaded->ask(media, q, mode, gp, out)) {
+                if (stream) { send_chunk_str(c, "{\"error\":\"inference failed (see server log)\"}\n"); send_stream_end(c); }
+                else send_error(c, "inference failed");
+                return true;
+            }
+            if (stream) { send_chunk_str(c, "{\"done\":true}\n"); send_stream_end(c); }
+            else send_json(c, "{\"text\":\"" + json_escape(out) + "\"}");
             return true;
         }
         send_error(c, "bad action");
