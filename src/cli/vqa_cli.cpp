@@ -105,7 +105,7 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-    std::string model_path, tokenizer_arg, image_path, frames_dir, ask_text, mode, arch_override,
+    std::string model_path, tokenizer_arg, image_path, frames_dir, ask_text, mode, arch_override, batch_path,
                 dump_dir, vision_path, region_path;
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f;
@@ -123,6 +123,7 @@ int main(int argc, char ** argv) {
         else if (a == "--image" || a == "-i") image_path = next("--image");
         else if (a == "--frames") frames_dir = next("--frames");
         else if (a == "--fps") fps = (float)atof(next("--fps"));
+        else if (a == "--batch") batch_path = next("--batch");
         else if (a == "--ask" || a == "-p") ask_text = next("--ask");
         else if (a == "--mode") mode = next("--mode");
         else if (a == "--max-tokens" || a == "-n") max_tokens = atoi(next("--max-tokens"));
@@ -177,6 +178,7 @@ int main(int argc, char ** argv) {
 
     // moondream3.1: hand over to its own engine (own flags, own vision/region files)
     if (arch == "moondream3" || arch == "moondream") {
+
         if (!frames_dir.empty()) {
             fprintf(stderr, "moondream3.1 does not take video input; use a VideoChat3 model\n");
             return 2;
@@ -197,7 +199,7 @@ int main(int argc, char ** argv) {
     } else if (!frames_dir.empty()) {
         if (!vqa::load_frame_dir(frames_dir, fps, media)) return 4;
     }
-    if (media.empty() && ask_text.empty()) { usage(); return 2; }
+    if (media.empty() && ask_text.empty() && batch_path.empty()) { usage(); return 2; }
 
     vqa::GenParams gp;
     gp.max_tokens = max_tokens;
@@ -216,6 +218,13 @@ int main(int argc, char ** argv) {
     opt.use_gpu = use_gpu;
     opt.dump_dir = dump_dir;
     if (!model->load(model_path, tok_path, opt)) { fprintf(stderr, "model load failed\n"); return 4; }
+    if (!batch_path.empty()) {
+        const int rc = model->run_batch(batch_path, max_tokens);
+        if (rc < 0) { fprintf(stderr, "this backend does not support --batch\n"); return 4; }
+        delete model;
+        return rc;
+    }
+
 
     std::string out;
     if (!model->ask(media, ask_text, mode, gp, out)) { fprintf(stderr, "inference failed\n"); return 5; }

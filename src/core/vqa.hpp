@@ -85,6 +85,9 @@ public:
     virtual bool ask(const MediaInput & media, const std::string & prompt,
                      const std::string & mode, const GenParams & gp,
                      std::string & out_text) = 0;
+
+    // batched text-only decode driver (one prompt per line); -1 = unsupported
+    virtual int run_batch(const std::string & batch_path, int n_gen) { (void)batch_path; (void)n_gen; return -1; }
 };
 
 // Backend factories (one per architecture).

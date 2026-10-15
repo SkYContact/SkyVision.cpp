@@ -1,5 +1,5 @@
 @echo off
-rem Build moondream.cpp (ggml CPU backend) with MSVC.
+rem Build SkyVision.cpp (ggml CPU backend) with MSVC.
 rem Override the toolchain with:  set VCVARS=<path to vcvars64.bat>
 setlocal
 cd /d "%~dp0.."

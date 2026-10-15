@@ -1,5 +1,5 @@
 // moondream_batch.inc — batched text decoding for the moondream CLI.
-// Included from src/moondream.cpp AFTER the Engine definition; defines
+// Included from src/models/moondream/moondream.cpp AFTER the Engine definition; defines
 // Engine::step_batch + a standalone run_batch() driver. Kept separate to avoid
 // touching the (working) single-sequence paths.
 //

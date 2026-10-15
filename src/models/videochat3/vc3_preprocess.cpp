@@ -136,21 +136,20 @@ void patchify(const float * rgb, int h, int w, const VisConfig & vc,
     patches.assign((size_t)C * N, 0.0f);
 
     const float inv = 1.0f / 127.5f;   // (x/255 - 0.5)/0.5
-    for (int bi = 0; bi < nh; bi++) {
-        for (int bj = 0; bj < nw; bj++) {
-            for (int ma = 0; ma < M; ma++) {
-                for (int mb = 0; mb < M; mb++) {
-                    const int hi = bi * M + ma, wi = bj * M + mb;
-                    const size_t n = ((size_t)(bi * nw + bj) * M + ma) * M + mb;
-                    float * dst = &patches[n * C];
-                    for (int c = 0; c < 3; c++) {
-                        for (int ph = 0; ph < P; ph++) {
-                            const float * row = rgb + ((size_t)(hi * P + ph) * w + wi * P) * 3 + c;
-                            float * drow = dst + (size_t)(c * P + ph) * P;
-                            for (int pw = 0; pw < P; pw++) {
-                                drow[pw] = row[(size_t)pw * 3] * inv - 1.0f;
-                            }
-                        }
+    // tokens in row-major (gh, gw) order - same as the reference conv output, and
+    // what pos_embed_for_grid / rope_2d_tables (and the merge reshape) assume.
+    // An earlier version emitted merge-block order (nh, nw, kh, kw), silently
+    // misaligning every token's position embedding and 2D rope.
+    for (int hi = 0; hi < gh; hi++) {
+        for (int wi = 0; wi < gw; wi++) {
+            const size_t n = (size_t)hi * gw + wi;
+            float * dst = &patches[n * C];
+            for (int c = 0; c < 3; c++) {
+                for (int ph = 0; ph < P; ph++) {
+                    const float * row = rgb + ((size_t)(hi * P + ph) * w + wi * P) * 3 + c;
+                    float * drow = dst + (size_t)(c * P + ph) * P;
+                    for (int pw = 0; pw < P; pw++) {
+                        drow[pw] = row[(size_t)pw * 3] * inv - 1.0f;
                     }
                 }
             }

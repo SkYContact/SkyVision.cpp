@@ -1,5 +1,5 @@
 @echo off
-rem Build moondream.cpp with the ggml CUDA backend via Ninja.
+rem Build SkyVision.cpp with the ggml CUDA backend via Ninja.
 rem
 rem CUDA 13.0 nvcc is incompatible with the VS18 MSVC 14.51 host compiler
 rem (cudafe++ crashes), so this uses the VS2022 BuildTools environment and an

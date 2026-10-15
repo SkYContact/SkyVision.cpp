@@ -1,4 +1,4 @@
-"""Convert moondream3.1-9B-A2B HF safetensors (FP8 MoE) to GGUF for moondream.cpp.
+"""Convert moondream3.1-9B-A2B HF safetensors (FP8 MoE) to GGUF for SkyVision.cpp.
 
 Usage:
   python convert/convert_hf_to_gguf.py [--q6 | --q4] [--q8-dense] [--src DIR] [-o OUT.gguf]

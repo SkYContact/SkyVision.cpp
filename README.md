@@ -1,4 +1,4 @@
-# moondream.cpp
+# SkyVision.cpp
 
 用 [ggml](https://github.com/ggml-org/ggml) 在本地跑**图像/视频 VQA** —— 一个多模型推理引擎：
 每个视觉语言模型是一个后端（实现 `vqa::Model`），统一前端按 GGUF 里的
@@ -39,8 +39,8 @@
 唯一第三方依赖是 ggml 本体（它同时提供 gguf）：
 
 ```bash
-git clone https://github.com/<you>/moondream.cpp
-cd moondream.cpp
+git clone https://github.com/<you>/SkyVision.cpp
+cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
 # Windows（MSVC + Ninja）：一次构建 vqa-cli 与 moondream-cli

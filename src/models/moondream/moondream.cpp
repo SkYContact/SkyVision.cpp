@@ -1,4 +1,4 @@
-// moondream.cpp — standalone ggml inference engine for moondream3.1-9B-A2B
+// SkyVision.cpp — standalone ggml inference engine for moondream3.1-9B-A2B
 // Milestone 1: text-only, CPU, greedy decode, single stream, batch=1 steps.
 //
 // Model math (from moondream/moondream3-preview official reference text.py/layers.py/rope.py):
@@ -26,6 +26,9 @@
 #   include "ggml-cuda.h"
 #endif
 #include "ggml-alloc.h"
+
+#include "attention.hpp"
+#include "sampler.hpp"
 #include "gguf.h"
 
 #include <cstdio>
@@ -263,9 +266,7 @@ struct Engine {
     int n_past = 0;
     std::vector<int *> leaked_ids;   // per-step host id buffers (freed never; few KB)
     int n_ctx = 1024;
-    struct ggml_context * kv_ctx = nullptr;
-    struct ggml_backend_buffer * kv_buf = nullptr;
-    std::vector<struct ggml_tensor *> kv_k, kv_v;
+    vqa::KvCache kv;
     ggml_backend_t backend = nullptr;
     struct ggml_gallocr * gallocr = nullptr;
     // static decode graph: shape-invariant (KV views cover full n_ctx, mask hides unused
@@ -284,7 +285,7 @@ struct Engine {
     // static decode/batch graphs keep working — only their input values depend on it)
     void reset() {
         n_past = 0;
-        if (kv_buf) ggml_backend_buffer_clear(kv_buf, 0);
+        kv.clear();
     }
     int step_batch(const std::vector<int> & toks, const std::vector<int> & posv,
                    const std::vector<int> & lo, const std::vector<int> & hi, float * logits_out);
@@ -292,8 +293,7 @@ struct Engine {
     ~Engine() {
         if (dec_ctx) ggml_free(dec_ctx);
         if (bat_ctx) ggml_free(bat_ctx);
-        if (kv_buf) ggml_backend_buffer_free(kv_buf);
-        if (kv_ctx) ggml_free(kv_ctx);
+        kv.free();
         if (gallocr) ggml_gallocr_free(gallocr);
         if (backend) ggml_backend_free(backend);
     }
@@ -331,18 +331,9 @@ bool Engine::init(const char * gguf_path, const char * tok_json, int n_ctx_) {
     if (!tok.load(tok_json)) return false;
     n_ctx = n_ctx_;
 
-    struct ggml_init_params ip = { ggml_tensor_overhead() * (model.n_layer * 2 + 8), NULL, true };
-    kv_ctx = ggml_init(ip);
-    int n_kv = model.n_kv_head * model.n_head_dim;
-    for (int i = 0; i < model.n_layer * 2; i++) {
-        // F16 KV: half the memory, and ggml flash-attn CUDA consumes F16 natively
-        struct ggml_tensor * t = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F16, n_kv, n_ctx); // k,v both [KV, ctx]
-        (i % 2 == 0 ? kv_k : kv_v).push_back(t);
-    }
-    kv_buf = ggml_backend_alloc_ctx_tensors(kv_ctx, backend);
-    if (!kv_buf) { fprintf(stderr, "kv cache alloc on backend failed\n"); return false; }
-    ggml_backend_buffer_clear(kv_buf, 0);   // unused cache slots must be zero: flash-attn reads
-    // the full fixed-size window and NaN garbage would poison softmax even under -inf mask
+    if (!kv.alloc(backend, model.n_layer, model.n_kv_head, model.n_head_dim, n_ctx)) return false;
+    // unused cache slots must be zero: flash-attn reads the full fixed-size window
+    // and NaN garbage would poison softmax even under -inf mask (kv.alloc clears)
 
     // Pre-grow the gallocr pool to the largest graph shape we will ever run
     // (an embedding prefill of the full context). ggml_gallocr FREEs the whole
@@ -464,8 +455,8 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
         if (il == 0) ggml_set_name(v2, "d_l0_v2");
 
         // write into KV cache rows P..P+T via scatter
-        ggml_build_forward_expand(gf, ggml_set_rows(gctx, kv_k[il], k2, pos));
-        ggml_build_forward_expand(gf, ggml_set_rows(gctx, kv_v[il], v2, pos));
+        ggml_build_forward_expand(gf, ggml_set_rows(gctx, kv.k[il], k2, pos));
+        ggml_build_forward_expand(gf, ggml_set_rows(gctx, kv.v[il], v2, pos));
 
         const int S = fixed_ctx ? n_ctx : P + T;   // static decode graph: fixed-size KV views
         static const bool no_fa = getenv("MD_NO_FA") != nullptr;
@@ -474,9 +465,9 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
             // fused flash attention: q [HD,T,H], k/v [HD,S,H] views straight into tensors
             // (views are row-contiguous, no cont() copies needed)
             struct ggml_tensor * qf = ggml_view_3d(gctx, q, HD, T, H, q->nb[2], q->nb[1], 0);
-            struct ggml_tensor * kf = ggml_view_3d(gctx, kv_k[il], HD, S, H,
+            struct ggml_tensor * kf = ggml_view_3d(gctx, kv.k[il], HD, S, H,
                     KV * sizeof(ggml_fp16_t), HD * sizeof(ggml_fp16_t), 0);
-            struct ggml_tensor * vf = ggml_view_3d(gctx, kv_v[il], HD, S, H,
+            struct ggml_tensor * vf = ggml_view_3d(gctx, kv.v[il], HD, S, H,
                     KV * sizeof(ggml_fp16_t), HD * sizeof(ggml_fp16_t), 0);
             // causal mask: shared tensor (may be NULL for single-shot decode without fixed ctx)
             struct ggml_tensor * mask = shared_mask;
@@ -488,9 +479,9 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
         // per-head attention with explicit 2D matmuls; results concatenated along D (h-major)
         for (int h = 0; h < H; h++) {
             struct ggml_tensor * qh  = ggml_view_2d(gctx, q, HD, T, q->nb[2], h * q->nb[1]);
-            struct ggml_tensor * kh  = ggml_view_2d(gctx, kv_k[il], HD, S, KV * sizeof(ggml_fp16_t), h * HD * sizeof(ggml_fp16_t));
+            struct ggml_tensor * kh  = ggml_view_2d(gctx, kv.k[il], HD, S, KV * sizeof(ggml_fp16_t), h * HD * sizeof(ggml_fp16_t));
             struct ggml_tensor * wth = ggml_cont(gctx, ggml_transpose(gctx,
-                    ggml_view_2d(gctx, kv_v[il], HD, S, KV * sizeof(ggml_fp16_t), h * HD * sizeof(ggml_fp16_t))));  // [S, HD]
+                    ggml_view_2d(gctx, kv.v[il], HD, S, KV * sizeof(ggml_fp16_t), h * HD * sizeof(ggml_fp16_t))));  // [S, HD]
             struct ggml_tensor * kq = MMUL(gctx, kh, qh);              // [S, T]
             kq = ggml_scale(gctx, kq, 1.0f / sqrtf((float)HD));
             if (P > 0 || T > 1) {
@@ -530,7 +521,9 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
             struct ggml_tensor * gu = ggml_mul_mat_id(gctx, L.up_exps, cur, sel);      // [2I, K, T]
             struct ggml_tensor * h = ggml_view_3d(gctx, gu, M.inter, M.n_experts_used, T, gu->nb[1], gu->nb[2], 0);
             struct ggml_tensor * g = ggml_view_3d(gctx, gu, M.inter, M.n_experts_used, T, gu->nb[1], gu->nb[2], M.inter * gu->nb[0]);
-            cur = ggml_gelu_erf(gctx, h);              // ref layers.py MoE GeGLU uses F.gelu (erf)
+            // h is a row-strided view of gu (first I of 2I rows per expert slice); the CUDA unary
+            // kernel only accepts contiguous src0, so materialize it like the rope path above
+            cur = ggml_gelu_erf(gctx, ggml_cont(gctx, h));   // ref layers.py MoE GeGLU uses F.gelu (erf)
             g = ggml_add(gctx, g, one_fill);           // g + 1
             cur = ggml_mul(gctx, cur, g);
             struct ggml_tensor * ff3 = ggml_mul_mat_id(gctx, L.down_exps, cur, sel);   // [D, K, T]

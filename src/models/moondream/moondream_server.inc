@@ -1,5 +1,5 @@
 // moondream_server.inc — minimal embedded web UI for the moondream CLI.
-// Included from src/moondream.cpp after Engine/VisionModel are available.
+// Included from src/models/moondream/moondream.cpp after Engine/VisionModel are available.
 // Philosophy of the project: no external dependencies — hand-rolled HTTP on
 // plain sockets, sequential request handling (single local user).
 //
@@ -388,7 +388,7 @@ static int run_server(Engine & e, const char * vision_path, const char * region_
     }
     if (!vm_loaded) fprintf(stderr, "warning: vision model failed to load, /api/vision disabled\n");
 
-    printf("moondream.cpp web UI: http://127.0.0.1:%d  (Ctrl+C to stop)\n", port);
+    printf("SkyVision.cpp web UI: http://127.0.0.1:%d  (Ctrl+C to stop)\n", port);
     fflush(stdout);
 
     while (true) {

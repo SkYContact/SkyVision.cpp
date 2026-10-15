@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(moondream.cpp CXX)
+project(SkyVision.cpp CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,7 +39,7 @@ set(VQA_CORE_SRC
     src/core/tokenizer.cpp)
 
 set(MOONDREAM_SRC
-    src/models/moondream/moondream.cpp
+    src/models/moondream/SkyVision.cpp
     src/models/moondream/moondream_vision.cpp
     src/models/moondream/moondream_preprocess.cpp
     src/models/moondream/moondream_region.cpp)
@@ -72,16 +72,16 @@ target_link_libraries(moondream-cli PRIVATE ggml ggml-cpu)
 target_include_directories(moondream-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- vision encoder test target (milestone 6) ---
-add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp)
+add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)
 target_compile_definitions(moondream-vision-test PRIVATE VISION_TEST_MAIN)
 target_link_libraries(moondream-vision-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-vision-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC})
+target_include_directories(moondream-vision-test PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- region head test target (milestone 7) ---
-add_executable(moondream-region-test src/models/moondream/moondream_region.cpp)
+add_executable(moondream-region-test src/models/moondream/moondream_region.cpp src/core/vqa_util.cpp)
 target_compile_definitions(moondream-region-test PRIVATE REGION_TEST_MAIN)
 target_link_libraries(moondream-region-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-region-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC})
+target_include_directories(moondream-region-test PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- multi-crop Lanczos preprocess test target (milestone 6 follow-up) ---
 add_executable(moondream-preprocess-test src/models/moondream/moondream_preprocess.cpp)

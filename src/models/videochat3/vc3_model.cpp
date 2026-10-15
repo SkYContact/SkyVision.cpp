@@ -22,6 +22,8 @@
 #endif
 #include "tokenizer.hpp"
 #include "vc3_preprocess.hpp"
+#include "attention.hpp"
+#include "sampler.hpp"
 #include "vqa_util.hpp"
 
 #include <algorithm>
@@ -83,10 +85,10 @@ private:
     bool load_weights(const char * path);
     bool alloc_kv();
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens);
-    bool build_text_graph(TextGraph & g, int T, int S, int n_img);
+    bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false);
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<float> * img_feats,
                   const std::vector<int> * img_pos, std::vector<float> & logits_out);
-    std::string render_prompt(int n_img_tokens, const std::string & user_text) const;
+    std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video) const;
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     float randf();
     void dump(const ggml_cgraph * gf, const char * name);
@@ -117,9 +119,21 @@ private:
     ggml_tensor *mm_l1_w = nullptr, *mm_l1_b = nullptr;
     ggml_tensor *mm_l2_w = nullptr, *mm_l2_b = nullptr;
 
-    ggml_backend_buffer_t kv_buf = nullptr;
-    ggml_context * kv_ctx = nullptr;
-    std::vector<ggml_tensor *> kv_k, kv_v;
+    vqa::KvCache kv;
+    // batch decode (vc3_batch.inc)
+    int bat_n = 0;
+    ggml_context * bat_ctx = nullptr;
+    ggml_cgraph * bat_gf = nullptr;
+    ggml_tensor * bat_tok = nullptr, * bat_pos = nullptr, * bat_mask = nullptr;
+    int step_batch(const std::vector<int> & toks, const std::vector<int> & posv,
+                   const std::vector<int> & lo, const std::vector<int> & hi, float * logits_out);
+    int run_batch(const std::string & path, int n_gen);
+    // static decode graph (T=1, fixed KV window per block): same gf object across
+    // steps -> eligible for ggml CUDA graph capture (see moondream Engine::step)
+    ggml_context * dec_ctx = nullptr;
+    ggml_cgraph * dec_gf = nullptr;
+    int dec_blk = 0;
+    ggml_tensor * dec_tok = nullptr, * dec_pos = nullptr, * dec_mask = nullptr;
     ggml_gallocr_t allocr = nullptr;
     int n_past = 0;
 
@@ -160,18 +174,26 @@ static void tensor_to_f32(ggml_tensor * t, float * dst) {
     }
 }
 
-// per-pair complex rotation on an interleaved head vector: pair p = (v[2p], v[2p+1])
-static ggml_tensor * rope_2d(ggml_context * ctx, ggml_tensor * x,
+// per-pair complex rotation on an interleaved head vector: pair p = (v[2p], v[2p+1]).
+// cos_t/sin_t are [1, pairs, H, N] - pre-expanded on the host to re/im's exact shape,
+// so every elementwise op is same-shape. ore/oim land in a preallocated interleaved
+// tensor via two cpy ops - a dim0 concat here explodes into thousands of tiny kernel
+// launches under WDDM.
+// per-pair complex rotation on an interleaved head vector: pair p = (v[2p], v[2p+1]).
+// cos_t/sin_t are [1, pairs, H*N] - pre-expanded on the host to re/im's exact shape.
+// Everything is kept 3d: the CUDA concat launcher loops over ne[3], so a 4d layout
+// with ne3=N explodes into thousands of tiny kernel launches under WDDM.
+static ggml_tensor * rope_2d(ggml_context * ctx, struct ggml_cgraph * gf, ggml_tensor * x,
                              ggml_tensor * cos_t, ggml_tensor * sin_t) {
     const int64_t hd = x->ne[0], H = x->ne[1], N = x->ne[2];
-    const int64_t pairs = hd / 2;
-    ggml_tensor * x4 = ggml_reshape_4d(ctx, x, 2, pairs, H, N);
-    ggml_tensor * re = ggml_view_4d(ctx, x4, 1, pairs, H, N, x4->nb[1], x4->nb[2], x4->nb[3], 0);
-    ggml_tensor * im = ggml_view_4d(ctx, x4, 1, pairs, H, N, x4->nb[1], x4->nb[2], x4->nb[3], x4->nb[0]);
-    ggml_tensor * c = ggml_reshape_4d(ctx, cos_t, 1, pairs, 1, N);
-    ggml_tensor * s = ggml_reshape_4d(ctx, sin_t, 1, pairs, 1, N);
-    ggml_tensor * ore = ggml_sub(ctx, ggml_mul(ctx, re, c), ggml_mul(ctx, im, s));
-    ggml_tensor * oim = ggml_add(ctx, ggml_mul(ctx, re, s), ggml_mul(ctx, im, c));
+    const int64_t pairs = hd / 2, M = H * N;
+    ggml_tensor * x3 = ggml_reshape_3d(ctx, x, 2, pairs, M);
+    ggml_tensor * re = ggml_cont(ctx, ggml_view_3d(ctx, x3, 1, pairs, M, x3->nb[1], x3->nb[2], 0));
+    ggml_tensor * im = ggml_cont(ctx, ggml_view_3d(ctx, x3, 1, pairs, M, x3->nb[1], x3->nb[2], x3->nb[0]));
+    ggml_tensor * c = ggml_reshape_3d(ctx, cos_t, 1, pairs, M);
+    ggml_tensor * sn = ggml_reshape_3d(ctx, sin_t, 1, pairs, M);
+    ggml_tensor * ore = ggml_sub(ctx, ggml_mul(ctx, re, c), ggml_mul(ctx, im, sn));
+    ggml_tensor * oim = ggml_add(ctx, ggml_mul(ctx, re, sn), ggml_mul(ctx, im, c));
     return ggml_reshape_3d(ctx, ggml_concat(ctx, ore, oim, 0), hd, H, N);
 }
 
@@ -184,8 +206,9 @@ float VideoChat3::randf() {
 
 VideoChat3::~VideoChat3() {
     if (allocr) ggml_gallocr_free(allocr);
-    if (kv_buf) ggml_backend_buffer_free(kv_buf);
-    if (kv_ctx) ggml_free(kv_ctx);
+    if (bat_ctx) ggml_free(bat_ctx);
+    if (dec_ctx) ggml_free(dec_ctx);
+    kv.free();
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wbuf_plain) ggml_backend_buffer_free(wbuf_plain);
     if (wctx) ggml_free(wctx);
@@ -429,24 +452,7 @@ bool VideoChat3::load_weights(const char * path) {
 }
 
 bool VideoChat3::alloc_kv() {
-    const size_t kv_bytes = (size_t)n_ctx * (size_t)n_kv_head * head_dim * sizeof(ggml_fp16_t);
-    struct ggml_init_params ip = { (size_t)(n_layer * 2 + 8) * ggml_tensor_overhead(), NULL, true };
-    kv_ctx = ggml_init(ip);
-    if (!kv_ctx) return false;
-    kv_k.resize(n_layer);
-    kv_v.resize(n_layer);
-    for (int i = 0; i < n_layer; i++) {
-        kv_k[i] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F16, n_kv_head * head_dim, n_ctx);
-        kv_v[i] = ggml_new_tensor_2d(kv_ctx, GGML_TYPE_F16, n_kv_head * head_dim, n_ctx);
-    }
-    kv_buf = ggml_backend_alloc_ctx_tensors(kv_ctx, backend);
-    if (!kv_buf) {
-        fprintf(stderr, "KV cache allocation failed (%.2f GB)\n", (double)n_layer * 2 * kv_bytes / 1e9);
-        return false;
-    }
-    ggml_backend_buffer_clear(kv_buf, 0);
-    fprintf(stderr, "kv cache: %.2f GB (n_ctx %d)\n", (double)n_layer * 2 * kv_bytes / 1e9, n_ctx);
-    return true;
+    return kv.alloc(backend, n_layer, n_kv_head, head_dim, n_ctx);
 }
 
 void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
@@ -476,11 +482,7 @@ void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
 bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens) {
     *n_tokens = 0;
     if (media.empty()) return true;
-    if (media.kind == vqa::MediaKind::Video) {
-        fprintf(stderr, "video input is not implemented yet\n");
-        return false;
-    }
-    const vqa::Frame & fr = media.frames[0];
+    const int T = (int)media.frames.size();
     const int src_h = media.height, src_w = media.width;
     const int factor = vc.patch * vc.merge;
 
@@ -490,22 +492,55 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
     }
-    fprintf(stderr, "image %dx%d -> %dx%d\n", src_w, src_h, W, H);
+    if (media.kind == vqa::MediaKind::Video)
+        fprintf(stderr, "video %d frame%s %dx%d -> %dx%d each\n", T, T == 1 ? "" : "s", src_w, src_h, W, H);
+    else
+        fprintf(stderr, "image %dx%d -> %dx%d\n", src_w, src_h, W, H);
 
-    std::vector<float> rgb;
-    resize_bicubic_antialias(fr.rgb.data(), src_w, src_h, W, H, rgb);
+    // clips of temporal_merge frames each (modeling_videochat3.py split_grid_thws_clip_by_clip):
+    // attention is block-diagonal per clip, the temporal pos index restarts per clip and
+    // the merger mean-pools the time axis of each clip
+    std::vector<int> clip_t;
+    for (int off = 0; off < T; off += vc.temporal_merge)
+        clip_t.push_back(std::min(vc.temporal_merge, T - off));
 
-    std::vector<float> patches;
+    std::vector<float> rgb, patches, pos, pos_clip;
     int gh = 0, gw = 0;
-    patchify(rgb.data(), H, W, vc, patches, &gh, &gw);
-    const int N = gh * gw;
-
-    std::vector<float> pos;
-    pos_embed_for_grid(pos_emb_host.data(), pos_time_host.data(), vc, 1, gh, gw, pos);
+    for (int ti = 0; ti < T; ti++) {
+        resize_bicubic_antialias(media.frames[ti].rgb.data(), src_w, src_h, W, H, rgb);
+        std::vector<float> p;
+        patchify(rgb.data(), H, W, vc, p, &gh, &gw);
+        patches.insert(patches.end(), p.begin(), p.end());
+    }
+    const int hw = gh * gw;
+    const int N = hw * T;
+    for (int t : clip_t) {
+        pos_embed_for_grid(pos_emb_host.data(), pos_time_host.data(), vc, t, gh, gw, pos_clip);
+        pos.insert(pos.end(), pos_clip.begin(), pos_clip.end());
+    }
 
     const int vhd = vc.n_embd / vc.n_head;
+            const bool pad80 = vhd == 72;
     std::vector<float> rcos, rsin;
-    rope_2d_tables(vhd, 1, gh, gw, vc.rope_theta, rcos, rsin);
+    rope_2d_tables(vhd, T, gh, gw, vc.rope_theta, rcos, rsin);
+    // expand [pairs, N] to [pairs, n_head, N] flat - rope_2d consumes same-shape tensors
+    {
+        const int pairs = vhd / 2, NH = vc.n_head;
+        // rope_2d_tables writes pair-major buffers (table[p*N + s]); the ggml
+        // [1, pairs, H, N] tensor is row-major, so index both sides explicitly
+        std::vector<float> ex((size_t)pairs * NH * N);
+        for (int h = 0; h < NH; h++)
+            for (int s = 0; s < N; s++)
+                for (int p = 0; p < pairs; p++)
+                    ex[(size_t)p + (size_t)pairs * ((size_t)h + (size_t)NH * s)] = rcos[(size_t)p * N + s];
+        rcos.swap(ex);
+        std::vector<float> ey((size_t)pairs * NH * N);
+        for (int h = 0; h < NH; h++)
+            for (int s = 0; s < N; s++)
+                for (int p = 0; p < pairs; p++)
+                    ey[(size_t)p + (size_t)pairs * ((size_t)h + (size_t)NH * s)] = rsin[(size_t)p * N + s];
+        rsin.swap(ey);
+    }
 
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     ggml_context * gctx = ggml_init(ip);
@@ -516,19 +551,111 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     ggml_set_name(t_patches, "patches");
     ggml_tensor * t_pos = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vc.n_embd, N);
     ggml_set_name(t_pos, "vpos");
-    ggml_tensor * t_cos = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vhd / 2, N);
+    ggml_tensor * t_cos = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, vhd / 2, vc.n_head, N);
     ggml_set_name(t_cos, "vcos");
-    ggml_tensor * t_sin = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vhd / 2, N);
+    ggml_tensor * t_sin = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, vhd / 2, vc.n_head, N);
     ggml_set_name(t_sin, "vsin");
     ggml_tensor * t_zmask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, N, N);
     ggml_set_name(t_zmask, "vzmask");
+    ggml_tensor * t_pad80 = nullptr;
+    if (pad80) {
+        t_pad80 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 80 - vhd, N, vc.n_head);
+        ggml_set_name(t_pad80, "vpad80");
+    }
 
     ggml_tensor * x = ggml_mul_mat(gctx, v_patch_w, t_patches);
     x = ggml_add(gctx, x, v_patch_b);
     x = ggml_add(gctx, x, t_pos);
     ggml_set_name(x, "v_patch_out");
 
-    for (int il = 0; il < vc.n_layer; il++) {
+    // parity helper: truncate the graph at a named node (the sink is then never
+    // buffer-reused, so its dump is valid) -- scripts/parity_vc3_video.py
+    const char * stop_after = getenv("VC3_STOP_AFTER");
+    auto run = [&](const char * out_name) -> bool {
+        const auto ra = std::chrono::steady_clock::now();
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "vision graph allocation failed\n");
+            return false;
+        }
+        static const bool vprof = getenv("VC3_PROF") != nullptr;
+        static double v_alloc = 0, v_input = 0, v_comp = 0; static int v_runs = 0;
+        const auto rb = std::chrono::steady_clock::now();
+        // truncated graphs may leave unused inputs unallocated (buffer == NULL)
+        if (t_patches->buffer) ggml_backend_tensor_set(t_patches, patches.data(), 0, sizeof(float) * patches.size());
+        if (t_pos->buffer)     ggml_backend_tensor_set(t_pos, pos.data(), 0, sizeof(float) * pos.size());
+        if (t_cos->buffer)     ggml_backend_tensor_set(t_cos, rcos.data(), 0, sizeof(float) * rcos.size());
+        if (t_sin->buffer)     ggml_backend_tensor_set(t_sin, rsin.data(), 0, sizeof(float) * rsin.size());
+        fprintf(stderr, "[run] inputs set\n");
+        if (t_pad80 && t_pad80->buffer) {
+            std::vector<float> zeros(ggml_nelements(t_pad80), 0.0f);
+            ggml_backend_tensor_set(t_pad80, zeros.data(), 0, sizeof(float) * zeros.size());
+        }
+        if (t_zmask->buffer) {
+            // block-diagonal attention: tokens attend within their clip only
+            // (cu_seqlens mask in modeling_videochat3.py). Single clip = all zeros.
+            std::vector<ggml_fp16_t> mask((size_t)N * N, ggml_fp32_to_fp16(0.0f));
+            if (clip_t.size() > 1) {
+                std::vector<int> tok_clip(N);
+                {
+                    int s = 0;
+                    for (size_t c = 0; c < clip_t.size(); c++)
+                        for (int i = 0; i < clip_t[c] * hw; i++) tok_clip[s++] = (int)c;
+                }
+                const ggml_fp16_t neg = ggml_fp32_to_fp16(-INFINITY);
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < N; j++)
+                        if (tok_clip[i] != tok_clip[j]) mask[(size_t)i * N + j] = neg;
+            }
+            ggml_backend_tensor_set(t_zmask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
+        }
+        const auto rc = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "vision compute failed\n");
+            return false;
+        }
+        const auto rd = std::chrono::steady_clock::now();
+        if (vprof) {
+            v_runs++;
+            v_alloc += std::chrono::duration<double,std::milli>(rb-ra).count();
+            v_input += std::chrono::duration<double,std::milli>(rc-rb).count();
+            v_comp  += std::chrono::duration<double,std::milli>(rd-rc).count();
+            fprintf(stderr, "[vprof] run=%d alloc %.1fms input %.1fms compute %.1fms\n",
+                    v_runs, v_alloc/v_runs, v_input/v_runs, v_comp/v_runs);
+        }
+        dump(gf, "patches");
+        dump(gf, "vpos");
+        dump(gf, "vcos");
+        dump(gf, "vsin");
+        dump(gf, "v_patch_out");
+        dump(gf, "v_blk0_qkv");
+        dump(gf, "v_blk0_q_rope");
+        dump(gf, "v_blk0_k_rope");
+        dump(gf, "v_blk0_attn_out");
+        dump(gf, "v_blk0_out");
+        dump(gf, "v_final");
+        dump(gf, "v_merge");
+        dump(gf, "v_proj_out");
+        dump(gf, out_name);   // sink dump is always buffer-safe
+        ggml_tensor * out = ggml_graph_get_tensor(gf, out_name);
+        const int n = (int)out->ne[1];
+        const int d = (int)out->ne[0];   // vision dim (!= n_embd before the projector)
+        feats.resize((size_t)n * d);
+        ggml_backend_tensor_get(out, feats.data(), 0, sizeof(float) * feats.size());
+        *n_tokens = n;
+        fprintf(stderr, "vision: %d patches (%dx%d) -> %d tokens%s\n", N, gh, gw, n,
+                stop_after ? " (truncated for parity)" : "");
+        return true;
+    };
+    if (stop_after && !strcmp(stop_after, "v_patch_out")) {
+        ggml_build_forward_expand(gf, x);
+        if (!run("v_patch_out")) { ggml_free(gctx); return false; }
+        ggml_free(gctx);
+        return true;
+    }
+
+    int vl_max = vc.n_layer;
+    { const char * e = getenv("VC3_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
+    for (int il = 0; il < vl_max; il++) {
         VisLayer & L = vl[il];
         ggml_tensor * l = ggml_norm(gctx, x, vc.layernorm_eps);
         l = ggml_mul(gctx, l, L.norm0_w);
@@ -546,21 +673,89 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_tensor * v = ggml_reshape_3d(gctx,
                 ggml_cont(gctx, ggml_view_2d(gctx, qkv, vc.n_embd, N, qkv->nb[1], 2 * off)), vhd, vc.n_head, N);
         if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
+        if (il == 0 && stop_after && !strcmp(stop_after, "v_blk0_qkv")) {
+            ggml_build_forward_expand(gf, qkv);
+            if (!run("v_blk0_qkv")) { ggml_free(gctx); return false; }
+            ggml_free(gctx);
+            return true;
+        }
+        if (il == 0 && stop_after && !strcmp(stop_after, "v_blk0_q")) {
+            ggml_build_forward_expand(gf, q);
+            if (!run("v_blk0_q")) { ggml_free(gctx); return false; }
+            ggml_free(gctx);
+            return true;
+        }
 
-        q = rope_2d(gctx, q, t_cos, t_sin);
-        k = rope_2d(gctx, k, t_cos, t_sin);
-        if (il == 0) { ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope"); }
+        q = rope_2d(gctx, gf, q, t_cos, t_sin);
+        k = rope_2d(gctx, gf, k, t_cos, t_sin);
+        if (il == 0) {
+            ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
+            if (stop_after && !strcmp(stop_after, "v_blk0_q_rope")) {
+                ggml_build_forward_expand(gf, q);
+                if (!run("v_blk0_q_rope")) { ggml_free(gctx); return false; }
+                ggml_free(gctx);
+                return true;
+            }
+        }
 
-        ggml_tensor * qf = ggml_view_3d(gctx, q, vhd, N, vc.n_head, q->nb[2], q->nb[1], 0);
-        ggml_tensor * kf = ggml_view_3d(gctx, k, vhd, N, vc.n_head, k->nb[2], k->nb[1], 0);
-        ggml_tensor * vf = ggml_view_3d(gctx, v, vhd, N, vc.n_head, v->nb[2], v->nb[1], 0);
-        ggml_tensor * fa = ggml_flash_attn_ext(gctx, qf, kf, vf, t_zmask,
-                                               1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(gctx, ggml_cont(gctx, fa), vc.n_embd, N);
+        // attention runs clip-locally with NO mask: a masked flash-attn falls off
+        // the fast path, and clip tokens are contiguous, so per-clip unmasked FA
+        // (same trick as SkyVision.cpp's multi-crop SigLIP) is both exact and fast.
+        // hd=72 is not a compiled FA kernel size: zero-pad q/k/v to 80 (exact:
+        // padded dims contribute 0 to QK^T and 0 to the output, sliced away after).
+        const int vhd_f = pad80 ? 80 : vhd;
+        auto fa_in = [&](ggml_tensor * t, int n_tok, size_t off) {
+            ggml_tensor * tv = ggml_view_3d(gctx, t, vhd, n_tok, vc.n_head, t->nb[2], t->nb[1], off * t->nb[2]);
+            if (!pad80) return ggml_cont(gctx, tv);   // FA kernels want aligned strides
+            if (true) {
+                // concat dim0 wants same-shape (besides dim0) tensors; use a
+                // matching-width slice of the pad input and materialize the view
+                ggml_tensor * pad = t_pad80;
+                if (n_tok != N)
+                    pad = ggml_view_3d(gctx, t_pad80, 80 - vhd, n_tok, vc.n_head,
+                                       t_pad80->nb[1], t_pad80->nb[2], 0);
+                tv = ggml_concat(gctx, ggml_cont(gctx, tv), pad, 0);
+            }
+            return tv;
+        };
+        ggml_tensor * fa = nullptr;
+        if (clip_t.size() == 1) {
+            ggml_tensor * qf = fa_in(q, N, 0);
+            ggml_tensor * kf = fa_in(k, N, 0);
+            ggml_tensor * vf = fa_in(v, N, 0);
+            fa = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
+        } else {
+            size_t coff = 0;
+            for (int t : clip_t) {
+                const int cn = t * hw;
+                ggml_tensor * qf = fa_in(q, cn, coff);
+                ggml_tensor * kf = fa_in(k, cn, coff);
+                ggml_tensor * vf = fa_in(v, cn, coff);
+                ggml_tensor * fc = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
+                fc = ggml_cont(gctx, fc);
+                fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;   // fa out is [hd, heads, tokens]: concat tokens (dim2)
+                coff += (size_t)cn;
+            }
+        }
+        // fa is [vhd_f, n_head, N]; drop the padding cols and lay out rows as tokens
+        ggml_tensor * attn_src = fa;
+        if (pad80)
+            attn_src = ggml_view_3d(gctx, ggml_cont(gctx, fa), vhd, vc.n_head, N,
+                                    (size_t)vhd_f * sizeof(float), (size_t)vhd_f * vc.n_head * sizeof(float), 0);
+        ggml_tensor * attn =
+                ggml_reshape_2d(gctx, ggml_cont(gctx, attn_src), vc.n_embd, N);
         attn = ggml_mul_mat(gctx, L.wo_w, attn);
         attn = ggml_add(gctx, attn, L.wo_b);
         x = ggml_add(gctx, x, attn);
-        if (il == 0) ggml_set_name(x, "v_blk0_attn_out");
+        if (il == 0) {
+            ggml_set_name(x, "v_blk0_attn_out");
+            if (stop_after && !strcmp(stop_after, "v_blk0_attn_out")) {
+                ggml_build_forward_expand(gf, x);
+                if (!run("v_blk0_attn_out")) { ggml_free(gctx); return false; }
+                ggml_free(gctx);
+                return true;
+            }
+        }
 
         ggml_tensor * m = ggml_norm(gctx, x, vc.layernorm_eps);
         m = ggml_mul(gctx, m, L.norm1_w);
@@ -571,26 +766,60 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         m = ggml_mul_mat(gctx, L.fc1_w, m);
         m = ggml_add(gctx, m, L.fc1_b);
         x = ggml_add(gctx, x, m);
-        if (il == 0) ggml_set_name(x, "v_blk0_out");
+        if (il == 0) {
+            ggml_set_name(x, "v_blk0_out");
+            if (stop_after && !strcmp(stop_after, "v_blk0_out")) {
+                ggml_build_forward_expand(gf, x);
+                if (!run("v_blk0_out")) { ggml_free(gctx); return false; }
+                ggml_free(gctx);
+                return true;
+            }
+        }
     }
     x = ggml_norm(gctx, x, vc.layernorm_eps);
     x = ggml_mul(gctx, x, v_final_w);
     x = ggml_add(gctx, x, v_final_b);
     ggml_set_name(x, "v_final");
+    if (stop_after && !strcmp(stop_after, "v_final")) {
+        ggml_build_forward_expand(gf, x);
+        if (!run("v_final")) { ggml_free(gctx); return false; }
+        ggml_free(gctx);
+        return true;
+    }
 
-    // merge: the reference reads the sequence as (nh, kh, nw, kw) and folds (kh,kw)
-    // into the feature dim; the processor emits (nh, nw, kh, kw) - reproduced verbatim
+    // merge: the reference reads the sequence as (t, nh, kh, nw, kw) and mean-pools
+    // the time axis of each clip, then folds (kh,kw) into the feature dim
+    // (patch_merger in modeling_videochat3.py); the processor emits (nh, nw, kh, kw)
     const int nh = gh / vc.merge, nw = gw / vc.merge;
     const int kh = vc.merge, kw = vc.merge;
     {
-        ggml_tensor * x4 = ggml_reshape_4d(gctx, x, (int64_t)vc.n_embd * kw, nw, kh, nh);
+        // temporal mean-pool each clip: sum its frames' [D, hw] slices, scale by 1/t
+        ggml_tensor * pooled = nullptr;
+        size_t off = 0;
+        for (int t : clip_t) {
+            ggml_tensor * acc = ggml_view_2d(gctx, x, vc.n_embd, hw, x->nb[1], off);
+            for (int ti = 1; ti < t; ti++)
+                acc = ggml_add(gctx, acc,
+                        ggml_view_2d(gctx, x, vc.n_embd, hw, x->nb[1], off + (size_t)ti * hw * x->nb[1]));
+            acc = ggml_scale(gctx, acc, 1.0f / t);
+            pooled = pooled ? ggml_concat(gctx, pooled, acc, 1) : acc;
+            off += (size_t)t * hw * x->nb[1];
+        }
+        x = pooled;
+        ggml_tensor * x4 = ggml_reshape_4d(gctx, x, (int64_t)vc.n_embd * kw, nw, kh, (int64_t)nh * clip_t.size());
         x4 = ggml_cont(gctx, ggml_permute(gctx, x4, 0, 2, 1, 3));
-        ggml_tensor * x3 = ggml_reshape_3d(gctx, x4, vc.n_embd, kw * kh, nh * nw);
+        ggml_tensor * x3 = ggml_reshape_3d(gctx, x4, vc.n_embd, kw * kh, (int64_t)nh * nw * clip_t.size());
         ggml_set_name(x3, "v_merge");
+        if (stop_after && !strcmp(stop_after, "v_merge")) {
+            ggml_build_forward_expand(gf, x3);
+            if (!run("v_merge")) { ggml_free(gctx); return false; }
+            ggml_free(gctx);
+            return true;
+        }
         ggml_tensor * pn = ggml_norm(gctx, x3, 1e-5f);
         pn = ggml_mul(gctx, pn, mm_pre_w);
         pn = ggml_add(gctx, pn, mm_pre_b);
-        ggml_tensor * x2 = ggml_reshape_2d(gctx, pn, vc.n_embd * kw * kh, nh * nw);
+        ggml_tensor * x2 = ggml_reshape_2d(gctx, pn, (int64_t)vc.n_embd * kw * kh, (int64_t)nh * nw * clip_t.size());
         ggml_tensor * h = ggml_mul_mat(gctx, mm_l1_w, x2);
         h = ggml_add(gctx, h, mm_l1_b);
         h = ggml_gelu_erf(gctx, h);                   // nn.GELU() == exact erf
@@ -600,47 +829,13 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_build_forward_expand(gf, h);
     }
 
-    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-        fprintf(stderr, "vision graph allocation failed\n");
-        ggml_free(gctx);
-        return false;
-    }
-    ggml_backend_tensor_set(t_patches, patches.data(), 0, sizeof(float) * patches.size());
-    ggml_backend_tensor_set(t_pos, pos.data(), 0, sizeof(float) * pos.size());
-    ggml_backend_tensor_set(t_cos, rcos.data(), 0, sizeof(float) * rcos.size());
-    ggml_backend_tensor_set(t_sin, rsin.data(), 0, sizeof(float) * rsin.size());
-    {
-        std::vector<ggml_fp16_t> zeros((size_t)N * N, ggml_fp32_to_fp16(0.0f));
-        ggml_backend_tensor_set(t_zmask, zeros.data(), 0, sizeof(ggml_fp16_t) * zeros.size());
-    }
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vision compute failed\n");
-        ggml_free(gctx);
-        return false;
-    }
-
-    dump(gf, "patches");
-    dump(gf, "vpos");
-    dump(gf, "vcos");
-    dump(gf, "vsin");
-    dump(gf, "v_patch_out");
-    dump(gf, "v_blk0_out");
-    dump(gf, "v_final");
-    dump(gf, "v_merge");
-    dump(gf, "v_proj_out");
-
-    ggml_tensor * out = ggml_graph_get_tensor(gf, "v_proj_out");
-    const int n = (int)out->ne[1];
-    feats.resize((size_t)n * n_embd);
-    ggml_backend_tensor_get(out, feats.data(), 0, sizeof(float) * feats.size());
-    *n_tokens = n;
-    fprintf(stderr, "vision: %d patches (%dx%d) -> %d tokens\n", N, gh, gw, n);
+    if (!run("v_proj_out")) { ggml_free(gctx); return false; }
     ggml_free(gctx);
     return true;
 }
 
 // ---------------------------------------------------------------- text
-bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img) {
+bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all) {
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
@@ -698,17 +893,17 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img) {
 
         ggml_tensor * k2 = ggml_reshape_2d(g.ctx, k3, NKV * HD, T);
         ggml_tensor * v2 = ggml_reshape_2d(g.ctx, v, NKV * HD, T);
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv_k[il], k2, g.pos_in));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv_v[il], v2, g.pos_in));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[il], k2, g.pos_in));
+        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[il], v2, g.pos_in));
 
         // q3 is [HD, NH, T]; flash attention wants [HD, n_q, n_head], so swap the
         // two trailing strides. The KV cache is [NKV*HD, n_ctx]: one position is
         // NKV*HD halves and one head inside it is HD halves.
         ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
-        ggml_tensor * kf = ggml_view_3d(g.ctx, kv_k[il], HD, S, NKV,
-                                        kv_k[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * vf = ggml_view_3d(g.ctx, kv_v[il], HD, S, NKV,
-                                        kv_v[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+        ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[il], HD, S, NKV,
+                                        kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+        ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[il], HD, S, NKV,
+                                        kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
         ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
                                                1.0f / sqrtf((float)HD), 0.0f, 0.0f);
         ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
@@ -737,8 +932,12 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img) {
     x = ggml_mul(g.ctx, x, out_norm);
     ggml_set_name(x, "t_final_norm");
 
-    ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);
-    g.logits = ggml_mul_mat(g.ctx, tok_embd, last);
+    if (logits_all) {
+        g.logits = ggml_mul_mat(g.ctx, tok_embd, x);   // [vocab, T] for batch decode
+    } else {
+        ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);
+        g.logits = ggml_mul_mat(g.ctx, tok_embd, last);
+    }
     ggml_set_name(g.logits, "logits");
     ggml_build_forward_expand(g.gf, g.logits);
     return true;
@@ -750,7 +949,61 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
     const int S = n_past + T;
     if (S > n_ctx) { fprintf(stderr, "context overflow (%d > %d)\n", S, n_ctx); return false; }
     const int n_img = (img_feats && img_pos) ? (int)(img_feats->size() / n_embd) : 0;
+    static const bool prof = getenv("VC3_PROF") != nullptr;
+    static double tb = 0, ta = 0, tc = 0; static int ns = 0;
+    auto tick = [](){ return std::chrono::steady_clock::now(); };
+    auto tp0 = tick();
+
+    // single-token decode: a static graph with a block-rounded KV window.
+    // The identical gf object across steps lets ggml capture a CUDA graph,
+    // cutting per-step kernel-launch overhead (the moondream Engine pattern).
+    ggml_tensor * logits_t = nullptr;
+    const bool use_static = (T == 1) && n_img == 0 && !ggml_backend_is_cpu(backend);
+    if (use_static) {
+        const int blk = std::min(vqa::block_for(S), n_ctx);
+        if (!dec_gf || dec_blk != blk) {
+            if (dec_ctx) ggml_free(dec_ctx);
+            struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, true };
+            dec_ctx = ggml_init(ip);
+            TextGraph dg;
+            // build directly into the persistent context
+            const int D = n_embd;
+            dg.ctx = dec_ctx;
+            if (!build_text_graph(dg, 1, blk, 0)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
+            dec_gf = dg.gf;
+            if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
+                fprintf(stderr, "static decode graph alloc failed\n");
+                ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
+                return false;
+            }
+            dec_blk = blk;
+            dec_tok = ggml_graph_get_tensor(dec_gf, "tok_in");
+            dec_pos = ggml_graph_get_tensor(dec_gf, "pos_in");
+            dec_mask = ggml_graph_get_tensor(dec_gf, "mask_in");
+        }
+        ggml_backend_tensor_set(dec_tok, toks.data(), 0, sizeof(int));
+        ggml_backend_tensor_set(dec_pos, &n_past, 0, sizeof(int));
+        vqa::set_causal_mask(dec_mask, n_past, 1);
+        auto tp2 = tick();
+        if (ggml_backend_graph_compute(backend, dec_gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "text compute failed\n");
+            return false;
+        }
+        if (prof) {
+            ns++;
+            tb += std::chrono::duration<double,std::milli>(tp2-tp0).count();
+            tc += std::chrono::duration<double,std::milli>(tick()-tp2).count();
+            if (ns % 50 == 0)
+                fprintf(stderr, "[prof] steps=%d build+input %.2fms compute %.2fms (avg, static)\n", ns, tb/ns, tc/ns);
+        }
+        logits_out.resize(n_vocab);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(dec_gf, "logits"), logits_out.data(), 0, sizeof(float) * n_vocab);
+        n_past = S;
+        return true;
+    }
+
     if (!build_text_graph(g, T, S, n_img)) return false;
+    auto tp1 = tick();
     if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
         fprintf(stderr, "text graph allocation failed\n");
         ggml_free(g.ctx);
@@ -768,19 +1021,24 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
         for (int i = 0; i < T; i++) posv[i] = n_past + i;
         ggml_backend_tensor_set(g.pos_in, posv.data(), 0, sizeof(int) * T);
     }
-    {
-        std::vector<ggml_fp16_t> mv((size_t)S * T, ggml_fp32_to_fp16(-INFINITY));
-        for (int t = 0; t < T; t++)
-            for (int s = 0; s < S; s++)
-                if (s <= n_past + t) mv[(size_t)t * S + s] = ggml_fp32_to_fp16(0.0f);
-        ggml_backend_tensor_set(g.mask_in, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
-    }
+    vqa::set_causal_mask(g.mask_in, n_past, T);
+    auto tp2 = tick();
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "text compute failed\n");
         ggml_free(g.ctx);
         g.ctx = nullptr;
         return false;
+    }
+    auto tp3 = tick();
+    if (prof) {
+        ns++;
+        tb += std::chrono::duration<double,std::milli>(tp1-tp0).count();
+        ta += std::chrono::duration<double,std::milli>(tp2-tp1).count();
+        tc += std::chrono::duration<double,std::milli>(tp3-tp2).count();
+        if (ns % 50 == 0)
+            fprintf(stderr, "[prof] steps=%d build %.2fms alloc+input %.2fms compute %.2fms (avg)\n",
+                    ns, tb/ns, ta/ns, tc/ns);
     }
     dump(g.gf, "emb");
     dump(g.gf, "t_l0_norm");
@@ -797,11 +1055,13 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
     return true;
 }
 
-std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user_text) const {
+std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user_text, bool video) const {
     std::string s = "<|im_start|>user\n";
     if (n_img_tokens > 0) {
+        // chat_template.jinja: image -> <|image_pad|>, video -> <|video_pad|>
+        const char * pad = video ? "<|video_pad|>" : "<|image_pad|>";
         s += "<|vision_start|>";
-        for (int i = 0; i < n_img_tokens; i++) s += "<|image_pad|>";
+        for (int i = 0; i < n_img_tokens; i++) s += pad;
         s += "<|vision_end|>";
     }
     s += user_text;
@@ -810,51 +1070,24 @@ std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user
 }
 
 int VideoChat3::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
-    if (gp.temperature <= 0.0f && gp.top_k <= 0) {
-        int best = 0;
-        float bv = -INFINITY;
-        for (int i = 0; i < (int)logits.size(); i++)
-            if (logits[i] > bv) { bv = logits[i]; best = i; }
-        return best;
-    }
-    std::vector<std::pair<float, int>> cand(logits.size());
-    for (int i = 0; i < (int)logits.size(); i++) cand[i] = {logits[i], i};
-    std::sort(cand.begin(), cand.end(),
-              [](const std::pair<float, int> & a, const std::pair<float, int> & b) { return a.first > b.first; });
-    int keep = (int)cand.size();
-    if (gp.top_k > 0) keep = std::min(keep, gp.top_k);
-    const float inv_t = 1.0f / std::max(gp.temperature, 1e-4f);
-    std::vector<float> p(keep);
-    const float maxl = cand[0].first;
-    float sum = 0.0f;
-    for (int i = 0; i < keep; i++) { p[i] = expf((cand[i].first - maxl) * inv_t); sum += p[i]; }
-    if (sum <= 0.0f) return cand[0].second;
-    for (int i = 0; i < keep; i++) p[i] /= sum;
-    if (gp.top_p < 1.0f) {
-        float acc = 0.0f;
-        int n = 0;
-        while (n < keep && acc < gp.top_p) { acc += p[n]; n++; }
-        keep = std::max(1, n);
-    }
-    const float r = randf();
-    float acc = 0.0f;
-    for (int i = 0; i < keep; i++) {
-        acc += p[i];
-        if (r <= acc) return cand[i].second;
-    }
-    return cand[keep - 1].second;
+    return vqa::sample_logits(logits, gp, rng_state);
 }
 
 bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
                      const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
     std::vector<float> feats;
     int n_img = 0;
+    const auto tv0 = std::chrono::steady_clock::now();
     if (!encode_vision(media, feats, &n_img)) return false;
+    fprintf(stderr, "[perf] vision encode: %.0f ms (%d tokens)\n",
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
-    const std::string text = render_prompt(n_img, prompt);
+    const bool video = media.kind == vqa::MediaKind::Video;
+    const std::string text = render_prompt(n_img, prompt, video);
     const std::vector<int> ids = tok_.encode(text);
+    const int pad_id = video ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;
-    for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == id_image_pad) img_pos.push_back(i);
+    for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == pad_id) img_pos.push_back(i);
     if ((int)img_pos.size() != n_img) {
         fprintf(stderr, "placeholder mismatch: %d image_pad tokens vs %d vision tokens\n",
                 (int)img_pos.size(), n_img);
@@ -863,6 +1096,7 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
     fprintf(stderr, "prompt: %d tokens (%d image), max_new %d\n", (int)ids.size(), n_img, gp.max_tokens);
 
     n_past = 0;
+    kv.clear();
     auto t0 = std::chrono::steady_clock::now();
     TextGraph g;
     std::vector<float> logits;
@@ -891,6 +1125,8 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
             n_dec, ms_decode, ms_decode > 0 ? n_dec * 1000.0 / ms_decode : 0.0);
     return true;
 }
+
+#include "vc3_batch.inc"
 
 }  // namespace vc3
 

@@ -1,4 +1,4 @@
-# moondream.cpp
+# SkyVision.cpp
 
 Local **image/video VQA** on top of [ggml](https://github.com/ggml-org/ggml) — a multi-model
 inference engine: every vision-language model is a backend implementing `vqa::Model`, and one
@@ -40,8 +40,8 @@ needed to run it.
 The only third-party dependency is ggml itself (it ships gguf too):
 
 ```bash
-git clone https://github.com/<you>/moondream.cpp
-cd moondream.cpp
+git clone https://github.com/<you>/SkyVision.cpp
+cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
 # Windows (MSVC + Ninja): builds vqa-cli and moondream-cli in one go
@@ -183,7 +183,7 @@ architecture is far from anything llama.cpp supports:
 - **official checkpoints ship FP8 (e4m3) expert weights** with per-channel scales
 - a SigLIP vision encoder with 588-column patch embeddings and multi-crop tiling
 
-Instead of wedging this into llama.cpp's model registry, moondream.cpp owns the whole stack:
+Instead of wedging this into llama.cpp's model registry, SkyVision.cpp owns the whole stack:
 weight conversion, graph construction, KV cache, and sampling — vendoring ggml for the kernels,
 exactly like [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and
 [audio.cpp](https://github.com/0xShug0/audio.cpp). VideoChat3-4B is the second backend in the
