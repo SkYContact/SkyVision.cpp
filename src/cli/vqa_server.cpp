@@ -277,6 +277,11 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             std::string q = query_param(req.query, "q");
             std::string mode = query_param(req.query, "mode");
             if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
+            // stream state shared by the token callback and the final flush
+            static thread_local std::string carry;
+            static thread_local bool sent_any;
+            carry.clear();
+            sent_any = false;
             if (stream) {
                 // NDJSON events: {"phase":"vision"} once the media is decoded,
                 // {"t":".."} per generated piece, then {"done":true} / {"error":".."}
@@ -285,8 +290,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 // complete characters are emitted and the tail is carried over.
                 send_stream_head(c, "application/x-ndjson");
                 send_chunk_str(c, "{\"phase\":\"vision\"}\n");
-                static thread_local std::string carry;
                 carry.clear();
+                sent_any = false;
                 gp.on_token = [](const char * piece, void * ud) {
                     std::string s = carry + piece;
                     carry.clear();
@@ -306,8 +311,10 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                         // continuation byte (0x80..0xBF): keep scanning back
                     }
                     if (emit < s.size()) { carry = s.substr(emit); s.resize(emit); }
-                    if (!s.empty())
+                    if (!s.empty()) {
+                        sent_any = true;
                         send_chunk_str(*(HttpSock *)ud, std::string("{\"t\":\"") + json_escape(s) + "\"}\n");
+                    }
                 };
                 gp.on_token_ud = &c;
             }
@@ -317,7 +324,15 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 else send_error(c, "inference failed");
                 return true;
             }
-            if (stream) { send_chunk_str(c, "{\"done\":true}\n"); send_stream_end(c); }
+            if (stream) {
+                // whole-result skills (detect/point/gaze) never emit token
+                // events — deliver the text as one final event so the page
+                // isn't left with an empty string ("未检测到目标")
+                if (!sent_any && !out.empty())
+                    send_chunk_str(c, std::string("{\"t\":\"") + json_escape(out) + "\"}\n");
+                send_chunk_str(c, "{\"done\":true}\n");
+                send_stream_end(c);
+            }
             else send_json(c, "{\"text\":\"" + json_escape(out) + "\"}");
             return true;
         }

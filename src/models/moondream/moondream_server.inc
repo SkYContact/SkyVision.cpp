@@ -25,6 +25,7 @@
 #endif
 
 #include <map>
+#include <string_view>
 #include <array>
 #include <sstream>
 
@@ -129,7 +130,7 @@ struct MdReqCache {
 };
 static MdReqCache md_cache;
 
-static uint64_t md_fnv(const std::string & s) {
+static uint64_t md_fnv(std::string_view s) {
     uint64_t h = 1469598103934665603ull;
     for (char c : s) { h ^= (unsigned char)c; h *= 1099511628211ull; }
     return h;
@@ -137,12 +138,22 @@ static uint64_t md_fnv(const std::string & s) {
 
 // make sure the engine holds THIS image's prefix at KV [0,730); n_past ends at 730
 static void md_ensure_img_prefill(Engine & e, VisionModel & vm, const uint8_t * rgb, int w, int h) {
-    if (md_cache.kv_valid) { e.n_past = 730; return; }       // rewind: reuse KV prefix
-    if (md_cache.prefix.empty()) {
-        md_prefill_image(e, vm, rgb, w, h, md_cache.prefix); // encode + prefill + fill cache
-    } else {
-        e.step({}, nullptr, md_cache.prefix.data(), 730, nullptr, true); // engine was reset, prefix hot
+    // the key must actually gate the reuse: the web UI sends a different image
+    // per request, and reusing the first image's prefix made every answer
+    // describe the old picture
+    uint64_t key = md_fnv(std::string_view((const char *)rgb, (size_t)w * h * 3));
+    key ^= (uint64_t)w << 32 ^ (uint64_t)h;
+    if (md_cache.img_key == key && md_cache.kv_valid) { e.n_past = 730; return; }   // rewind: reuse KV prefix
+    if (md_cache.img_key == key && !md_cache.prefix.empty()) {
+        e.step({}, nullptr, md_cache.prefix.data(), 730, nullptr, true);   // engine was reset, prefix hot
+        md_cache.kv_valid = true;
+        return;
     }
+    e.reset();   // different image: clear the old prefix before re-encoding
+    md_cache.prefix.clear();
+    md_prefill_image(e, vm, rgb, w, h, md_cache.prefix);   // encode + prefill + fill cache
+    md_cache.img_key = key;
+    md_cache.q_key = 0;   // question cache is only valid within one image
     md_cache.kv_valid = true;
 }
 
@@ -200,9 +211,9 @@ static std::vector<std::array<float,4>> md_detect(Engine & e, VisionModel & vm, 
         float sizes[2];
         RegionModel::bins_to_size(bins, sizes);
         rm.encode_size(sizes, 1, emb.data());
-        e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
+        // same single-step fix as md_point: logits and hidden come from one call
+        e.step({}, lv.data(), emb.data(), 1, hidden.data(), false);
         boxes.push_back({{ xc - sizes[0] / 2, yc - sizes[1] / 2, xc + sizes[0] / 2, yc + sizes[1] / 2 }});
-        e.step({}, lv.data(), emb.data(), 1, nullptr, false);
         next = (lv[0] >= lv[5]) ? 0 : 5;
     }
     return boxes;
@@ -244,9 +255,11 @@ static std::vector<std::array<float,2>> md_point(Engine & e, VisionModel & vm, R
         rm.decode_coordinate(hidden.data(), xl);
         float yc = RegionModel::logits_to_center(xl, 1024);
         rm.encode_coordinate(&yc, 1, emb.data());
-        e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
+        // ONE step yields both the next hidden and the eos/coord logits - the
+        // old code fed the y-embedding twice (once for hidden, once for logits),
+        // shifting every following position and producing marching garbage points
+        e.step({}, lv.data(), emb.data(), 1, hidden.data(), false);
         pts.push_back({{ xc, yc }});
-        e.step({}, lv.data(), emb.data(), 1, nullptr, false);
         next = (lv[0] >= lv[5]) ? 0 : 5;
     }
     return pts;

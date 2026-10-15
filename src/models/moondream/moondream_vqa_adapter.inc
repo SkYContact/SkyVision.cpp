@@ -103,6 +103,58 @@ struct MoondreamModel : vqa::Model {
         auto q = e.tok.encode(prompt);
         toks.insert(toks.end(), q.begin(), q.end());
         toks.push_back(3);
+
+        // official query() reasoning mode (ref_moondream.py _generate_reasoning):
+        // prompt = query prefix + question + thinking_id(4); generate until
+        // answer_id(3) — coordinate tokens (5) are region-model grounded, eos_id
+        // (0) and size_id (6) logits masked — then feed the query suffix (3) and
+        // produce the answer
+        if (mode == "ask-think" && rm_ok) {
+            const int D = e.model.n_embd;
+            std::vector<float> hidden(D), emb(D), lv(e.model.n_vocab);
+            std::vector<int> rtoks = toks;
+            rtoks.back() = 4;                      // thinking_id instead of suffix
+            int cur = e.step(rtoks, lv.data(), nullptr, 0, hidden.data(), false);
+            const int think_cap = 4 * gp.max_tokens + 256;
+            for (int i = 0; i < think_cap && cur != 3; i++) {
+                if (cur == 5) {                     // coord: region encode/decode
+                    float xl[1024];
+                    rm.decode_coordinate(hidden.data(), xl);
+                    float c = RegionModel::logits_to_center(xl, 1024);
+                    rm.encode_coordinate(&c, 1, emb.data());
+                    e.step({}, lv.data(), emb.data(), 1, hidden.data(), false);
+                } else {
+                    if (gp.on_token && cur != 6 && cur != 7 && cur != 9) {
+                        std::string piece = e.tok.decode({ cur });
+                        // grounding markers can still decode to their reserved
+                        // spelling — never surface those
+                        if (piece.find("<|md_reserved") == std::string::npos)
+                            gp.on_token(piece.c_str(), gp.on_token_ud);
+                    }
+                    e.step({ cur }, lv.data(), nullptr, 0, hidden.data(), false);
+                }
+                lv[0] = -INFINITY;                  // mask eos_id and size_id
+                lv[6] = -INFINITY;
+                cur = (int)(std::max_element(lv.begin(), lv.end()) - lv.begin());
+            }
+            if (gp.on_token) gp.on_token("\n\n———\n\n", gp.on_token_ud);
+            // answer: the query suffix token the reasoning stopped on, then decode
+            std::vector<int> out;
+            cur = e.step({ 3 }, nullptr);
+            if (cur != 0) {
+                out.push_back(cur);
+                if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
+            }
+            for (int i = 1; i < gp.max_tokens && cur != 0; i++) {
+                cur = e.step({ cur }, nullptr);
+                if (cur == 0) break;
+                out.push_back(cur);
+                if (gp.on_token) gp.on_token(e.tok.decode({ cur }).c_str(), gp.on_token_ud);
+            }
+            out_text = e.tok.decode(out);
+            return true;
+        }
+
         // md_ensure_img_prefill left n_past at 730 (or 0 without an image)
         std::vector<int> out;
         int cur = e.step(toks, nullptr);
