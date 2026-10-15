@@ -12,7 +12,7 @@
 | 后端 | 架构标签 | 输入 | 说明 |
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
-| **VideoChat3-4B** | `videochat3` | 图像 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
+| **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
 
 ## 当前状态
 
@@ -93,7 +93,7 @@ moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
 moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
 ```
 
-`vqa-cli` 常用开关：`--frames <dir> --fps 2`（视频帧目录）、`--temp/--top-k/--top-p`（采样，默认贪心）、
+`vqa-cli` 常用开关：`--video <file> --fps 2 --max-frames 32`（内置视频：ffmpeg 管道解码 + qwen_vl_utils 式采样 n = min(duration×fps, max_frames)，超限自动全片均匀重采样）、`--frames <dir>`（预抽帧目录）、`--temp/--top-k/--top-p`（采样，默认贪心）、
 `--max-tokens`、`--n-ctx`、`--threads`、`--cpu`、`--dump-ids`（只跑分词并打印 token id）、
 `--help` 看全部。
 

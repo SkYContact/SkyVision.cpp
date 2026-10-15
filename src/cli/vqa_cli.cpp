@@ -35,7 +35,7 @@ namespace {
 void usage() {
     fprintf(stderr,
         "usage: vqa-cli --model <gguf> [--tokenizer <path|dir>]\n"
-        "               [--image <file>] [--frames <dir> --fps <f>]\n"
+        "               [--image <file>] [--video <file> | --frames <dir>] [--fps <f>] [--max-frames <n>]\n"
         "               --ask <question> [--mode <skill>] [options]\n"
         "\n"
         "options:\n"
@@ -105,10 +105,11 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-    std::string model_path, tokenizer_arg, image_path, frames_dir, ask_text, mode, arch_override, batch_path,
+    std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, ask_text, mode, arch_override, batch_path,
                 dump_dir, vision_path, region_path;
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f;
+    int max_frames = 32;
     bool use_gpu = true, quiet = false, dump_ids = false;   // CUDA preferred, CPU fallback
 
     for (int i = 1; i < argc; i++) {
@@ -123,6 +124,8 @@ int main(int argc, char ** argv) {
         else if (a == "--image" || a == "-i") image_path = next("--image");
         else if (a == "--frames") frames_dir = next("--frames");
         else if (a == "--fps") fps = (float)atof(next("--fps"));
+        else if (a == "--video") video_path = next("--video");
+        else if (a == "--max-frames") max_frames = atoi(next("--max-frames"));
         else if (a == "--batch") batch_path = next("--batch");
         else if (a == "--ask" || a == "-p") ask_text = next("--ask");
         else if (a == "--mode") mode = next("--mode");
@@ -196,6 +199,8 @@ int main(int argc, char ** argv) {
     vqa::MediaInput media;
     if (!image_path.empty()) {
         if (!vqa::load_image(image_path, media)) return 4;
+    } else if (!video_path.empty()) {
+        if (!vqa::load_video_file(video_path, fps, max_frames, media)) return 4;
     } else if (!frames_dir.empty()) {
         if (!vqa::load_frame_dir(frames_dir, fps, media)) return 4;
     }

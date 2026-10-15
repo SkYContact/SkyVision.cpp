@@ -36,10 +36,11 @@ set(VQA_CORE_SRC
     src/core/vqa_util.cpp
     src/core/vqa_registry.cpp
     src/core/media_io.cpp
+    src/core/video_pipe.cpp
     src/core/tokenizer.cpp)
 
 set(MOONDREAM_SRC
-    src/models/moondream/SkyVision.cpp
+    src/models/moondream/moondream.cpp
     src/models/moondream/moondream_vision.cpp
     src/models/moondream/moondream_preprocess.cpp
     src/models/moondream/moondream_region.cpp)
