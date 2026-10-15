@@ -135,7 +135,7 @@ def write_metadata(gw, text, vis, outtype):
     gw.add_uint32("videochat3.vision.pos_emb_width", vis["pos_w"])
     gw.add_float32("videochat3.vision.layer_norm_epsilon", vis["eps"])
     gw.add_float32("videochat3.vision.rope_theta", 10000.0)
-    gw.add_uint32("videochat3.vision.rope_layout", 1)   # 1 = VISION-rope row perm
+    gw.add_uint32("videochat3.vision.rope_layout", 2)   # 2 = VISION-rope perm + zero-pad 72->80
     for key, value in SPECIAL.items():
         gw.add_uint32(f"videochat3.{key}", value)
 
@@ -247,27 +247,56 @@ def main():
     vision_suffixes = ("norm0.weight", "norm0.bias", "norm1.weight", "norm1.bias",
                        "wqkv.weight", "wqkv.bias", "wo.weight", "wo.bias",
                        "mlp.fc0.weight", "mlp.fc0.bias", "mlp.fc1.weight", "mlp.fc1.bias")
-    # Vision wqkv gets its q/k OUTPUT ROWS permuted per head so the engine can use
-    # ggml's fused GGML_ROPE_TYPE_VISION kernel: our interleaved pair order
-    # (x0,y0,x1,y1,...) becomes section blocks (x-pairs | y-pairs), each split into
-    # NEOX halves (re|im). See the rope handling in vc3_model.cpp.
-    half_pairs = vis["head_dim"] // 4          # pairs per section (72 -> 18)
-    perm = ([4 * i     for i in range(half_pairs)] +   # x re  -> pairs 0..17
-            [4 * i + 2 for i in range(half_pairs)] +   # y re  -> pairs 18..35
-            [4 * i + 1 for i in range(half_pairs)] +   # x im
-            [4 * i + 3 for i in range(half_pairs)])    # y im
-    assert len(perm) == vis["head_dim"]
+    # Vision wqkv rows are re-laid out per head so the engine needs ZERO runtime
+    # copies before attention (see vc3_model.cpp):
+    #  - interleaved pair order (x0,y0,x1,y1,...) -> section blocks (x-pairs |
+    #    y-pairs) with NEOX re|im halves, matching ggml_rope_multi(VISION)
+    #  - head_dim zero-padded 72 -> 80 so q/k/v feed the FA-80 mma kernel directly
+    #    (pad rows are zeros: exact). rope n_dims becomes 40; the engine passes
+    #    freq_base' = theta**(20/18) so every real pair keeps its exact frequency.
+    hd, nh = vis["head_dim"], vis["n_head"]
+    half_pairs = hd // 4                              # pairs per section (72 -> 18)
+    npad = 80 - hd
+    perm = ([4 * i     for i in range(half_pairs)] +  # x re  -> pairs 0..17
+            [4 * i + 2 for i in range(half_pairs)] +  # y re  -> pairs 18..35
+            [-1] * (npad // 2) +                      # zero pad after the re half
+            [4 * i + 1 for i in range(half_pairs)] +  # x im
+            [4 * i + 3 for i in range(half_pairs)] +  # y im
+            [-1] * (npad // 2))                       # zero pad after the im half
+    assert len(perm) == 80
 
     for i in range(vis["n_layer"]):
         p, b = f"{vt}.encoder.blocks.{i}", f"v.blk.{i}"
         for suffix in vision_suffixes:
             if suffix == "wqkv.weight":
-                w = np.ascontiguousarray(weights.get(f"{p}.{suffix}")).copy()
-                hd = vis["head_dim"]
-                for h in range(vis["n_head"] * 2):     # q rows then k rows (v untouched)
-                    base = h * hd
-                    w[base:base + hd] = w[[base + j for j in perm]]
+                w0 = weights.get(f"{p}.{suffix}")       # [3*nh*hd, D]
+                D = w0.shape[1]
+                w = np.zeros((3 * nh * 80, D), dtype=w0.dtype)
+                for h in range(nh * 3):                 # q, k, v blocks in order
+                    src = w0[h * hd:(h + 1) * hd]
+                    dst = np.zeros((80, D), dtype=w0.dtype)
+                    if h < nh * 2:                      # q/k: permuted halves layout
+                        for j, o in enumerate(perm):
+                            if o >= 0:
+                                dst[j] = src[o]
+                    else:                               # v: plain pad at the end
+                        dst[:hd] = src
+                    w[h * 80:(h + 1) * 80] = dst
                 _lib.add_f16(gw, f"{b}.{suffix}", w)
+                stats["f16"] += 1
+            elif suffix == "wqkv.bias":
+                b0 = weights.get(f"{p}.{suffix}")        # [3*nh*hd]
+                # q/k bias rows follow the same permute+pad as the weight rows
+                bb = np.zeros(3 * nh * 80, dtype=b0.dtype)
+                for h in range(nh * 3):
+                    src = b0[h * hd:(h + 1) * hd]
+                    if h < nh * 2:
+                        for j, o in enumerate(perm):
+                            if o >= 0:
+                                bb[h * 80 + j] = src[o]
+                    else:
+                        bb[h * 80:h * 80 + hd] = src
+                _lib.add_f16(gw, f"{b}.{suffix}", bb)
                 stats["f16"] += 1
             else:
                 add_tensor(f"{b}.{suffix}", f"{p}.{suffix}")

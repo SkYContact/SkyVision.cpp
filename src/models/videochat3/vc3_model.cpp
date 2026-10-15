@@ -298,8 +298,8 @@ bool VideoChat3::load_weights(const char * path) {
     vc.pos_w   = gguf_u32(gu, "videochat3.vision.pos_emb_width", vc.pos_w);
     vc.layernorm_eps = gguf_f32(gu, "videochat3.vision.layer_norm_epsilon", vc.layernorm_eps);
     vc.rope_theta = gguf_f32(gu, "videochat3.vision.rope_theta", vc.rope_theta);
-    if (gguf_u32(gu, "videochat3.vision.rope_layout", 0) != 1) {
-        fprintf(stderr, "this build expects a rope_layout=1 GGUF (wqkv rows permuted for the fused vision rope); re-run convert/convert_videochat3.py\n");
+    if (gguf_u32(gu, "videochat3.vision.rope_layout", 0) != 2) {
+        fprintf(stderr, "this build expects a rope_layout=2 GGUF (wqkv rows permuted + zero-padded for the fused vision rope); re-run convert/convert_videochat3.py\n");
         return false;
     }
 
@@ -548,11 +548,6 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     ggml_set_name(t_vpos, "vxy");
     ggml_tensor * t_zmask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, N, N);
     ggml_set_name(t_zmask, "vzmask");
-    ggml_tensor * t_pad80 = nullptr;
-    if (pad80) {
-        t_pad80 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 80 - vhd, N, vc.n_head);
-        ggml_set_name(t_pad80, "vpad80");
-    }
 
     ggml_tensor * x = ggml_mul_mat(gctx, v_patch_w, t_patches);
     x = ggml_add(gctx, x, v_patch_b);
@@ -576,10 +571,6 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         if (t_pos->buffer)     ggml_backend_tensor_set(t_pos, pos.data(), 0, sizeof(float) * pos.size());
         if (t_vpos->buffer) ggml_backend_tensor_set(t_vpos, vpos.data(), 0, sizeof(int) * vpos.size());
         fprintf(stderr, "[run] inputs set\n");
-        if (t_pad80 && t_pad80->buffer) {
-            std::vector<float> zeros(ggml_nelements(t_pad80), 0.0f);
-            ggml_backend_tensor_set(t_pad80, zeros.data(), 0, sizeof(float) * zeros.size());
-        }
         if (t_zmask->buffer) {
             // block-diagonal attention: tokens attend within their clip only
             // (cu_seqlens mask in modeling_videochat3.py). Single clip = all zeros.
@@ -653,15 +644,18 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_tensor * qkv = ggml_mul_mat(gctx, L.wqkv_w, l);
         qkv = ggml_add(gctx, qkv, L.wqkv_b);
 
-        const size_t off = (size_t)vc.n_embd * qkv->nb[0];
-        // the three projections are packed along ne0 of qkv, so each slice is a
-        // strided view: make it contiguous before reshaping into heads
-        ggml_tensor * q = ggml_reshape_3d(gctx,
-                ggml_cont(gctx, ggml_view_2d(gctx, qkv, vc.n_embd, N, qkv->nb[1], 0)), vhd, vc.n_head, N);
-        ggml_tensor * k = ggml_reshape_3d(gctx,
-                ggml_cont(gctx, ggml_view_2d(gctx, qkv, vc.n_embd, N, qkv->nb[1], off)), vhd, vc.n_head, N);
-        ggml_tensor * v = ggml_reshape_3d(gctx,
-                ggml_cont(gctx, ggml_view_2d(gctx, qkv, vc.n_embd, N, qkv->nb[1], 2 * off)), vhd, vc.n_head, N);
+        // qkv packs the three padded projections along ne0; the converter pads and
+        // permutes the rows so each [80]-wide head slice works as-is - feed strided
+        // views straight into rope/FA, no cont(), no runtime padding copies
+        const int vhd_f = pad80 ? 80 : vhd;
+        const size_t off = (size_t)vc.n_head * vhd_f * qkv->nb[0];
+        auto qkv_head_view = [&](int block) {
+            return ggml_view_3d(gctx, qkv, vhd_f, vc.n_head, N,
+                                (size_t)vhd_f * qkv->nb[0], qkv->nb[1], (size_t)block * off);
+        };
+        ggml_tensor * q = qkv_head_view(0);
+        ggml_tensor * k = qkv_head_view(1);
+        ggml_tensor * v = qkv_head_view(2);
         if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
         if (il == 0 && stop_after && !strcmp(stop_after, "v_blk0_qkv")) {
             ggml_build_forward_expand(gf, qkv);
@@ -669,18 +663,15 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             ggml_free(gctx);
             return true;
         }
-        if (il == 0 && stop_after && !strcmp(stop_after, "v_blk0_q")) {
-            ggml_build_forward_expand(gf, q);
-            if (!run("v_blk0_q")) { ggml_free(gctx); return false; }
-            ggml_free(gctx);
-            return true;
-        }
 
+        // rope: the converter's 72->80 pad makes n_dims 40; rescale freq_base so
+        // each real pair keeps its exact frequency (theta**(-p/18) == (theta**(20/18))**(-2p/40))
         int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
-        q = ggml_rope_multi(gctx, q, t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
-                            n_ctx, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k = ggml_rope_multi(gctx, k, t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
-                            n_ctx, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        const float rope_base = pad80 ? powf(vc.rope_theta, (float)vhd_f / vhd) : vc.rope_theta;
+        q = ggml_rope_multi(gctx, q, t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
+                            n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_multi(gctx, k, t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
+                            n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         if (il == 0) {
             ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
             if (stop_after && !strcmp(stop_after, "v_blk0_q_rope")) {
@@ -694,22 +685,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         // attention runs clip-locally with NO mask: a masked flash-attn falls off
         // the fast path, and clip tokens are contiguous, so per-clip unmasked FA
         // (same trick as SkyVision.cpp's multi-crop SigLIP) is both exact and fast.
-        // hd=72 is not a compiled FA kernel size: zero-pad q/k/v to 80 (exact:
-        // padded dims contribute 0 to QK^T and 0 to the output, sliced away after).
-        const int vhd_f = pad80 ? 80 : vhd;
-        auto fa_in = [&](ggml_tensor * t, int n_tok, size_t off) {
-            ggml_tensor * tv = ggml_view_3d(gctx, t, vhd, n_tok, vc.n_head, t->nb[2], t->nb[1], off * t->nb[2]);
-            if (!pad80) return ggml_cont(gctx, tv);   // FA kernels want aligned strides
-            if (true) {
-                // concat dim0 wants same-shape (besides dim0) tensors; use a
-                // matching-width slice of the pad input and materialize the view
-                ggml_tensor * pad = t_pad80;
-                if (n_tok != N)
-                    pad = ggml_view_3d(gctx, t_pad80, 80 - vhd, n_tok, vc.n_head,
-                                       t_pad80->nb[1], t_pad80->nb[2], 0);
-                tv = ggml_concat(gctx, ggml_cont(gctx, tv), pad, 0);
-            }
-            return tv;
+        auto fa_in = [&](ggml_tensor * t, int n_tok, size_t tok_off) {
+            return ggml_view_3d(gctx, t, vhd_f, n_tok, vc.n_head, t->nb[2], t->nb[1], tok_off * t->nb[2]);
         };
         ggml_tensor * fa = nullptr;
         if (clip_t.size() == 1) {
@@ -733,7 +710,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         // fa is [vhd_f, n_head, N]; drop the padding cols and lay out rows as tokens
         ggml_tensor * attn_src = fa;
         if (pad80)
-            attn_src = ggml_view_3d(gctx, ggml_cont(gctx, fa), vhd, vc.n_head, N,
+            attn_src = ggml_view_3d(gctx, fa, vhd, vc.n_head, N,
                                     (size_t)vhd_f * sizeof(float), (size_t)vhd_f * vc.n_head * sizeof(float), 0);
         ggml_tensor * attn =
                 ggml_reshape_2d(gctx, ggml_cont(gctx, attn_src), vc.n_embd, N);
