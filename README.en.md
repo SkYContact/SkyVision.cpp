@@ -71,7 +71,7 @@ pip install -r convert/requirements.txt
 hf download moondream/moondream3.1-9B-A2B --local-dir models/moondream3.1-9B-A2B
 
 # VideoChat3-4B
-hf download qqceqqq/VideoChat3-4B --local-dir models/VideoChat3-4B
+hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
 ```
 
 The converters find the checkpoint themselves: `--src <dir|file>` → the model's

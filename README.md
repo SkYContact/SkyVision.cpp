@@ -69,7 +69,7 @@ pip install -r convert/requirements.txt
 hf download moondream/moondream3.1-9B-A2B --local-dir models/moondream3.1-9B-A2B
 
 # VideoChat3-4B
-hf download qqceqqq/VideoChat3-4B --local-dir models/VideoChat3-4B
+hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
