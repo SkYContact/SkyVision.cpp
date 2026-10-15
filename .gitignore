@@ -21,8 +21,8 @@ run*.log
 *_log.txt
 parity/
 
-# local model downloads / dev scratch
-models/
+# local model downloads / dev scratch (anchored: src/models/ is source code!)
+/models/
 test_shapes.png
 
 # editors / OS
