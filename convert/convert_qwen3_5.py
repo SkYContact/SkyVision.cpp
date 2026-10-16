@@ -216,7 +216,15 @@ def main():
     log(f"{len(weights)} tensors in the checkpoint")
 
     std = src.replace(chr(92), "/").rstrip("/").split("/")[-1]
-    gw = gguf.GGUFWriter(out, "qwen3_5")
+    # arch label follows the fine-tune (detected later again for marlin.skills);
+    # legacy files were written with a fixed "qwen3_5" and read back swapped
+    try:
+        with open(os.path.join(src, "config.json"), encoding="utf-8") as f:
+            _archs = json.load(f).get("architectures", [])
+    except Exception:
+        _archs = []
+    _is_marlin = any("Marlin" in str(x) for x in _archs)
+    gw = gguf.GGUFWriter(out, "marlin" if _is_marlin else "qwen3_5")
     gw.add_name(std)
     write_metadata(gw, text, vis, args.outtype)
 

@@ -366,6 +366,15 @@ bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ft
     if (!g) return false;
     int k = gguf_find_key(g, "general.architecture");
     if (k >= 0) arch = gguf_get_val_str(g, k);
+    // legacy qwen3.5/marlin ggufs carry swapped arch labels; marlin.skills
+    // (written by the converter from the checkpoint's architectures) is
+    // authoritative for which fine-tune it is
+    int ks = gguf_find_key(g, "marlin.skills");
+    if (arch == "qwen3_5" || arch == "marlin") {
+        // skills=true -> Marlin fine-tune; false or key missing (older
+        // converter that labelled plain qwen3.5 files "marlin") -> qwen3_5
+        arch = (ks >= 0 && gguf_get_val_bool(g, ks)) ? "marlin" : "qwen3_5";
+    }
     int kf = gguf_find_key(g, "general.file_type");
     if (kf >= 0) {
         char b[32];
