@@ -129,7 +129,7 @@ $('go').onclick = async () => {
     $('status').textContent = '视觉编码…';
     const kind = isVideo ? '&kind=video&fps=1&max-frames=8' : '';
     const rt = useSess ? '&session=' + sess + '&rt=1' : '';
-    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask&q=' + encodeURIComponent(q) + kind + '&n=300&stream=1' + rt, {
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + encodeURIComponent(q) + kind + '&n=300&stream=1' + rt, {
       method: 'POST', body: blob || new Uint8Array(0)
     });
     const reader = r.body.getReader();
