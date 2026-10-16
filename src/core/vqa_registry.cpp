@@ -60,6 +60,7 @@ namespace vqa {
 Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
     if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
+    if (arch == "moss_vl") return create_moss_vl();
     if (arch == "moondream3") return create_moondream();
     return nullptr;
 }

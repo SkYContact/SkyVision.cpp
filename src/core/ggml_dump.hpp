@@ -13,8 +13,13 @@
 //   2. AFTER compute: dump::write(gf, dir, name) fetches the tensor and writes
 //      dir/cpp_<name>.bin (+ .shape with the ggml ne[] layout).
 //
+// Marked tensors are registered by POINTER (dump_registry): graph name lookup
+// can be ambiguous when a name collides across differently-shaped graphs, so
+// dump()/write() read through the registry first.
+//
 // Cost when unused: mark_sinks is guarded by the caller's dump-enabled flag;
-// the extra nodes only exist while a dump is being taken.
+// the extra nodes only exist while a dump is being taken. Call
+// dump_registry_clear() before rebuilding a graph to drop stale entries.
 #pragma once
 
 #include "ggml.h"
@@ -22,10 +27,18 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vqa {
 namespace dump {
+
+inline std::vector<std::pair<std::string, ggml_tensor *>> & dump_registry() {
+    static std::vector<std::pair<std::string, ggml_tensor *>> reg;
+    return reg;
+}
+
+inline void dump_registry_clear() { dump_registry().clear(); }
 
 inline void mark_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * const * names) {
     if (!ctx || !gf || !names) return;
@@ -36,18 +49,24 @@ inline void mark_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * const 
                 ggml_tensor * keep = ggml_scale(ctx, t, 1.0f);
                 ggml_set_name(keep, "dump_sink");
                 ggml_build_forward_expand(gf, keep);
+                dump_registry().push_back({*n, t});
                 break;
             }
         }
     }
 }
 
-inline void write(ggml_cgraph * gf, const char * dir, const char * name) {
-    ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+// registry-first tensor lookup (falls back to graph name lookup)
+inline ggml_tensor * lookup(ggml_cgraph * gf, const char * name) {
+    for (auto it = dump_registry().rbegin(); it != dump_registry().rend(); ++it)
+        if (it->first == name) return it->second;
+    return ggml_graph_get_tensor(gf, name);
+}
+
+inline void write_tensor(ggml_tensor * t, const char * dir, const char * name) {
     if (!t || !t->data) return;
     std::string path = std::string(dir) + "/cpp_" + name + ".bin";
     std::vector<float> tmp;
-    std::vector<uint8_t> raw;
     const uint8_t * src;
     if (t->type == GGML_TYPE_F32) {
         tmp.resize((size_t)ggml_nelements(t));
@@ -57,13 +76,13 @@ inline void write(ggml_cgraph * gf, const char * dir, const char * name) {
         std::vector<ggml_fp16_t> h((size_t)ggml_nelements(t));
         ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
         tmp.resize(h.size());
+        src = (const uint8_t *)h.data();
         for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
-        src = (const uint8_t *)tmp.data();
     } else {
-        const ggml_type_traits * tt = ggml_get_type_traits(t->type);
+        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
         tmp.resize((size_t)ggml_nelements(t));
-        tt->to_float(t->data, tmp.data(), ggml_nelements(t));
         src = (const uint8_t *)tmp.data();
+        tt->to_float(t->data, tmp.data(), ggml_nelements(t));
     }
     FILE * f = fopen(path.c_str(), "wb");
     if (f) { fwrite(src, sizeof(float), tmp.size(), f); fclose(f); }
@@ -73,6 +92,10 @@ inline void write(ggml_cgraph * gf, const char * dir, const char * name) {
                 (long long)t->ne[2], (long long)t->ne[3]);
         fclose(m);
     }
+}
+
+inline void write(ggml_cgraph * gf, const char * dir, const char * name) {
+    write_tensor(lookup(gf, name), dir, name);
 }
 
 }  // namespace dump

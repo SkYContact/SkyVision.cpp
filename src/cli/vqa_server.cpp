@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -109,7 +110,7 @@ std::string resolve_tokenizer(const std::string & arch) {
         FindClose(hd);
     }
 #endif
-    const bool need_qwen = arch == "videochat3" || arch == "qwen3_5" || arch == "marlin";
+    const bool need_qwen = arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl";
     for (auto & c : cands) {
         FILE * f = fopen(c.c_str(), "rb");
         if (!f) continue;
@@ -159,7 +160,7 @@ void discover_models() {
                         vision_path.empty() ? "*-vision.gguf" : "tokenizer.json");
                 continue;
             }
-        } else if (arch == "videochat3" || arch == "qwen3_5" || arch == "marlin") {
+        } else if (arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl") {
             if (!file_exists(tok)) {
                 fprintf(stderr, "serve: skip %s (needs tokenizer.json)\n", f.c_str());
                 continue;
@@ -303,6 +304,27 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             std::string q = query_param(req.query, "q");
             std::string mode = query_param(req.query, "mode");
             if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
+            // --- multi-turn sessions (?session=<id>, ?reset=1 clears) ---
+            static std::map<std::string, std::vector<std::pair<std::string, std::string>>> sessions;
+            const std::string sess = query_param(req.query, "session");
+            if (!sess.empty() && query_param(req.query, "reset") == "1") sessions.erase(sess);
+            if (sess.empty() && query_param(req.query, "reset") == "1" && q.empty()) {
+                send_json(c, "{\"ok\":true}"); return true;
+            }
+            // rebuild the conversation prefix from the stored turns (text-only:
+            // media from earlier turns is not re-sent; ask about it again)
+            if (!sess.empty()) {
+                auto & turns = sessions[sess];
+                while (turns.size() > 12) turns.erase(turns.begin());   // keep the last 12 turns
+                std::string hist;
+                for (const auto & t : turns) {
+                    std::string a = t.second;
+                    if (a.size() > 1500) a.resize(1500);
+                    hist += "<|im_start|>user\n" + t.first + "<|im_end|>\n<|im_start|>assistant\n"
+                         + a + "<|im_end|>\n";
+                }
+                gp.history = hist;
+            }
             // stream state shared by the token callback and the final flush
             static thread_local std::string carry;
             static thread_local bool sent_any;
@@ -368,6 +390,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 send_stream_end(c);
             }
             else send_json(c, "{\"text\":\"" + json_escape(out) + "\"}");
+            if (!sess.empty() && !q.empty())
+                sessions[sess].push_back({q, out});   // remember the turn
             return true;
         }
         send_error(c, "bad action");

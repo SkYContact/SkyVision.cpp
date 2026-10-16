@@ -43,6 +43,10 @@ struct GenParams {
     // optional coarse progress (e.g. per vision clip: "vision", done, total)
     void (*on_stage)(const char * stage, int done, int total, void * ud) = nullptr;
     void * on_stage_ud = nullptr;
+    // multi-turn conversation prefix: fully formatted prior turns (with chat
+    // markers), prepended verbatim before the new user turn. Backends without
+    // multi-turn support ignore it.
+    std::string history;
 };
 
 // Load-time configuration shared by every backend.
@@ -98,6 +102,7 @@ public:
 Model * create_moondream();
 Model * create_videochat3();
 Model * create_qwen3_5();
+Model * create_moss_vl();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);
