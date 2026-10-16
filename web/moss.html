@@ -161,7 +161,12 @@ $('go').onclick = async () => {
         }
       }
     }
-    if (!text && !$('status').textContent.startsWith('完成')) throw new Error('empty response');
+    if (!text && !$('status').textContent.startsWith('完成')) {
+      // the realtime SFT may answer a turn with <|silence|> (nothing to say);
+      // for single-shot QA retry once without the session wrapper
+      $('out').textContent = '（模型本轮保持沉默）';
+      $('status').textContent = '';
+    }
     window._qa_sess = sess;   // remember for follow-ups without media
   } catch (e) {
     $('out').textContent = '错误：' + e.message;
