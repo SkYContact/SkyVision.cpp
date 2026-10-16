@@ -1039,9 +1039,6 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
         dump(gf, "xkv_k0");
         fprintf(stderr, "cross kv: %d rows projected with the vision graph\n", plan->n_vtot);
     }
-    ggml_tensor * got = ggml_graph_get_tensor(gf, "v_merged");
-    merged.resize((size_t)got->ne[0] * got->ne[1]);
-    ggml_backend_tensor_get(got, merged.data(), 0, sizeof(float) * merged.size());
     if (plan && plan->n_vtot > 0 && !dump_dir.empty()) {   // parity input for the numpy recompute
         const int V = plan->n_vtot;
         std::vector<float> sep(vc.out_hidden);
@@ -1141,24 +1138,23 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
     if (!gctx) return false;
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8192, false);
 
-    // host-side cs: separator columns interleaved per frame ([frame | sep]*F),
-    // built on the host so the graph sees a single contiguous input tensor with
-    // no view/concat chain (in-graph concat was the prime suspect for dirty cs).
-    ggml_tensor * t_cs = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vc.out_hidden, V);
-    std::vector<float> cs_host;
+    // device-side cs, structurally IDENTICAL to the in-vision-graph projection:
+    // a leaf F32 input feeding the fused GEMM computes wrong values on CUDA,
+    // while the concat-chain form is verified correct, so cache hits reuse
+    // exactly that structure (leaf = the merged features, concat per frame)
+    ggml_tensor * t_m = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vc.out_hidden, M);
+    ggml_tensor * cs = nullptr;
     {
-        std::vector<float> sep(vc.out_hidden);
-        ggml_backend_tensor_get(sep_w, sep.data(), 0, sizeof(float) * sep.size());
-        cs_host.reserve((size_t)V * vc.out_hidden);
+        ggml_tensor * sep_col = ggml_reshape_2d(gctx, sep_w, vc.out_hidden, 1);
         size_t off = 0;
         for (const FrameMeta & fm : plan.frames) {
-            cs_host.insert(cs_host.end(), merged.begin() + off * vc.out_hidden,
-                           merged.begin() + (off + fm.tpf) * vc.out_hidden);
-            cs_host.insert(cs_host.end(), sep.begin(), sep.end());
+            ggml_tensor * col = ggml_view_2d(gctx, t_m, vc.out_hidden, fm.tpf, t_m->nb[1],
+                                             off * t_m->nb[1]);
+            cs = cs ? ggml_concat(gctx, cs, col, 1) : col;
+            cs = ggml_concat(gctx, cs, sep_col, 1);
             off += fm.tpf;
         }
     }
-    ggml_tensor * cs = t_cs;
     ggml_tensor * t_mpos = nullptr;
     std::vector<int> mpos;
     if (!append_cross_kv(gctx, gf, cs, V, plan, &t_mpos, mpos)) {
@@ -1174,7 +1170,7 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
         ggml_free(gctx);
         return false;
     }
-    ggml_backend_tensor_set(t_cs, cs_host.data(), 0, sizeof(float) * cs_host.size());
+    ggml_backend_tensor_set(t_m, merged.data(), 0, sizeof(float) * merged.size());
     ggml_backend_tensor_set(t_mpos, mpos.data(), 0, sizeof(int) * mpos.size());
     ggml_backend_tensor_set(t_rows, rows.data(), 0, sizeof(int) * V);
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
@@ -1187,8 +1183,6 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
         fprintf(stderr, "[timing] cross-kv compute %.0f ms\n", ggml_time_ms() - t_ck);
     dump(gf, "xkv_k0");
     if (!dump_dir.empty()) {   // parity inputs for the xkv numpy recompute
-        dump_host("xkv_cs", cs_host.data(), sizeof(float) * cs_host.size(),
-                  {vc.out_hidden, V});
         std::vector<int> vmpos((size_t)V * 4, 0);
         for (const FrameMeta & fm : plan.frames) {
             const int t0 = (int)fm.t0, mh = std::max(fm.eh, fm.ew);
@@ -1588,7 +1582,13 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
         }
         key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
         bool projected = false;
-        if (vcache.key == key && !vcache.merged.empty()) {
+        // CUDA: the standalone re-projection graph computes systematically
+        // different values than the in-vision-graph one (ggml-cuda numerics,
+        // same inputs + weights); the tower only costs ~0.2-0.8s on GPU, so
+        // always take the verified in-graph path there. CPU keeps the cache
+        // (its standalone projection is correct).
+        const bool cache_ok = ggml_backend_is_cpu(backend);
+        if (vcache.key == key && !vcache.merged.empty() && cache_ok) {
             fprintf(stderr, "vision: cache hit (%d merged tokens)\n",
                     (int)(vcache.merged.size() / vc.out_hidden));
         } else {
@@ -1716,7 +1716,7 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
             for (size_t k = 0; k < fr.rgb.size(); k++) { key ^= fr.rgb[k]; key *= 1099511628211ull; }
         }
         key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
-        if (scache.key == key && !scache.merged.empty()) {
+        if (scache.key == key && !scache.merged.empty() && ggml_backend_is_cpu(backend)) {
             fprintf(stderr, "session vision: cache hit\n");
         } else {
             const int N = (int)(patches.size() / (3 * vc.patch * vc.patch));
