@@ -41,7 +41,10 @@ import _lib
 import hf_source
 from _lib import log, warn, fail, progress
 
+# accepts both Marlin-2B and the official Qwen3.5 checkpoints (identical
+# structure - Marlin is a plain SFT of Qwen3.5, tensor names unchanged)
 MODEL_ID = "NemoStation/Marlin-2B"
+ALT_MODEL_IDS = ("Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-7B", "Qwen/Qwen3.5-2B-Instruct", "Qwen/Qwen3.5-7B-Instruct")
 ENV_VAR = "MARLIN_SRC"
 PATTERNS = ("model.safetensors.index.json", "model.safetensors")
 
@@ -107,8 +110,7 @@ def full_attn_layers(text):
 
 
 def write_metadata(gw, text, vis, outtype):
-    gw.add_architecture()
-    gw.add_name("Marlin-2B")
+    gw.add_architecture()   # name set by the caller from the checkpoint dir
     gw.add_file_type({
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "q6_k": gguf.LlamaFileType.MOSTLY_Q6_K,
@@ -178,7 +180,8 @@ def main():
     hf_source.add_src_argument(ap, model_id=MODEL_ID, env_var=ENV_VAR)
     args = ap.parse_args()
 
-    out = args.out or f"marlin-2b-{args.outtype}.gguf"
+    src_name = (args.src or "").replace(chr(92), "/").rstrip("/").split("/")[-1]
+    out = args.out or f"{(src_name or 'marlin-2b').lower()}-{args.outtype}.gguf"
     src = hf_source.find_checkpoint_dir(args.src, model_id=MODEL_ID, env_var=ENV_VAR,
                                         patterns=PATTERNS)
     log(f"source: {src}")
@@ -208,7 +211,9 @@ def main():
     weights = _lib.TensorSource(src)
     log(f"{len(weights)} tensors in the checkpoint")
 
+    std = src.replace(chr(92), "/").rstrip("/").split("/")[-1]
     gw = gguf.GGUFWriter(out, "marlin")
+    gw.add_name(std)
     write_metadata(gw, text, vis, args.outtype)
 
     stats = {"quantized": 0, "f16": 0, "f32": 0}

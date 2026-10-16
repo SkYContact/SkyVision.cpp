@@ -13,7 +13,7 @@
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
 | **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
-| **Marlin-2B** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）；官方两个训练技能 caption（带时间戳事件）/ find（时序定位）
+| **Qwen3.5 系（含 Marlin-2B）** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
 
 ## 当前状态
 
@@ -78,6 +78,9 @@ hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
 
 # Marlin-2B（魔搭镜像，无需登录）
 modelscope download NemoStation/Marlin-2B --local_dir models/Marlin-2B
+
+# Qwen3.5-2B（官方，通用图文/视频问答）
+modelscope download Qwen/Qwen3.5-2B --local_dir models/Qwen3.5-2B
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
@@ -160,6 +163,7 @@ Q6_K 量化器是本仓库自带的（gguf-py 至今只实现了 Q6_K 的**解�
 
 ```bash
 python convert/convert_videochat3.py --outtype q8_0   # → videochat3-4b-q8_0.gguf（4.83GB）
+python convert/convert_marlin.py --src models/Qwen3.5-2B   # → qwen3.5-2b-q8_0.gguf（2.67GB，Qwen3.5/Marlin 通用）
 python convert/convert_videochat3.py --outtype q6_k   # → 3.92GB
 python convert/convert_videochat3.py --outtype q4_0   # → 2.95GB
 ```
