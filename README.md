@@ -13,6 +13,7 @@
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
 | **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
+| **Marlin-2B** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）；官方两个训练技能 caption（带时间戳事件）/ find（时序定位）
 
 ## 当前状态
 
@@ -32,6 +33,8 @@
 | 批量推理（`--batch`）/ 流式输出 | ✅ prefill 注意力按 prompt 长度开窗（不再扫满 n_ctx）；8 路批量 decode ~241 tok/s |
 | VideoChat3-4B 图像问答 | ✅ 端到端 + **逐级 parity 已验证**：patch 嵌入 rel 4e-4、27 层 ViT + merger + projector rel 0.026（F16 权重噪声级），贪心输出与官方 bf16 逐字一致 |
 | VideoChat3-4B 视频输入 | ✅ 内置 `--video`（ffmpeg 管道，`FFMPEG=<path>` 可指定）：抽帧 + 时间戳提示词 + 4 帧时序 clip 联合注意力；视觉塔逐 clip 分批执行（激活峰值降至单 clip），同上下文预算内自动钳制超大图/视频 |
+| Marlin-2B 图像/视频问答 | ✅ 端到端 + **逐级 parity 已验证**（官方 transformers 5.20 做 oracle）：pixel_values 与引擎 patchify 逐位一致、pos 表 2.7e-8、patch 卷积 2.6e-3、block0 5.3e-3；整塔漂移 6.6e-2 **优于官方 bf16 自身的 1.1e-1**；末 token logits 1.5e-2 < 官方 bf16 2.8e-2；文本纯输入 gated-delta 层 1.4e-2 |
+| Marlin-2B 视频结构化技能 | ✅ `--mode caption`（Scene + 带秒级时间戳的 Events 列表）/ `--mode find`（自然语言事件 → `From X.X to Y.X.`），训练对齐的官方提示词 |
 | 视觉预处理 token 预算 | ✅ 图片/视频的视觉 token 上限 = n_ctx − max_tokens − 文本开销，编码前钳制分辨率或提前报错（不再白等几秒后 context overflow） |
 
 ## 快速开始
@@ -72,6 +75,9 @@ hf download moondream/moondream3.1-9B-A2B --local-dir models/moondream3.1-9B-A2B
 
 # VideoChat3-4B
 hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
+
+# Marlin-2B（魔搭镜像，无需登录）
+modelscope download NemoStation/Marlin-2B --local_dir models/Marlin-2B
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
@@ -85,6 +91,10 @@ hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
 vqa-cli --model models/VideoChat3-4B/videochat3-4b-q8_0.gguf \
         --tokenizer models/VideoChat3-4B \
         --image photo.jpg --ask "What is in this image?" --max-tokens 256
+
+# Marlin-2B：视频结构化信息提取
+vqa-cli --model marlin-2b-q8_0.gguf --tokenizer models/Marlin-2B         --video clip.mp4 --fps 2 --max-frames 16         --ask x --mode caption --max-tokens 512          # Scene: + 带时间戳的事件列表
+vqa-cli --model marlin-2b-q8_0.gguf --tokenizer models/Marlin-2B         --video clip.mp4 --fps 2         --ask "a person enters the room" --mode find     # From X.X to Y.Y.
 
 vqa-cli --model moondream3.1-q6k.gguf --tokenizer tokenizer.json \
         --vision moondream3.1-vision.gguf --region moondream3.1-region.gguf \
@@ -120,6 +130,7 @@ HTTP API：`POST /api/vision`，`mode=ask|caption|detect|point|gaze`
 | `convert_vision.py` | `moondream3.1-vision.gguf`（SigLIP 塔，~0.84GB） |
 | `convert_region.py` | `moondream3.1-region.gguf`（detect/point/gaze 头，~30MB） |
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf`（Qwen3 + VideoChat3 ViT，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
+| `convert_marlin.py` | `marlin-2b-<outtype>.gguf`（Qwen3.5 混合主干 + Qwen3-VL 视觉塔，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
 
 ### moondream3.1
 
@@ -215,6 +226,7 @@ CPU 上 Q8_0 的 VideoChat3-4B 受内存带宽限制；换成更小的量化或 
 |---|---|---|---|---|
 | VideoChat3-4B Q8_0（4.83GB） | CPU 14 线程 | i7-14700K | ~71 tok/s | ~10.4 tok/s |
 | VideoChat3-4B Q8_0（4.83GB） | CUDA | RTX 4070 SUPER | ~401 tok/s | ~49.8 tok/s |
+| Marlin-2B Q8_0（2.67GB） | CUDA | RTX 5070 Ti Laptop | ~9.7k tok/s | ~121 tok/s（视觉编码 112ms/300tok） |
 
 每次推理都会在 stderr 打印一行 `[perf] prefill ... | decode ...`，便于自行核对。
 moondream3.1 的数字见[当前状态](#当前状态)（官方标注来自 5070 Ti Laptop）。

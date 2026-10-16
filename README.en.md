@@ -14,6 +14,7 @@ needed to run it.
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | image | MoE text model + SigLIP tower; all five official skills (caption / query / detect / point / gaze), web UI, batch inference |
 | **VideoChat3-4B** | `videochat3` | image | Qwen3 text trunk (36 layers, GQA, per-head qk-norm) + VideoChat3's own 27-layer ViT (2D RoPE, 2×2 merge), built-in merger and multimodal projector |
+| **Marlin-2B** | `marlin` | image + video | Qwen3.5 hybrid trunk (18 gated-delta linear-attention + 6 full-attention layers, interleaved MRoPE) + Qwen3-VL style vision tower (learned absolute pos embed, 2D RoPE, per-temporal-step attention); the two trained skills: caption (timestamped event list) and find (temporal grounding) |
 
 ## Status
 
@@ -31,6 +32,7 @@ needed to run it.
 | FP8 expert weights → Q8_0 / Q6_K / Q4_K | ✅ converter included (Q6_K ≈ 7.6 GB — the pick for 12 GB GPUs) |
 | Batch inference (`--batch`) / streaming | ✅ |
 | VideoChat3-4B text / image VQA | ✅ works end to end (`vqa-cli`, verified on CPU and CUDA); **stage-by-stage parity against the PyTorch reference is still outstanding** |
+| Marlin-2B image/video VQA | ✅ end to end with **stage-by-stage parity verified** against the official transformers 5.20 reference (pixel values bitwise-identical, tower drift beats official bf16, logits 1.5e-2 vs f32); `--mode caption` / `--mode find` wired to the canonical trained prompts |
 | VideoChat3-4B video input | 🔜 frame decoding and timestamped prompts are designed but not wired up yet |
 
 ## Quick start
