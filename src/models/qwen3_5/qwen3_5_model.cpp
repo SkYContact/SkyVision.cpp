@@ -1229,6 +1229,16 @@ bool Qwen3_5::run_text(TextGraph & g, const std::vector<int> & toks,
         }
         logits_out.resize(n_vocab);
         ggml_backend_tensor_get(ggml_graph_get_tensor(dec_gf, "logits"), logits_out.data(), 0, sizeof(float) * n_vocab);
+        if (h_last) {
+            // MTP spec's plain rounds resume the draft chain from here: the
+            // h must come out of the same graph family the verify uses, or
+            // the draft head sees inputs it never predicts from
+            ggml_tensor * hn = ggml_graph_get_tensor(dec_gf, "t_final_norm");
+            if (hn) {
+                h_last->resize(n_embd);
+                ggml_backend_tensor_get(hn, h_last->data(), (size_t)(T - 1) * hn->nb[1], sizeof(float) * n_embd);
+            }
+        }
         n_past = S;
         return true;
     }

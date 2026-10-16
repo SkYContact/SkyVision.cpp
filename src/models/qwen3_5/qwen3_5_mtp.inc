@@ -115,7 +115,19 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     ggml_backend_tensor_set(t_h, h, 0, sizeof(float) * D);
     int mpos[4] = { axis, axis, axis, slot };
     ggml_backend_tensor_set(t_mpos, mpos, 0, sizeof(mpos));
-    vqa::set_causal_mask(t_mask, slot, 1);
+    static const bool selfkv = getenv("QWEN35_SPEC_SELFKV") != nullptr;
+    if (selfkv) {
+        // attend only to the draft token's own KV: cols < slot hold entries
+        // drafted for OTHER tokens in earlier rounds (drafted != accepted), so
+        // the causal window feeds the head stale keys - llama.cpp resets the
+        // draft-region KV for the same reason
+        const int S = (int)t_mask->ne[0];
+        std::vector<ggml_fp16_t> mv((size_t)S, ggml_fp32_to_fp16(-INFINITY));
+        if (slot >= 0 && slot < S) mv[(size_t)slot] = ggml_fp32_to_fp16(0.0f);
+        ggml_backend_tensor_set(t_mask, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
+    } else {
+        vqa::set_causal_mask(t_mask, slot, 1);
+    }
     if (ggml_backend_graph_compute(backend, c.gf) != GGML_STATUS_SUCCESS) return -1;
     h_out.resize(D);
     ggml_backend_tensor_get(h_out_t, h_out.data(), 0, sizeof(float) * D);
@@ -505,10 +517,13 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
     int plain_streak_total = 0;
     const double ema_min = getenv("QWEN35_SPEC_EMA_MIN") ? atof(getenv("QWEN35_SPEC_EMA_MIN")) : 0.30;
     const int probe_interval = getenv("QWEN35_SPEC_PROBE") ? atoi(getenv("QWEN35_SPEC_PROBE")) : 32;
+    // bisect helper: force the first k rounds plain, then pure-spec
+    const int plain_first = getenv("QWEN35_SPEC_PLAIN_FIRST") ? atoi(getenv("QWEN35_SPEC_PLAIN_FIRST")) : -1;
     TextGraph g_plain;
     while (n_dec < max_new) {
         if (pending == id_eos || pending == id_endoftext) break;
-        if (ema < ema_min && plain_streak < probe_interval) {
+        const bool force_plain = plain_first >= 0 && rounds < plain_first;
+        if ((ema < ema_min && plain_streak < probe_interval) || force_plain) {
             // plain round: process `pending` through the static decode path.
             // after a reject the live SSM/conv state lives in the slot-b
             // rollback tensors (state_slot == 1); the static graph only reads
@@ -526,6 +541,21 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             n_past = write_base;    // run_text's static path derives the KV
                                     // window + mask base from the member
             if (!run_text(g_plain, { pending }, nullptr, nullptr, pp, Lp, &hp)) return false;
+            // debug: how far is the static path's h from the verify path's h
+            // for the SAME token+state? (draft-chain sensitivity probe)
+            static const bool hchk = getenv("QWEN35_SPEC_HCHK") != nullptr;
+            if (hchk) {
+                std::vector<float> L2x((size_t)2 * n_vocab), hx(2 * n_embd);
+                const int tx[2] = { pending, 999 };
+                int amx[2];
+                n_past = write_base;
+                if (mtp_verify(tx, write_base, cur + 1, state_slot, L2x, hx, amx)) {
+                    double num = 0, den = 0, n1 = 0, n2 = 0;
+                    for (int i = 0; i < n_embd; i++) { double d = hp[i] - hx[i]; num += d * d; den += (double)hx[i] * hx[i]; n1 += (double)hp[i] * hp[i]; }
+                    for (int i = 0; i < n_embd; i++) n2 += (double)hx[i] * hx[i];
+                    fprintf(stderr, "[hchk] wb=%d h rel=%.3e |hp|=%.3f |hx|=%.3f\n", write_base, sqrt(num / (den + 1e-12)), sqrt(n1 / n_embd), sqrt(n2 / n_embd));
+                }
+            }
             const std::string piece = tok_.decode({pending});
             raw += piece;
             if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
