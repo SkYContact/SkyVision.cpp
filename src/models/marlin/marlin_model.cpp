@@ -509,6 +509,35 @@ bool Marlin::alloc_state() {
     return true;
 }
 
+// gallocr reuses the buffers of intermediates that are not direct graph nodes,
+// so dumped intermediates come back polluted (only true sinks survive). Making
+// each wanted tensor a direct graph node extends its lifetime to the whole
+// compute and makes every dump trustworthy. No-op unless dumping is enabled.
+static void mark_dump_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * dump_dir) {
+    if (!dump_dir || !*dump_dir) return;
+    static const char * const names[] = {
+        "emb", "t_l0_q", "t_l0_q_norm", "t_l0_q_rope", "t_l0_k_rope", "t_l0_attn",
+        "t_l0_la_qkv", "t_l0_la_z", "t_l0_la_beta", "t_l0_la_g", "t_l0_la_conv",
+        "t_l0_la_core", "t_l0_swiglu", "t_l0_out", "t_final_norm",
+        "patches", "v_pos_in", "v_patch_out", "v_blk0_attn_out", "v_blk0_out",
+        "v_final", "v_merge", "v_proj_out",
+    };
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->name[0]) continue;
+        for (const char * n : names) {
+            if (!strcmp(t->name, n)) {
+                // build_forward_expand is a no-op for tensors already in the
+                // graph; a fresh trailing consumer (identity scale) extends the
+                // tensor's buffer lifetime past the whole compute
+                ggml_tensor * keep = ggml_scale(ctx, t, 1.0f);
+                ggml_set_name(keep, "dump_sink");
+                ggml_build_forward_expand(gf, keep);
+                break;
+            }
+        }
+    }
+}
+
 void Marlin::dump(const ggml_cgraph * gf, const char * name) {
     if (dump_dir.empty()) return;
     ggml_tensor * t = ggml_graph_get_tensor((ggml_cgraph *)gf, name);
@@ -682,7 +711,9 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
 
         ggml_tensor * t_patches = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, C3, Nc);
         ggml_tensor * t_pos = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, vc.n_embd, Nc);
+        ggml_set_name(t_pos, "v_pos_in");
         ggml_tensor * t_vpos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, (int64_t)Nc * 4);
+        ggml_set_name(t_patches, "patches");
         std::vector<int> vpos((size_t)Nc * 4, 0);
         for (int i = 0; i < Nc; i++) {
             vpos[i] = coords[((size_t)s * hw + i) * 2];             // h  (section 0)
@@ -696,6 +727,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         ggml_set_name(x, "v_patch_out");
 
         auto run_chunk = [&](const char * out_name, std::vector<float> & dest) -> bool {
+            mark_dump_sinks(gctx, gf, dump_dir.c_str());
             if (!ggml_gallocr_alloc_graph(allocr, gf)) {
                 fprintf(stderr, "vision graph allocation failed\n");
                 return false;
@@ -709,6 +741,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
             }
             if (s == 0) {
                 dump(gf, "patches");
+                dump(gf, "v_pos_in");
                 dump(gf, "v_patch_out");
                 dump(gf, "v_blk0_attn_out");
                 dump(gf, "v_blk0_out");
@@ -774,6 +807,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         ggml_tensor * x = t_x;
 
         auto run_merger = [&](const char * out_name) -> bool {
+            mark_dump_sinks(mctx, mgf, dump_dir.c_str());
             if (!ggml_gallocr_alloc_graph(allocr, mgf)) {
                 fprintf(stderr, "merger graph allocation failed\n");
                 return false;
@@ -1023,6 +1057,7 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
     }
     ggml_set_name(g.logits, "logits");
     ggml_build_forward_expand(g.gf, g.logits);
+    mark_dump_sinks(g.ctx, g.gf, dump_dir.c_str());
     return true;
 }
 
@@ -1142,7 +1177,9 @@ std::string Marlin::render_prompt(int n_img_tokens, const std::string & user_tex
         s += "<|vision_end|>";
     }
     s += user_text;
-    s += "<|im_end|>\n<|im_start|>assistant\n";
+    // official chat template: the assistant prefix carries the ms-swift
+    // non-thinking artifact, so generations start clean
+    s += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     return s;
 }
 
@@ -1165,14 +1202,26 @@ static std::string strip_thinking(const std::string & s) {
 }
 
 bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
-                 const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
+                 const std::string & mode, const vqa::GenParams & gp, std::string & out_text) {
+    // the two trained skills (modeling_marlin.py canonical prompts - DO NOT EDIT):
+    // "caption" ignores the user text and emits the Scene:/Events: format,
+    // "find" treats the user text as the event to temporally ground
+    static const char * CAPTION_PROMPT =
+        "Provide a spatial description of this clip followed by time-ranged events.\n"
+        "For each event, give the time range as <start - end> and a short description.";
+    std::string prompt_eff = prompt;
+    if (mode == "caption") prompt_eff = CAPTION_PROMPT;
+    else if (mode == "find")
+        prompt_eff = "Identify the timestamps during which \"" + prompt + "\" takes place. "
+                     "Output the time range as \"From <start> to <end>.\" (numbers in seconds).";
+    const std::string & user_text = prompt_eff;
     std::vector<float> feats;
     int n_img = 0;
     int grid[3] = {0, 0, 0};     // (temporal steps, merged h, merged w)
     const auto tv0 = std::chrono::steady_clock::now();
     const bool video_kind = media.kind == vqa::MediaKind::Video;
     {
-        const int text_overhead = (int)tok_.encode(render_prompt(1, prompt, video_kind)).size();
+        const int text_overhead = (int)tok_.encode(render_prompt(1, user_text, video_kind)).size();
         const int budget = n_ctx - gp.max_tokens - text_overhead - 16;
         if (budget <= 0) {
             fprintf(stderr, "n_ctx %d too small: prompt %d tokens + max_new %d leaves nothing for the image\n",
@@ -1204,7 +1253,7 @@ bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
     fprintf(stderr, "[perf] vision encode: %.0f ms (%d tokens)\n",
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
-    const std::string text = render_prompt(n_img, prompt, video_kind);
+    const std::string text = render_prompt(n_img, user_text, video_kind);
     const std::vector<int> ids = tok_.encode(text);
     const int pad_id = video_kind ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;
