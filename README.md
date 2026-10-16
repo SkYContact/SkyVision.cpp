@@ -22,15 +22,17 @@
 | | |
 |---|---|
 | 文本 decode（24 层） | ✅ 质量对齐官方（逐张量 diff ~1e-3），贪心输出无 reserved token |
-| GPU 后端（CUDA via ggml） | ✅ 单序列 ~106 tok/s，8 路批量 231 tok/s（5070 Ti Laptop，Q6_K；flash-attn + F16 KV + CUDA graph 回放） |
+| GPU 后端（CUDA via ggml） | ✅ 单序列 ~106 tok/s，8 路批量 ~241 tok/s（5070 Ti Laptop，Q6_K；flash-attn + F16 KV + CUDA graph 回放） |
 | CPU 后端 | ✅ 12.8 tok/s（16 线程，与 CUDA 数值一致） |
 | SigLIP 视觉编码器 | ✅ 官方多 crop Lanczos 预处理 + 批量编码，~0.56s/图（10 crop），parity < 0.04 |
 | 五个官方技能 | ✅ caption（short/normal/long）/ query / detect / point / gaze，模板与官方逐 token 一致 |
-| Web UI（`--serve`） | ✅ 图像优先界面：拖拽/粘贴图片、三档描述、提问、检测绿框、定位十字、注视点预测；同图缓存命中 ~66ms |
+| Web UI（`--serve`，可绑 0.0.0.0 部署局域网） | ✅ 移动端友好：拖拽/选图、NDJSON 流式逐字输出（UTF-8 边界安全）、视觉编码逐 clip 进度、detect 绿框 / point 十字 / gaze；同图同视频追问走两级缓存（上传解码 + 视觉特征），二次提问 ~26ms |
+| moondream 思考模式 | ✅ `mode=ask-think`：官方 reasoning 协议（thinking_id → grounded 坐标 token → answer），推理段与回答流式分段输出 |
 | FP8 专家权重 → Q8_0 / Q6_K / Q4_K | ✅ 转换器已就绪（Q6_K ≈ 7.6GB，12GB 显卡首选） |
-| 批量推理（`--batch`）/ 流式输出 | ✅ |
-| VideoChat3-4B 文本 / 图像问答 | ✅ 端到端可用（`vqa-cli`，CPU 与 CUDA 均验证）；**与 PyTorch 参考实现的逐级 parity 尚未做** |
-| VideoChat3-4B 视频输入 | 🔜 帧目录解码与时间戳提示词已设计，尚未接线 |
+| 批量推理（`--batch`）/ 流式输出 | ✅ prefill 注意力按 prompt 长度开窗（不再扫满 n_ctx）；8 路批量 decode ~241 tok/s |
+| VideoChat3-4B 图像问答 | ✅ 端到端 + **逐级 parity 已验证**：patch 嵌入 rel 4e-4、27 层 ViT + merger + projector rel 0.026（F16 权重噪声级），贪心输出与官方 bf16 逐字一致 |
+| VideoChat3-4B 视频输入 | ✅ 内置 `--video`（ffmpeg 管道，`FFMPEG=<path>` 可指定）：抽帧 + 时间戳提示词 + 4 帧时序 clip 联合注意力；视觉塔逐 clip 分批执行（激活峰值降至单 clip），同上下文预算内自动钳制超大图/视频 |
+| 视觉预处理 token 预算 | ✅ 图片/视频的视觉 token 上限 = n_ctx − max_tokens − 文本开销，编码前钳制分辨率或提前报错（不再白等几秒后 context overflow） |
 
 ## 快速开始
 

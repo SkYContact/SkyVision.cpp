@@ -782,6 +782,19 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             fprintf(stderr, "vision budget %d tokens (%d clip%s): max_pixels clamped to %.2f MP\n",
                     token_budget, n_clips, n_clips == 1 ? "" : "s", max_pixels / 1e6);
     }
+    // per-frame resolution cap for videos: clip attention is quadratic over the
+    // clip's (4 frames x patches) tokens, so full-HD frames make one clip cost
+    // ~7.5s on a laptop GPU. ~0.75MP/frame keeps video QA accurate in practice
+    // at a fraction of the cost; VC3_VIDEO_MP=0 restores full resolution up to
+    // the context budget.
+    if (media.kind == vqa::MediaKind::Video) {
+        double vmp = 0.75;
+        if (const char * e = getenv("VC3_VIDEO_MP")) vmp = atof(e);
+        if (vmp > 0 && (double)max_pixels > vmp * 1e6) {
+            max_pixels = (long long)(vmp * 1e6);
+            fprintf(stderr, "video frame cap: %.2f MP/frame (VC3_VIDEO_MP to override)\n", vmp);
+        }
+    }
     if (!smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;

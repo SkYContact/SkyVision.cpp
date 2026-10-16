@@ -56,3 +56,32 @@ test_scene.png
 # dev notes & third-party reference code — kept locally, not for publication
 docs/
 convert/ref_*.py
+
+# local run/deploy artifacts
+serve.log
+*.log
+start_webui.bat
+_build.bat
+
+# scratch dirs (parity dumps, release staging, reference clones)
+p[0-9]_q*/
+pL[0-9]*/
+dmp_*/
+d_off/
+d_on/
+d_in/
+parity_vision/
+ref_dumps/
+dist-*/
+ms-upload/
+llama.cpp/
+
+# test media
+*.mp4
+*.bmp
+px_*.png
+sw_*.png
+cover.png
+ck.png
+cimg.png
+timg.png
