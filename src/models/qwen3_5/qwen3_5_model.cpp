@@ -44,6 +44,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <filesystem>
 
 namespace qwen3_5 {
 
@@ -184,6 +185,19 @@ private:
     int dec_blk = 0;
     ggml_tensor * dec_tok = nullptr, * dec_mpos = nullptr, * dec_mask = nullptr;
 
+    // speculative graph caches (qwen3_5_mtp.inc): one verify graph per state
+    // slot + one draft graph, keyed on the 512-block KV window; allocated once
+    // and reused across rounds so per-round cost is input-set + compute only
+    struct SpecCache {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * gf = nullptr;
+        int blk = -1, slot = -1;
+        ggml_tensor * tok = nullptr, * mpos = nullptr, * mask = nullptr;
+        ggml_tensor * logits = nullptr, * hout = nullptr;
+    };
+    SpecCache spec_v[2];
+    SpecCache spec_d;
+
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 };
 
@@ -225,6 +239,8 @@ static float randf_(uint64_t & s) {
 
 Qwen3_5::~Qwen3_5() {
     if (dec_ctx) ggml_free(dec_ctx);
+    for (auto & c : spec_v) if (c.ctx) ggml_free(c.ctx);
+    if (spec_d.ctx) ggml_free(spec_d.ctx);
     if (sctx) ggml_free(sctx);
     if (sbuf) ggml_backend_buffer_free(sbuf);
     kv.free();
@@ -948,14 +964,35 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
             ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[ki], k2, pos_slot));
             ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[ki], v2, pos_slot));
 
-            ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
             ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[ki], HD, S, NKV,
                                             kv.k[ki]->nb[1], HD * sizeof(ggml_fp16_t), 0);
             ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[ki], HD, S, NKV,
                                             kv.v[ki]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-            ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
-                                                   1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-            ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
+            ggml_tensor * attn = nullptr;
+            if (logits_all && T > 1) {
+                // speculative verify: run flash attention PER TOKEN (T=1
+                // queries) instead of one fused T=2 call. The fused call
+                // lands on the mma-f16 kernel whose f16 Q*K costs ~2% logits
+                // vs the vector kernel the static decode path uses; per-token
+                // calls with the same 512-block-padded S take the identical
+                // vector-kernel path and keep verify bit-identical to plain
+                // greedy decoding.
+                for (int t = 0; t < T; t++) {
+                    ggml_tensor * qt = ggml_view_3d(g.ctx, q3, HD, 1, NH,
+                                                    q3->nb[1], q3->nb[1], (size_t)t * q3->nb[2]);
+                    ggml_tensor * mt = ggml_view_2d(g.ctx, g.mask_in, S, 1,
+                                                    g.mask_in->nb[1], (size_t)t * g.mask_in->nb[1]);
+                    ggml_tensor * fa_t = ggml_flash_attn_ext(g.ctx, qt, kf, vf, mt,
+                                                             1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+                    ggml_tensor * col = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa_t), (int64_t)NH * HD, 1);
+                    attn = attn ? ggml_concat(g.ctx, attn, col, 1) : col;
+                }
+            } else {
+                ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
+                ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
+                                                       1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+                attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
+            }
             if (il == 0) ggml_set_name(attn, "t_l0_attn");
             attn = ggml_mul(g.ctx, attn, ggml_sigmoid(g.ctx, gate));    // output gating
             attn_out = ggml_mul_mat(g.ctx, L.o, attn);
@@ -989,14 +1026,30 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
                 ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
                              conv_in->nb[1], conv_in->nb[2],
                              (size_t)(conv_in->ne[0] - (k_conv - 1)) * conv_in->nb[0]);
-            ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, conv_state_last, conv_st));
+            // state writes hang off the layer chain; without a dependency edge
+            // into the main path, CUDA multi-stream scheduling can overlap the
+            // copy with later nodes that REUSE the source buffer (observed as
+            // ~1e-2-slot-state corruption from the first post-attention layer
+            // on). Tie every state copy into the layer output via +0.
+            ggml_tensor * state_dep = nullptr;
+            auto tie_state = [&](ggml_tensor * cpy_out) {
+                ggml_build_forward_expand(g.gf, cpy_out);
+                ggml_tensor * s = ggml_scale(g.ctx, ggml_sum(g.ctx, cpy_out), 0.0f);
+                state_dep = state_dep ? ggml_add(g.ctx, state_dep, s) : s;
+            };
+            // the rolled conv window ALWAYS goes to the MAIN conv_state (the
+            // pre-fix code wrote it into `conv_st`, which on the slot-1
+            // rejection path is a view of conv_state_b - so main never
+            // advanced and the next round read a stale window)
+            tie_state(ggml_cpy(g.ctx, conv_state_last,
+                               ggml_reshape_3d(g.ctx, conv_state[si], k_conv - 1, kv_dim, 1)));
             if (spec) {
                 // rollback windows: state after 1 token (slot 1) and after 0 (slot 2,
                 // the untouched input state, needed when the whole draft is rejected)
                 ggml_tensor * cs1 = ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
                                                  conv_in->nb[1], conv_in->nb[2], 1 * conv_in->nb[0]);
-                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, cs1, ggml_reshape_3d(g.ctx, conv_state_b[si], k_conv - 1, kv_dim, 1)));
-                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, conv_st,
+                tie_state(ggml_cpy(g.ctx, cs1, ggml_reshape_3d(g.ctx, conv_state_b[si], k_conv - 1, kv_dim, 1)));
+                tie_state(ggml_cpy(g.ctx, conv_st,
                                                          ggml_reshape_3d(g.ctx, conv_state_c[si], k_conv - 1, kv_dim, 1)));
             }
             ggml_tensor * conv = ggml_ssm_conv(g.ctx, conv_in, L.la_conv1d); // [kv_dim, T, 1]
@@ -1039,18 +1092,14 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
                                                    ggml_row_size(res->type, Sk),
                                                    ggml_row_size(res->type, Sk * Sk),
                                                    ggml_row_size(res->type, Sk * Hv * T));
-            ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, new_state, ssm_state[si]));
+            tie_state(ggml_cpy(g.ctx, new_state, ssm_state[si]));
             if (spec) {
                 // snapshot layout: [scores T cols][slot0 = final][slot1 = one token back]
-                const int64_t D = Sk * Sk * Hv;
-                // packed layout: [scores T cols][slot0 S_v cols][slot1 S_v cols],
-                // each column ne0 long and consecutive columns contiguous, so a
-                // snapshot is D contiguous elements at column T + s*S_v
                 ggml_tensor * snap1 = ggml_view_3d(g.ctx, res, Sk, Sk, Hv,
                         Sk * ggml_element_size(res), Sk * Sk * ggml_element_size(res),
                         ggml_row_size(res->type, Sk * Hv * (T + Sk)));
-                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, snap1, ssm_state_b[si]));
-                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, s0,
+                tie_state(ggml_cpy(g.ctx, snap1, ssm_state_b[si]));
+                tie_state(ggml_cpy(g.ctx, s0,
                                                          ggml_reshape_3d(g.ctx, ssm_state_c[si], Sk, Sk, Hv)));
             }
             if (il == 0) ggml_set_name(out, "t_l0_la_core");
@@ -1062,6 +1111,8 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
             on = ggml_mul(g.ctx, on, ggml_silu(g.ctx, zn));
             ggml_tensor * flat = ggml_reshape_2d(g.ctx, on, ssm_d_inner, T);
             attn_out = ggml_mul_mat(g.ctx, L.la_out, flat);
+            if (state_dep)   // serialize the state copies into the main chain (+0)
+                attn_out = ggml_add(g.ctx, attn_out, state_dep);
         }
 
         x = ggml_add(g.ctx, x, attn_out);
@@ -1391,9 +1442,12 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
         if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
         n_dec++;
         if (step + 1 >= max_new) break;
-        step_pos[0] = last_mpos[0] + mrope_delta;
-        step_pos[1] = last_mpos[1] + mrope_delta;
-        step_pos[2] = last_mpos[2] + mrope_delta;
+        // mrope axis of the NEW token = previous token's axis + 1 (matches the
+        // prefill convention axis == KV column; the old `+ mrope_delta` froze
+        // every generated token at the last prompt token's axis)
+        step_pos[0] = last_mpos[0] + 1;
+        step_pos[1] = last_mpos[1] + 1;
+        step_pos[2] = last_mpos[2] + 1;
         step_pos[3] = n_past;               // KV slot
         step_tok[0] = next;
         if (!run_text(g, step_tok, nullptr, nullptr, step_pos, logits)) break;
