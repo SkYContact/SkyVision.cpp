@@ -55,6 +55,7 @@ std::string g_tokenizer = "";        // optional override
 std::vector<ModelEntry> g_models;
 std::mutex g_mu;                      // serializes model access
 std::string g_id_placeholder;         // substituted into pages per request
+std::string g_arch_placeholder;      // ditto, for arch-conditional UI
 vqa::Model * g_loaded = nullptr;
 std::string g_loaded_id;
 
@@ -781,6 +782,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         std::string marker = "__MODEL_ID__";
         size_t p;
         while ((p = html.find(marker)) != std::string::npos) html.replace(p, marker.size(), g_id_placeholder);
+        marker = "__MODEL_ARCH__";
+        while ((p = html.find(marker)) != std::string::npos) html.replace(p, marker.size(), g_arch_placeholder);
         send(c, "200 OK", "text/html; charset=utf-8", html);
     };
 
@@ -795,6 +798,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         g_id_placeholder = id;
         const ModelEntry * e = find_model(id);
         if (!e) { send(c, "404 Not Found", "text/plain", "unknown model"); return true; }
+        g_arch_placeholder = e->arch;
         serve_page(e->arch == "moondream3" ? "moondream.html"
                  : e->arch == "moss_vl" ? "moss.html"
                  : "vc3.html");

@@ -46,6 +46,11 @@
       <option value="32">32 帧</option>
       <option value="64">64 帧</option>
     </select>
+    <select id="mode" style="display:none">
+      <option value="">普通问答</option>
+      <option value="caption">技能：Caption（场景+时间戳事件）</option>
+      <option value="find">技能：Find（时序定位）</option>
+    </select>
     <button id="go">运行</button>
   </div>
   <div id="status"></div>
@@ -53,6 +58,8 @@
 </div>
 <script>
 const MODEL = '__MODEL_ID__';
+const ARCH = '__MODEL_ARCH__';
+if (ARCH === 'marlin') document.getElementById('mode').style.display = '';
 const drop = document.getElementById('drop'), file = document.getElementById('file');
 const imgP = document.querySelector('img#preview'), vidP = document.querySelector('video#preview');
 let blob = null, isVideo = false;
@@ -87,7 +94,9 @@ btn.onclick = async () => {
     const q = encodeURIComponent(document.getElementById('q').value);
     const mf = document.getElementById('mf').value;
     const kind = isVideo ? '&kind=video&fps=2&max-frames=' + mf : '';
-    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + kind + '&n=300&stream=1', {
+    const modeSel = document.getElementById('mode');
+    const modeQ = modeSel && modeSel.value ? '&mode=' + modeSel.value : '';
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + kind + modeQ + '&n=300&stream=1', {
       method: 'POST', body: blob || new Uint8Array(0)
     });
     // NDJSON stream: {"phase":"vision"} then {"t":".."} per token, {"done"|"error"} at the end
