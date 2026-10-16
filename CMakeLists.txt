@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ggml only: the standalone https://github.com/ggml-org/ggml checkout (it also
 # ships gguf). We do not depend on llama.cpp - only ggml + our own model layers.
+# CUDA graph capture for static decode graphs: the standalone ggml checkout
+# defaults this OFF ("llama.cpp only"), which silently compiled the feature
+# out after the move off llama.cpp - enable it explicitly (a no-op for
+# CPU-only builds).
+set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs" FORCE)
 add_subdirectory(ggml)
 
 # our sources carry UTF-8 comments/strings; MSVC defaults to the ANSI codepage

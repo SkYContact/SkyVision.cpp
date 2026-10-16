@@ -26,6 +26,7 @@
 #endif
 #include "tokenizer.hpp"
 #include "ggml_dump.hpp"
+#include "stage_buf.hpp"
 #include "vc3_preprocess.hpp"
 #include "attention.hpp"
 #include "sampler.hpp"
@@ -129,6 +130,7 @@ private:
     void (*stage_cb)(const char *, int, int, void *) = nullptr;   // per-clip vision progress
     void * stage_ud = nullptr;
     std::vector<float> patch_bias;                // v.patch_embd.bias, folded into the host pos table
+    vqa::StageBuffer tower_buf;          // device-side tower output, host never touched between clips
     vqa::MMap mm;
 
     std::vector<float> pos_emb_host, pos_time_host;
@@ -884,7 +886,9 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     static double v_alloc = 0, v_input = 0, v_comp = 0; static int v_runs = 0;
     auto t_now = []() { return std::chrono::steady_clock::now(); };
 
-    std::vector<float> tower_out;          // [n_embd, N]: concatenated v_final rows
+    // tower outputs land in a persistent DEVICE buffer (core/stage_buf.hpp);
+    // the merger reads it as a view - no per-clip host round trip
+    if (!tower_buf.ensure(backend, vc.n_embd, (int64_t)hw * (int64_t)T)) return false;
     int frame0 = 0;
     // immediate first tick so the UI shows the total before clip 0 finishes
     // (one clip of a full-resolution video can take seconds)
@@ -916,7 +920,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         x = ggml_add(gctx, x, t_pos);
         ggml_set_name(x, "v_patch_out");
 
-        auto run_chunk = [&](const char * out_name, std::vector<float> & dest) -> bool {
+        auto run_chunk = [&](const char * out_name, std::vector<float> * dest) -> bool {
             const auto ra = t_now();
             if (!dump_dir.empty()) {
                 static const char * const dump_names[] = {
@@ -956,9 +960,11 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
                 dump(gf, "v_blk0_out");
             }
             dump(gf, out_name);   // sink dump is always buffer-safe
-            ggml_tensor * out = ggml_graph_get_tensor(gf, out_name);
-            dest.resize((size_t)out->ne[1] * out->ne[0]);
-            ggml_backend_tensor_get(out, dest.data(), 0, sizeof(float) * dest.size());
+            if (dest) {
+                ggml_tensor * out = ggml_graph_get_tensor(gf, out_name);
+                dest->resize((size_t)out->ne[1] * out->ne[0]);
+                ggml_backend_tensor_get(out, dest->data(), 0, sizeof(float) * dest->size());
+            }
             return true;
         };
 
@@ -966,7 +972,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         const char * stop_c = (c == 0) ? stop_after : nullptr;
         if (stop_c && !strcmp(stop_c, "v_patch_out")) {
             ggml_build_forward_expand(gf, x);
-            if (!run_chunk("v_patch_out", feats)) { ggml_free(gctx); return false; }
+            if (!run_chunk("v_patch_out", &feats)) { ggml_free(gctx); return false; }
             *n_tokens = (int)(feats.size() / vc.n_embd);
             ggml_free(gctx);
             return true;
@@ -981,7 +987,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         env.pad80 = pad80; env.wo_padded = wo_padded; env.clip_t = &clip_one;
         env.stop_after = stop_c;
         env.state = 0;
-        env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, sink); };
+        env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, &sink); };
         for (int il = 0; il < vl_max; il++) {
             VisLayer & L = vl[il];
             vqa::vit::BlockWeights bw{L.norm0_w, L.norm0_b, L.wqkv_w, L.wqkv_b, L.wo_w, L.wo_b,
@@ -1005,15 +1011,14 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_set_name(x, "v_final");
         if (stop_c && !strcmp(stop_c, "v_final")) {
             ggml_build_forward_expand(gf, x);
-            if (!run_chunk("v_final", feats)) { ggml_free(gctx); return false; }
+            if (!run_chunk("v_final", &feats)) { ggml_free(gctx); return false; }
             *n_tokens = (int)(feats.size() / vc.n_embd);
             ggml_free(gctx);
             return true;
         }
-        ggml_build_forward_expand(gf, x);
-        std::vector<float> chunk_out;
-        if (!run_chunk("v_final", chunk_out)) { ggml_free(gctx); return false; }
-        tower_out.insert(tower_out.end(), chunk_out.begin(), chunk_out.end());
+        ggml_tensor * out_sink = tower_buf.sink(gctx, x, (int64_t)frame0);
+        ggml_build_forward_expand(gf, out_sink);
+        if (!run_chunk("v_final", nullptr)) { ggml_free(gctx); return false; }
         ggml_free(gctx);
         frame0 += t;
         if (stage_cb) stage_cb("vision", (int)(c + 1), (int)clip_t.size(), stage_ud);
@@ -1025,7 +1030,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_context * mctx = ggml_init(ip2);
         if (!mctx) return false;
         struct ggml_cgraph * mgf = ggml_new_graph_custom(mctx, 8192, false);
-        ggml_tensor * t_x = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, vc.n_embd, N);
+        ggml_tensor * t_x = tower_buf.view(mctx, N, 0);   // device-side, no host round trip
         ggml_tensor * x = t_x;
 
         auto run_merger = [&](const char * out_name) -> bool {
@@ -1037,7 +1042,6 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
                 fprintf(stderr, "merger graph allocation failed\n");
                 return false;
             }
-            if (t_x->buffer) ggml_backend_tensor_set(t_x, tower_out.data(), 0, sizeof(float) * tower_out.size());
             if (ggml_backend_graph_compute(backend, mgf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "merger compute failed\n");
                 return false;

@@ -30,6 +30,7 @@
 #include "sampler.hpp"
 #include "vqa_util.hpp"
 #include "ggml_dump.hpp"
+#include "stage_buf.hpp"
 #include "../videochat3/vc3_preprocess.hpp"   // smart_resize / resize_bicubic_antialias
 #include "marlin_preprocess.hpp"
 
@@ -134,6 +135,7 @@ private:
     std::vector<char> host_f32_storage;
     vqa::MMap mm;
     std::vector<float> patch_bias;       // v.patch_embd.bias, read on the host at load time
+    vqa::StageBuffer tower_buf;          // device-side tower output, host never touched between steps
     std::vector<float> pos_table_host;   // [pos_side^2, n_embd]
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr;
@@ -653,8 +655,11 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
 
     const char * stop_after = getenv("MARLIN_STOP_AFTER");
 
-    // ---- tower: one graph per temporal step (attention is step-local)
-    std::vector<float> tower_out;
+    // ---- tower: one graph per temporal step (attention is step-local);
+    // every step writes its [n_embd, hw] output into a slice of a persistent
+    // DEVICE buffer (core/stage_buf.hpp) - the merger then reads the whole
+    // buffer as a view, so tower outputs never round-trip through the host
+    if (!tower_buf.ensure(backend, vc.n_embd, (int64_t)hw * gt)) return false;
     auto t_now = []() { return std::chrono::steady_clock::now(); };
     for (int s = 0; s < gt; s++) {
         const int Nc = hw;
@@ -680,7 +685,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         x = ggml_add(gctx, x, t_pos);
         ggml_set_name(x, "v_patch_out");
 
-        auto run_chunk = [&](const char * out_name, std::vector<float> & dest) -> bool {
+        auto run_chunk = [&](const char * out_name, std::vector<float> * dest) -> bool {
             if (!dump_dir.empty()) {
                 static const char * const dump_names[] = {
                     "patches", "v_pos_in", "v_patch_out", "v_blk0_attn_out", "v_blk0_out",
@@ -707,16 +712,18 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
                 dump(gf, "v_blk0_out");
             }
             dump(gf, out_name);
-            ggml_tensor * out = ggml_graph_get_tensor(gf, out_name);
-            dest.resize((size_t)out->ne[1] * out->ne[0]);
-            ggml_backend_tensor_get(out, dest.data(), 0, sizeof(float) * dest.size());
+            if (dest) {
+                ggml_tensor * out = ggml_graph_get_tensor(gf, out_name);
+                dest->resize((size_t)out->ne[1] * out->ne[0]);
+                ggml_backend_tensor_get(out, dest->data(), 0, sizeof(float) * dest->size());
+            }
             return true;
         };
 
         const char * stop_s = (s == 0) ? stop_after : nullptr;
         if (stop_s && !strcmp(stop_s, "v_patch_out")) {
             ggml_build_forward_expand(gf, x);
-            if (!run_chunk("v_patch_out", feats)) { ggml_free(gctx); return false; }
+            if (!run_chunk("v_patch_out", &feats)) { ggml_free(gctx); return false; }
             *n_tokens = (int)(feats.size() / vc.n_embd);
             ggml_free(gctx);
             return true;
@@ -727,7 +734,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         MarlinVitEnv env;
         env.gctx = gctx; env.gf = gf; env.vc = &vc; env.t_vpos = t_vpos;
         env.N = Nc; env.vhd = vhd; env.stop_after = stop_s; env.state = 0;
-        env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, sink); };
+        env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, &sink); };
         for (int il = 0; il < vl_max; il++) {
             VisLayer & L = vl[il];
             vqa::vit::BlockWeights bw{L.norm0_w, L.norm0_b, L.wqkv_w, L.wqkv_b, L.wo_w, L.wo_b,
@@ -741,16 +748,15 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         }
         // no final norm in this tower
         ggml_set_name(x, "v_final");
-        ggml_build_forward_expand(gf, x);
+        ggml_tensor * out_sink = tower_buf.sink(gctx, x, (int64_t)s * hw);
+        ggml_build_forward_expand(gf, out_sink);
         if (stop_s && !strcmp(stop_s, "v_final")) {
-            if (!run_chunk("v_final", feats)) { ggml_free(gctx); return false; }
+            if (!run_chunk("v_final", &feats)) { ggml_free(gctx); return false; }
             *n_tokens = (int)(feats.size() / vc.n_embd);
             ggml_free(gctx);
             return true;
         }
-        std::vector<float> chunk_out;
-        if (!run_chunk("v_final", chunk_out)) { ggml_free(gctx); return false; }
-        tower_out.insert(tower_out.end(), chunk_out.begin(), chunk_out.end());
+        if (!run_chunk("v_final", nullptr)) { ggml_free(gctx); return false; }
         ggml_free(gctx);
     }
 
@@ -763,7 +769,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         ggml_context * mctx = ggml_init(ip2);
         if (!mctx) return false;
         struct ggml_cgraph * mgf = ggml_new_graph_custom(mctx, 8192, false);
-        ggml_tensor * t_x = ggml_new_tensor_2d(mctx, GGML_TYPE_F32, vc.n_embd, N);
+        ggml_tensor * t_x = tower_buf.view(mctx, N, 0);   // device-side, no host round trip
         ggml_tensor * x = t_x;
 
         auto run_merger = [&](const char * out_name) -> bool {
@@ -775,7 +781,6 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
                 fprintf(stderr, "merger graph allocation failed\n");
                 return false;
             }
-            if (t_x->buffer) ggml_backend_tensor_set(t_x, tower_out.data(), 0, sizeof(float) * tower_out.size());
             if (ggml_backend_graph_compute(backend, mgf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "merger compute failed\n");
                 return false;
