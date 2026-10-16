@@ -1,4 +1,4 @@
-// marlin_preprocess.hpp - Marlin-2B (Qwen3.5-VL) preprocessing, pure C++.
+// qwen3_5_preprocess.hpp - Qwen3_5-2B (Qwen3.5-VL) preprocessing, pure C++.
 //
 // Mirrors transformers 5.7 Qwen3_5VisionModel + the qwen-vl-utils processor:
 //   smart_resize (factor = patch*merge = 32; video ~448x448 per frame)
@@ -13,13 +13,13 @@
 //      groups 2x2 neighbours; emitting block-major at the host makes every
 //      downstream stage (pos add, per-frame attention, rope coords, merger
 //      reshape) plain row-major over the stream. Verified equivalent to the
-//      reference layout in docs/dev-notes.md "Marlin-2B".
+//      reference layout in docs/dev-notes.md "Qwen3_5-2B".
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
-namespace marlin {
+namespace qwen3_5 {
 
 struct VisConfig {
     int patch = 16;
@@ -44,4 +44,4 @@ void patchify3d(const float * const * tframes, int h, int w, const VisConfig & v
                 std::vector<float> & patches, std::vector<float> & pos,
                 std::vector<int> & coords, int * grid_h, int * grid_w);
 
-}  // namespace marlin
+}  // namespace qwen3_5

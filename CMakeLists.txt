@@ -60,10 +60,10 @@ set(VIDEOCHAT3_SRC
     src/models/videochat3/vc3_preprocess.cpp
     src/models/videochat3/vc3_model.cpp)
 
-#   src/models/marlin/       Marlin-2B backend (Qwen3.5 hybrid text + Qwen3-VL ViT)
-set(MARLIN_SRC
-    src/models/marlin/marlin_preprocess.cpp
-    src/models/marlin/marlin_model.cpp)
+#   src/models/qwen3_5/      Qwen3.5 backend (hybrid text + Qwen3-VL ViT; Marlin runs on it)
+set(QWEN35_SRC
+    src/models/qwen3_5/qwen3_5_preprocess.cpp
+    src/models/qwen3_5/qwen3_5_model.cpp)
 
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
@@ -72,7 +72,7 @@ add_executable(vqa-cli
     ${VQA_CORE_SRC}
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC}
-    ${MARLIN_SRC})
+    ${QWEN35_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC})
 

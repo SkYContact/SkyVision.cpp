@@ -1,9 +1,9 @@
-// marlin_preprocess.cpp - see marlin_preprocess.hpp.
-#include "marlin_preprocess.hpp"
+// qwen3_5_preprocess.cpp - see qwen3_5_preprocess.hpp.
+#include "qwen3_5_preprocess.hpp"
 
 #include <cmath>
 
-namespace marlin {
+namespace qwen3_5 {
 
 void patchify3d(const float * const * tframes, int h, int w, const VisConfig & vc,
                 const float * pos_table, std::vector<float> & patches,
@@ -73,4 +73,4 @@ void patchify3d(const float * const * tframes, int h, int w, const VisConfig & v
                 }
 }
 
-}  // namespace marlin
+}  // namespace qwen3_5

@@ -1,4 +1,4 @@
-// marlin_model.cpp - Marlin-2B backend (Qwen3.5 hybrid text + Qwen3-VL ViT).
+// qwen3_5_model.cpp - Qwen3_5-2B backend (Qwen3.5 hybrid text + Qwen3-VL ViT).
 //
 // Text decoder: 24 layers, 18 gated-delta linear-attention layers + 6 full
 // attention layers (3,7,11,15,19,23). Full layers use interleaved MRoPE
@@ -32,7 +32,7 @@
 #include "ggml_dump.hpp"
 #include "stage_buf.hpp"
 #include "../videochat3/vc3_preprocess.hpp"   // smart_resize / resize_bicubic_antialias
-#include "marlin_preprocess.hpp"
+#include "qwen3_5_preprocess.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -45,7 +45,7 @@
 #include <thread>
 #include <vector>
 
-namespace marlin {
+namespace qwen3_5 {
 
 struct VisLayer {
     ggml_tensor *norm0_w = nullptr, *norm0_b = nullptr;
@@ -81,13 +81,13 @@ struct TextGraph {
     ggml_tensor *logits = nullptr;
 };
 
-class Marlin : public vqa::Model {
+class Qwen3_5 : public vqa::Model {
 public:
-    ~Marlin() override;
+    ~Qwen3_5() override;
     bool load(const std::string & gguf_path, const std::string & tokenizer_path,
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override;
     const vqa::Capabilities & caps() const override { return caps_; }
-    const char * name() const override { return "marlin-2b"; }
+    const char * name() const override { return "qwen3.5"; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp,
              std::string & out_text) override;
@@ -103,10 +103,18 @@ private:
     bool alloc_state();
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                        int * n_tokens, int * grid /* t, h, w (merged) */, int token_budget = 0);
-    bool build_text_graph(TextGraph & g, int T, int S, int n_img);
+    bool build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot = 0, bool logits_all = false);
+    // qwen3_5_mtp.inc
+    int mtp_draft_step(int tok, const float * h, int slot, int axis,
+                       std::vector<float> & logits_out, std::vector<float> & h_out);
+    bool mtp_verify(const int * toks, int n_past, int axis0, int state_slot,
+                    std::vector<float> & logits2, std::vector<float> & h_out);
+    bool run_speculative(int next, int seed0, const std::vector<float> & logits_prev, float * h_seed,
+                         int max_new, const vqa::GenParams & gp, std::string & raw, int & n_dec);
     bool run_text(TextGraph & g, const std::vector<int> & toks,
                   const std::vector<float> * img_feats, const std::vector<int> * img_pos,
-                  const std::vector<int> & mpos, std::vector<float> & logits_out);
+                  const std::vector<int> & mpos, std::vector<float> & logits_out,
+                  std::vector<float> * h_last = nullptr);
     std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video) const;
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     void dump(const ggml_cgraph * gf, const char * name);
@@ -147,10 +155,23 @@ private:
     ggml_tensor *mm_fc2_w = nullptr, *mm_fc2_b = nullptr;
 
     vqa::KvCache kv;                     // 6 full-attention layers only
+    // speculative MTP head (official Qwen3.5 checkpoints; see dev-notes)
+    bool has_mtp = false;
+    ggml_tensor *mtp_fc = nullptr, *mtp_e_norm = nullptr, *mtp_h_norm = nullptr;
+    ggml_tensor *mtp_head_norm = nullptr, *mtp_attn_norm = nullptr, *mtp_post_norm = nullptr;
+    ggml_tensor *mtp_q = nullptr, *mtp_k = nullptr, *mtp_v = nullptr, *mtp_o = nullptr;
+    ggml_tensor *mtp_qn = nullptr, *mtp_kn = nullptr;
+    ggml_tensor *mtp_gate = nullptr, *mtp_up = nullptr, *mtp_down = nullptr;
+    vqa::KvCache mtp_kv;                 // the head's single attention layer
     // persistent gated-delta states (one per linear layer)
     ggml_context * sctx = nullptr;
     ggml_backend_buffer_t sbuf = nullptr;
-    std::vector<ggml_tensor *> ssm_state, conv_state;
+    // two rollback slots per linear layer: slot 1 holds the state one token
+    // back (written by the speculative verify graph, read when a draft token
+    // is rejected); slot 0 is the current state everywhere else
+    std::vector<ggml_tensor *> ssm_state, conv_state;          // slot 0
+    std::vector<ggml_tensor *> ssm_state_b, conv_state_b;      // slot 1
+    std::vector<ggml_tensor *> ssm_state_c, conv_state_c;      // slot 2 (pre-round save)
 
     ggml_gallocr_t allocr = nullptr;
     int n_past = 0;
@@ -176,6 +197,7 @@ static int gguf_u32(struct gguf_context * g, const char * key, int def) {
     if (id < 0) return def;
     switch (gguf_get_kv_type(g, id)) {
         case GGUF_TYPE_UINT32: return (int)gguf_get_val_u32(g, id);
+        case GGUF_TYPE_BOOL:   return gguf_get_val_bool(g, id) ? 1 : 0;
         case GGUF_TYPE_INT32:  return (int)gguf_get_val_i32(g, id);
         case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(g, id);
         case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(g, id);
@@ -201,7 +223,7 @@ static float randf_(uint64_t & s) {
     return (float)(((s * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 900719254740992.0));
 }
 
-Marlin::~Marlin() {
+Qwen3_5::~Qwen3_5() {
     if (dec_ctx) ggml_free(dec_ctx);
     if (sctx) ggml_free(sctx);
     if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -213,7 +235,7 @@ Marlin::~Marlin() {
     if (backend) ggml_backend_free(backend);
 }
 
-bool Marlin::init_backend() {
+bool Qwen3_5::init_backend() {
     if (use_gpu) {
 #ifdef GGML_USE_CUDA
         backend = ggml_backend_cuda_init(0);
@@ -233,13 +255,13 @@ bool Marlin::init_backend() {
 }
 
 // ---------------------------------------------------------------- load
-bool Marlin::load(const std::string & gguf_path, const std::string & tokenizer_path,
+bool Qwen3_5::load(const std::string & gguf_path, const std::string & tokenizer_path,
                   const vqa::LoadOptions & opt) {
     n_ctx = opt.n_ctx > 0 ? opt.n_ctx : n_ctx;
     n_threads = opt.n_threads;
     use_gpu = opt.use_gpu;
     dump_dir = opt.dump_dir;
-    if (const char * d = getenv("MARLIN_DUMP_DIR")) dump_dir = d;
+    if (const char * d = getenv("QWEN35_DUMP_DIR")) dump_dir = d;
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::Qwen2Regex)) return false;
@@ -265,7 +287,7 @@ bool Marlin::load(const std::string & gguf_path, const std::string & tokenizer_p
     return true;
 }
 
-bool Marlin::load_weights(const char * path) {
+bool Qwen3_5::load_weights(const char * path) {
     if (!mm.load(path)) { fprintf(stderr, "mmap failed: %s\n", path); return false; }
     fprintf(stderr, "model file: %.2f GB\n", mm.size / 1e9);
 
@@ -304,6 +326,7 @@ bool Marlin::load_weights(const char * path) {
     vc.layernorm_eps = gguf_f32(gu, "marlin.vision.layer_norm_epsilon", vc.layernorm_eps);
     vc.rope_theta = gguf_f32(gu, "marlin.vision.rope_theta", vc.rope_theta);
     vc.out_hidden = gguf_u32(gu, "marlin.vision.out_hidden_size", vc.out_hidden);
+    has_mtp = gguf_u32(gu, "marlin.has_mtp", 0) != 0;
     id_image_pad = gguf_u32(gu, "marlin.image_token_id", id_image_pad);
     id_video_pad = gguf_u32(gu, "marlin.video_token_id", id_video_pad);
     id_vision_start = gguf_u32(gu, "marlin.vision_start_token_id", id_vision_start);
@@ -460,6 +483,16 @@ bool Marlin::load_weights(const char * path) {
         L.up = g("ffn_up.weight");
         L.down = g("ffn_down.weight");
     }
+    if (has_mtp) {
+        mtp_fc = gt("mtp.fc");          mtp_e_norm = gt("mtp.e_norm");
+        mtp_h_norm = gt("mtp.h_norm");  mtp_head_norm = gt("mtp.head_norm");
+        mtp_attn_norm = gt("mtp.attn_norm"); mtp_post_norm = gt("mtp.post_norm");
+        mtp_q = gt("mtp.q"); mtp_k = gt("mtp.k"); mtp_v = gt("mtp.v"); mtp_o = gt("mtp.o");
+        mtp_qn = gt("mtp.q_norm"); mtp_kn = gt("mtp.k_norm");
+        mtp_gate = gt("mtp.ffn_gate"); mtp_up = gt("mtp.ffn_up"); mtp_down = gt("mtp.ffn_down");
+        if (!mtp_fc || !mtp_q || !mtp_head_norm) { fprintf(stderr, "mtp tensors incomplete\n"); return false; }
+        fprintf(stderr, "MTP draft head present (speculative decode, QWEN35_SPEC=0 to disable)\n");
+    }
     vl.resize(vc.n_layer);
     for (int i = 0; i < vc.n_layer; i++) {
         char buf[128];
@@ -490,19 +523,28 @@ bool Marlin::load_weights(const char * path) {
     return true;
 }
 
-bool Marlin::alloc_state() {
+bool Qwen3_5::alloc_state() {
     if (!kv.alloc(backend, n_full_layers, n_kv_head, head_dim, n_ctx)) return false;
+    if (has_mtp && !mtp_kv.alloc(backend, 1, n_kv_head, head_dim, n_ctx)) return false;
     const int n_lin = n_layer - n_full_layers;
     const int conv_dim = 2 * ssm_n_group * ssm_d_state + ssm_d_inner;   // 6144
-    const int n_rec = 2 * n_lin + 8;
+    const int n_rec = 6 * n_lin + 8;   // 2 buffers x 3 rollback slots per linear layer
     struct ggml_init_params ip = { (size_t)n_rec * ggml_tensor_overhead(), NULL, true };
     sctx = ggml_init(ip);
     if (!sctx) return false;
     ssm_state.resize(n_lin);
     conv_state.resize(n_lin);
+    ssm_state_b.resize(n_lin);
+    conv_state_b.resize(n_lin);
+    ssm_state_c.resize(n_lin);
+    conv_state_c.resize(n_lin);
     for (int i = 0; i < n_lin; i++) {
         ssm_state[i] = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, ssm_d_state, ssm_d_state, ssm_dt_rank);
         conv_state[i] = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, ssm_d_conv - 1, conv_dim);
+        ssm_state_b[i] = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, ssm_d_state, ssm_d_state, ssm_dt_rank);
+        conv_state_b[i] = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, ssm_d_conv - 1, conv_dim);
+        ssm_state_c[i] = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, ssm_d_state, ssm_d_state, ssm_dt_rank);
+        conv_state_c[i] = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, ssm_d_conv - 1, conv_dim);
     }
     sbuf = ggml_backend_alloc_ctx_tensors(sctx, backend);
     if (!sbuf) { fprintf(stderr, "ssm state allocation failed\n"); return false; }
@@ -512,7 +554,7 @@ bool Marlin::alloc_state() {
     return true;
 }
 
-void Marlin::dump(const ggml_cgraph * gf, const char * name) {
+void Qwen3_5::dump(const ggml_cgraph * gf, const char * name) {
     if (dump_dir.empty()) return;
     vqa::dump::write((ggml_cgraph *)gf, dump_dir.c_str(), name);
 }
@@ -582,7 +624,7 @@ static bool marlin_vit_probe(void * ud_, const char * stage, ggml_tensor * t) {
 }
 }  // namespace
 
-bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
+bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                            int * n_tokens, int * grid, int token_budget) {
     *n_tokens = 0;
     grid[0] = grid[1] = grid[2] = 0;
@@ -600,7 +642,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
 
     long long max_pixels = media.kind == vqa::MediaKind::Video ? 200704 : 16384LL * 32 * 32;
     if (media.kind == vqa::MediaKind::Video) {
-        if (const char * e = getenv("MARLIN_VIDEO_MP"))
+        if (const char * e = getenv("QWEN35_VIDEO_MP"))
             max_pixels = (long long)(atof(e) * 1e6 + 0.5);
     }
     if (token_budget > 0) {
@@ -642,7 +684,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         const float * fs[2] = { rgb[s * vc.temporal_patch].data(), rgb[s * vc.temporal_patch + 1].data() };
         std::vector<float> p, po;
         std::vector<int> co;
-        marlin::patchify3d(fs, H, W, vc, pos_table_host.data(), p, po, co, &gh, &gw);
+        qwen3_5::patchify3d(fs, H, W, vc, pos_table_host.data(), p, po, co, &gh, &gw);
         patches.insert(patches.end(), p.begin(), p.end());
         pos.insert(pos.end(), po.begin(), po.end());
         coords.insert(coords.end(), co.begin(), co.end());
@@ -653,7 +695,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
     if (!patch_bias.empty())
         vqa::vit::fold_patch_bias(pos.data(), pos.size(), vc.n_embd, patch_bias.data());
 
-    const char * stop_after = getenv("MARLIN_STOP_AFTER");
+    const char * stop_after = getenv("QWEN35_STOP_AFTER");
 
     // ---- tower: one graph per temporal step (attention is step-local);
     // every step writes its [n_embd, hw] output into a slice of a persistent
@@ -730,7 +772,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         }
 
         int vl_max = vc.n_layer;
-        { const char * e = getenv("MARLIN_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
+        { const char * e = getenv("QWEN35_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
         MarlinVitEnv env;
         env.gctx = gctx; env.gf = gf; env.vc = &vc; env.t_vpos = t_vpos;
         env.N = Nc; env.vhd = vhd; env.stop_after = stop_s; env.state = 0;
@@ -828,7 +870,7 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
 }
 
 // ---------------------------------------------------------------- text
-bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
+bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot, bool logits_all) {
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
@@ -864,7 +906,7 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
 
     int kv_idx = 0, ssm_idx = 0;
     int max_layers = n_layer;
-    if (const char * e = getenv("MARLIN_MAX_LAYERS")) max_layers = std::min(max_layers, atoi(e));
+    if (const char * e = getenv("QWEN35_MAX_LAYERS")) max_layers = std::min(max_layers, atoi(e));
     for (int il = 0; il < max_layers; il++) {
         TxtLayer & L = tl[il];
         ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
@@ -939,13 +981,24 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
             //  result [conv_dim, T, 1])
             ggml_tensor * qkv3 = ggml_reshape_3d(g.ctx, qkv, kv_dim, T, 1);
             ggml_tensor * qkv_t = ggml_transpose(g.ctx, qkv3);              // [T, kv_dim, 1]
-            ggml_tensor * conv_st = ggml_reshape_3d(g.ctx, conv_state[si], k_conv - 1, kv_dim, 1);
+            const bool spec = logits_all && T > 1;   // speculative verify graph
+            ggml_tensor * conv_in_state = (state_slot == 1 ? conv_state_b : state_slot == 2 ? conv_state_c : conv_state)[si];
+            ggml_tensor * conv_st = ggml_reshape_3d(g.ctx, conv_in_state, k_conv - 1, kv_dim, 1);
             ggml_tensor * conv_in = ggml_concat(g.ctx, conv_st, qkv_t, 0);  // [k-1+T, kv_dim, 1]
             ggml_tensor * conv_state_last =
                 ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
                              conv_in->nb[1], conv_in->nb[2],
                              (size_t)(conv_in->ne[0] - (k_conv - 1)) * conv_in->nb[0]);
             ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, conv_state_last, conv_st));
+            if (spec) {
+                // rollback windows: state after 1 token (slot 1) and after 0 (slot 2,
+                // the untouched input state, needed when the whole draft is rejected)
+                ggml_tensor * cs1 = ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
+                                                 conv_in->nb[1], conv_in->nb[2], 1 * conv_in->nb[0]);
+                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, cs1, ggml_reshape_3d(g.ctx, conv_state_b[si], k_conv - 1, kv_dim, 1)));
+                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, conv_st,
+                                                         ggml_reshape_3d(g.ctx, conv_state_c[si], k_conv - 1, kv_dim, 1)));
+            }
             ggml_tensor * conv = ggml_ssm_conv(g.ctx, conv_in, L.la_conv1d); // [kv_dim, T, 1]
             conv = ggml_silu(g.ctx, conv);
             if (il == 0) ggml_set_name(conv, "t_l0_la_conv");
@@ -974,9 +1027,10 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
             v_conv = ggml_reshape_4d(g.ctx, v_conv, Sk, Hv, T, 1);
 
             // fused gated delta net; the result packs scores + K=1 state snapshot
-            ggml_tensor * s0 = ggml_reshape_4d(g.ctx, ssm_state[si], Sk, Sk, Hv, 1);
+            ggml_tensor * ssm_in = (state_slot == 1 ? ssm_state_b : state_slot == 2 ? ssm_state_c : ssm_state)[si];
+            ggml_tensor * s0 = ggml_reshape_4d(g.ctx, ssm_in, Sk, Sk, Hv, 1);
             ggml_tensor * res = ggml_gated_delta_net(g.ctx, q_conv, k_conv2, v_conv, gk, beta,
-                                                     s0, /*K=*/1);
+                                                     s0, /*K=*/(spec && getenv("QWEN35_SPEC_K1") == nullptr) ? 2 : 1);
             ggml_tensor * out = ggml_view_4d(g.ctx, res, Sk, Hv, T, 1,
                                              ggml_row_size(res->type, Sk),
                                              ggml_row_size(res->type, Sk * Hv),
@@ -986,6 +1040,19 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
                                                    ggml_row_size(res->type, Sk * Sk),
                                                    ggml_row_size(res->type, Sk * Hv * T));
             ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, new_state, ssm_state[si]));
+            if (spec) {
+                // snapshot layout: [scores T cols][slot0 = final][slot1 = one token back]
+                const int64_t D = Sk * Sk * Hv;
+                // packed layout: [scores T cols][slot0 S_v cols][slot1 S_v cols],
+                // each column ne0 long and consecutive columns contiguous, so a
+                // snapshot is D contiguous elements at column T + s*S_v
+                ggml_tensor * snap1 = ggml_view_3d(g.ctx, res, Sk, Sk, Hv,
+                        Sk * ggml_element_size(res), Sk * Sk * ggml_element_size(res),
+                        ggml_row_size(res->type, Sk * Hv * (T + Sk)));
+                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, snap1, ssm_state_b[si]));
+                ggml_build_forward_expand(g.gf, ggml_cpy(g.ctx, s0,
+                                                         ggml_reshape_3d(g.ctx, ssm_state_c[si], Sk, Sk, Hv)));
+            }
             if (il == 0) ggml_set_name(out, "t_l0_la_core");
 
             // gated RMSNorm over the head dim, gated by silu(z)
@@ -1017,7 +1084,9 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
     x = ggml_mul(g.ctx, x, out_norm);
     ggml_set_name(x, "t_final_norm");
 
-    if (T > 1) {
+    if (logits_all) {
+        g.logits = ggml_mul_mat(g.ctx, tok_embd, x);       // [vocab, T] speculative verify
+    } else if (T > 1) {
         ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);
         g.logits = ggml_mul_mat(g.ctx, tok_embd, last);    // tied lm head
     } else {
@@ -1036,14 +1105,15 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
     return true;
 }
 
-bool Marlin::run_text(TextGraph & g, const std::vector<int> & toks,
+bool Qwen3_5::run_text(TextGraph & g, const std::vector<int> & toks,
                       const std::vector<float> * img_feats, const std::vector<int> * img_pos,
-                      const std::vector<int> & mpos, std::vector<float> & logits_out) {
+                      const std::vector<int> & mpos, std::vector<float> & logits_out,
+                      std::vector<float> * h_last) {
     const int T = (int)toks.size();
     const int S = n_past + T;
     if (S > n_ctx) { fprintf(stderr, "context overflow (%d > %d)\n", S, n_ctx); return false; }
     const int n_img = (img_feats && img_pos) ? (int)(img_feats->size() / n_embd) : 0;
-    static const bool prof = getenv("MARLIN_PROF") != nullptr;
+    static const bool prof = getenv("QWEN35_PROF") != nullptr;
     static double tb = 0, ta = 0, tc = 0; static int ns = 0;
     auto tick = []() { return std::chrono::steady_clock::now(); };
     auto tp0 = tick();
@@ -1134,15 +1204,20 @@ bool Marlin::run_text(TextGraph & g, const std::vector<int> & toks,
 
     logits_out.resize(n_vocab);
     ggml_backend_tensor_get(g.logits, logits_out.data(), 0, sizeof(float) * n_vocab);
+    if (h_last) {
+        ggml_tensor * hn = ggml_graph_get_tensor(g.gf, "t_final_norm");
+        h_last->resize(n_embd);
+        ggml_backend_tensor_get(hn, h_last->data(), (size_t)(T - 1) * hn->nb[1], sizeof(float) * n_embd);
+    }
     n_past = S;
     ggml_free(g.ctx);
     g.ctx = nullptr;
     return true;
 }
 
-std::string Marlin::render_prompt(int n_img_tokens, const std::string & user_text, bool video) const {
+std::string Qwen3_5::render_prompt(int n_img_tokens, const std::string & user_text, bool video) const {
     // chat_template.jinja: single vision block for the whole video, plain text
-    // prompt after it (Marlin's training format; timestamps live in the mrope
+    // prompt after it (Qwen3_5's training format; timestamps live in the mrope
     // t-axis, not in the prompt text)
     std::string s = "<|im_start|>user\n";
     if (n_img_tokens > 0) {
@@ -1158,7 +1233,7 @@ std::string Marlin::render_prompt(int n_img_tokens, const std::string & user_tex
     return s;
 }
 
-int Marlin::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
+int Qwen3_5::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
     return vqa::sample_logits(logits, gp, rng_state);
 }
 
@@ -1176,7 +1251,7 @@ static std::string strip_thinking(const std::string & s) {
     return b == std::string::npos ? std::string() : out.substr(b);
 }
 
-bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
+bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
                  const std::string & mode, const vqa::GenParams & gp, std::string & out_text) {
     // the two trained skills (modeling_marlin.py canonical prompts - DO NOT EDIT):
     // "caption" ignores the user text and emits the Scene:/Events: format,
@@ -1292,13 +1367,20 @@ bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
     auto t0 = std::chrono::steady_clock::now();
     TextGraph g;
     std::vector<float> logits;
-    if (!run_text(g, ids, n_img > 0 ? &feats : nullptr, n_img > 0 ? &img_pos : nullptr, mpos, logits))
+    std::vector<float> h_seed;
+    if (!run_text(g, ids, n_img > 0 ? &feats : nullptr, n_img > 0 ? &img_pos : nullptr, mpos, logits,
+                  has_mtp ? &h_seed : nullptr))
         return false;
     auto t1 = std::chrono::steady_clock::now();
 
     std::string raw;
     int next = sample(logits, gp);
     int n_dec = 0;
+    static const bool spec_off = getenv("QWEN35_SPEC") != nullptr && !strcmp(getenv("QWEN35_SPEC"), "0");
+    if (has_mtp && !spec_off && !h_seed.empty()) {
+        if (!run_speculative(next, ids.back(), logits, h_seed.data(), max_new, gp, raw, n_dec))
+            return false;
+    } else {
     std::vector<int> step_pos(4), step_tok(1);
     for (int step = 0; step < max_new; step++) {
         if (next == id_eos || next == id_endoftext) break;
@@ -1316,6 +1398,7 @@ bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
         last_mpos = {step_pos[0], step_pos[1], step_pos[2]};
         next = sample(logits, gp);
     }
+    }   // non-speculative decode loop
     auto t2 = std::chrono::steady_clock::now();
     const double ms_prefill = std::chrono::duration<double, std::milli>(t1 - t0).count();
     const double ms_decode = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -1326,8 +1409,11 @@ bool Marlin::ask(const vqa::MediaInput & media, const std::string & prompt,
     return true;
 }
 
-}  // namespace marlin
+
+#include "qwen3_5_mtp.inc"
+
+}  // namespace qwen3_5
 
 namespace vqa {
-Model * create_marlin() { return new marlin::Marlin(); }
+Model * create_qwen3_5() { return new qwen3_5::Qwen3_5(); }
 }  // namespace vqa

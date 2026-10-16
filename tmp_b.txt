@@ -1,0 +1,8 @@
+**Photosynthesis** is the biological process by which green plants, algae, and certain bacteria convert light energy into chemical energy. This process is fundamental to life on Earth, as it produces the oxygen we breathe and forms the base of the food chain.
+
+The overall chemical equation for photosynthesis is:
+$$6CO_2 + 6H_2O + \text{Light Energy} \xrightarrow{\text{Chlorophyll}} C_6H_{12}O_6 + 6O_2$$
+
+Here is a detailed breakdown of the process, divided into its two main stages: the **Light-Dependent Reactions** and the **Light-Independent Reactions** (Calvin Cycle).
+
+

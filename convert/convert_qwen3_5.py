@@ -1,6 +1,6 @@
-"""Convert NemoStation/Marlin-2B (HF safetensors) to GGUF for the marlin backend.
+"""Convert NemoStation/Qwen3_5-2B (HF safetensors) to GGUF for the marlin backend.
 
-Marlin = Qwen3.5-2B hybrid text backbone (18 gated-delta linear-attention layers
+Qwen3_5 = Qwen3.5-2B hybrid text backbone (18 gated-delta linear-attention layers
 + 6 full-attention layers at 3,7,11,15,19,23) + Qwen3-VL style vision tower.
 
 Usage::
@@ -10,10 +10,10 @@ Usage::
 
 Checkpoint (ModelScope, no gating)::
 
-  models/Marlin-2B   (NemoStation/Marlin-2B)
+  models/Qwen3_5-2B   (NemoStation/Qwen3_5-2B)
 
 Layout notes (semantics verified against transformers 5.7 modeling_qwen3_5.py
-and llama.cpp conversion/qwen.py; see docs/dev-notes.md "Marlin-2B"):
+and llama.cpp conversion/qwen.py; see docs/dev-notes.md "Qwen3_5-2B"):
 
 * Qwen3.5 RMSNorm applies ``x * (1 + w)`` -- every text RMSNorm weight except
   the gated ``linear_attn.norm`` gets +1 at conversion time.
@@ -41,11 +41,11 @@ import _lib
 import hf_source
 from _lib import log, warn, fail, progress
 
-# accepts both Marlin-2B and the official Qwen3.5 checkpoints (identical
-# structure - Marlin is a plain SFT of Qwen3.5, tensor names unchanged)
-MODEL_ID = "NemoStation/Marlin-2B"
+# accepts both Qwen3_5-2B and the official Qwen3.5 checkpoints (identical
+# structure - Qwen3_5 is a plain SFT of Qwen3.5, tensor names unchanged)
+MODEL_ID = "NemoStation/Qwen3_5-2B"
 ALT_MODEL_IDS = ("Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-7B", "Qwen/Qwen3.5-2B-Instruct", "Qwen/Qwen3.5-7B-Instruct")
-ENV_VAR = "MARLIN_SRC"
+ENV_VAR = "QWEN35_SRC"
 PATTERNS = ("model.safetensors.index.json", "model.safetensors")
 
 # defaults from the released config.json (overridden by it when present)
@@ -212,7 +212,7 @@ def main():
     log(f"{len(weights)} tensors in the checkpoint")
 
     std = src.replace(chr(92), "/").rstrip("/").split("/")[-1]
-    gw = gguf.GGUFWriter(out, "marlin")
+    gw = gguf.GGUFWriter(out, "qwen3_5")
     gw.add_name(std)
     write_metadata(gw, text, vis, args.outtype)
 
@@ -305,6 +305,30 @@ def main():
             add_tensor(f"{b}.{suffix}", f"{p}.{hf_vision[mod]}.{leaf}")
         if not args.quiet:
             progress(i, vis["n_layer"], "vision layer", every=6)
+
+    # ---------------------------------------------------------- optional MTP head
+    # (official Qwen3.5 checkpoints ship a one-block MTP draft head; Qwen3_5's
+    # fine-tune dropped it - silently skipped when absent)
+    if "mtp.fc.weight" in weights.names():
+        log("mtp draft head")
+        add_tensor("mtp.fc", "mtp.fc.weight", quantize=True)
+        add_tensor("mtp.e_norm", "mtp.pre_fc_norm_embedding.weight", plus_one=True)
+        add_tensor("mtp.h_norm", "mtp.pre_fc_norm_hidden.weight", plus_one=True)
+        add_tensor("mtp.head_norm", "mtp.norm.weight", plus_one=True)
+        add_tensor("mtp.attn_norm", "mtp.layers.0.input_layernorm.weight", plus_one=True)
+        add_tensor("mtp.q", "mtp.layers.0.self_attn.q_proj.weight", quantize=True)
+        add_tensor("mtp.k", "mtp.layers.0.self_attn.k_proj.weight", quantize=True)
+        add_tensor("mtp.v", "mtp.layers.0.self_attn.v_proj.weight", quantize=True)
+        add_tensor("mtp.o", "mtp.layers.0.self_attn.o_proj.weight", quantize=True)
+        add_tensor("mtp.q_norm", "mtp.layers.0.self_attn.q_norm.weight", plus_one=True)
+        add_tensor("mtp.k_norm", "mtp.layers.0.self_attn.k_norm.weight", plus_one=True)
+        add_tensor("mtp.post_norm", "mtp.layers.0.post_attention_layernorm.weight", plus_one=True)
+        add_tensor("mtp.ffn_gate", "mtp.layers.0.mlp.gate_proj.weight", quantize=True)
+        add_tensor("mtp.ffn_up", "mtp.layers.0.mlp.up_proj.weight", quantize=True)
+        add_tensor("mtp.ffn_down", "mtp.layers.0.mlp.down_proj.weight", quantize=True)
+        gw.add_bool("marlin.has_mtp", True)
+    else:
+        gw.add_bool("marlin.has_mtp", False)
 
     # ---------------------------------------------------------- merger (projector)
     log("merger")
