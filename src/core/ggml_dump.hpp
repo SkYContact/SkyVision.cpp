@@ -24,6 +24,8 @@
 
 #include "ggml.h"
 
+#include <cstring>
+
 #include <cstdint>
 #include <cstdio>
 #include <string>

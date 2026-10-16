@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <functional>
 #include <cmath>
 #include <cstdio>

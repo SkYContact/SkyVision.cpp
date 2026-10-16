@@ -1,5 +1,7 @@
 #include "tokenizer.hpp"
 
+#include <cstdint>
+
 #include "unicode_ranges.inc"
 #include "vqa_util.hpp"
 
