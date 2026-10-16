@@ -109,6 +109,8 @@ def full_attn_layers(text):
     return {i for i in range(text["n_layer"]) if (i + 1) % text["full_attn_interval"] == 0}
 
 
+src_hint = "."
+
 def write_metadata(gw, text, vis, outtype):
     gw.add_architecture()   # name set by the caller from the checkpoint dir
     gw.add_file_type({
@@ -184,6 +186,8 @@ def main():
     out = args.out or f"{(src_name or 'marlin-2b').lower()}-{args.outtype}.gguf"
     src = hf_source.find_checkpoint_dir(args.src, model_id=MODEL_ID, env_var=ENV_VAR,
                                         patterns=PATTERNS)
+    global src_hint
+    src_hint = src
     log(f"source: {src}")
     log(f"output: {out} ({args.outtype})")
 
@@ -329,6 +333,15 @@ def main():
         gw.add_bool("marlin.has_mtp", True)
     else:
         gw.add_bool("marlin.has_mtp", False)
+
+    # Marlin checkpoints carry the trained caption/find skills (same engine,
+    # different fine-tune); plain Qwen3.5 does not - detected from architectures
+    try:
+        with open(os.path.join(src_hint, "config.json"), encoding="utf-8") as f:
+            archs = json.load(f).get("architectures", [])
+    except Exception:
+        archs = []
+    gw.add_bool("marlin.skills", any("Marlin" in str(x) for x in archs))
 
     # ---------------------------------------------------------- merger (projector)
     log("merger")

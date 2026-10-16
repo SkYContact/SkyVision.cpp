@@ -158,6 +158,7 @@ private:
     vqa::KvCache kv;                     // 6 full-attention layers only
     // speculative MTP head (official Qwen3.5 checkpoints; see dev-notes)
     bool has_mtp = false;
+    bool marlin_skills = false;   // trained caption/find skills (Marlin fine-tunes only)
     ggml_tensor *mtp_fc = nullptr, *mtp_e_norm = nullptr, *mtp_h_norm = nullptr;
     ggml_tensor *mtp_head_norm = nullptr, *mtp_attn_norm = nullptr, *mtp_post_norm = nullptr;
     ggml_tensor *mtp_q = nullptr, *mtp_k = nullptr, *mtp_v = nullptr, *mtp_o = nullptr;
@@ -343,6 +344,7 @@ bool Qwen3_5::load_weights(const char * path) {
     vc.rope_theta = gguf_f32(gu, "marlin.vision.rope_theta", vc.rope_theta);
     vc.out_hidden = gguf_u32(gu, "marlin.vision.out_hidden_size", vc.out_hidden);
     has_mtp = gguf_u32(gu, "marlin.has_mtp", 0) != 0;
+    marlin_skills = gguf_u32(gu, "marlin.skills", 0) != 0;
     id_image_pad = gguf_u32(gu, "marlin.image_token_id", id_image_pad);
     id_video_pad = gguf_u32(gu, "marlin.video_token_id", id_video_pad);
     id_vision_start = gguf_u32(gu, "marlin.vision_start_token_id", id_vision_start);
@@ -1311,8 +1313,8 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
         "Provide a spatial description of this clip followed by time-ranged events.\n"
         "For each event, give the time range as <start - end> and a short description.";
     std::string prompt_eff = prompt;
-    if (mode == "caption") prompt_eff = CAPTION_PROMPT;
-    else if (mode == "find")
+    if (mode == "caption" && marlin_skills) prompt_eff = CAPTION_PROMPT;
+    else if (mode == "find" && marlin_skills)
         prompt_eff = "Identify the timestamps during which \"" + prompt + "\" takes place. "
                      "Output the time range as \"From <start> to <end>.\" (numbers in seconds).";
     const std::string & user_text = prompt_eff;
