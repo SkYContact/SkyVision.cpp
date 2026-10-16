@@ -60,6 +60,10 @@
     输入源：视频文件路径 / 摄像头（Windows 填 <code>video=摄像头名</code>）/ 流 URL。模型按节奏观察新画面，
     有值得说的会自己开口，没话说会保持沉默（&lt;|silence|&gt;）；随时可以插话提问。
   </div>
+  <label id="rtdrop" for="rtfile" style="display:block;border:2px dashed #333a48;border-radius:10px;padding:12px;text-align:center;color:#7d8798;cursor:pointer;font-size:13px;margin-bottom:10px">
+    或上传本地视频当实时流（测试用，按真实速度播放）— 点击选择
+  </label>
+  <input type="file" id="rtfile" accept="video/*" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden">
   <div class="row">
     <input type="text" id="src" placeholder="src：如 D:\clips\demo.mp4 或 video=USB Camera">
     <select id="interval">
@@ -80,6 +84,15 @@
 <script>
 const MODEL = '__MODEL_ID__';
 const $ = id => document.getElementById(id);
+let rtBlob = null;
+$('rtfile').onchange = () => {
+  const f = $('rtfile').files[0];
+  if (!f) return;
+  rtBlob = f;
+  $('rtdrop').textContent = f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB) — 已选为实时流源，点击替换';
+  $('src').value = '';
+};
+$('src').oninput = () => { rtBlob = null; $('rtdrop').textContent = '或上传本地视频当实时流（测试用，按真实速度播放）— 点击选择'; };
 
 /* ---------------- single-shot QA (with optional rt session) ---------------- */
 const drop = $('drop'), file = $('file');
@@ -192,7 +205,7 @@ async function poll() {
 
 $('rtgo').onclick = async () => {
   const src = $('src').value.trim();
-  if (!src) { $('rtstatus').textContent = '请先填入视频源'; return; }
+  if (!src && !rtBlob) { $('rtstatus').textContent = '请先填入视频源或上传视频'; return; }
   $('rtgo').disabled = true;
   $('rtstatus').textContent = '启动中（加载模型 + 打开视频源）…';
   try {
@@ -202,12 +215,13 @@ $('rtgo').onclick = async () => {
     rtSess = 'rt' + Date.now();   // fresh engine session each start
     since = 0;
     r = await fetch('/api/model/' + encodeURIComponent(MODEL) +
-        '/rt/start?session=' + rtSess + '&src=' + encodeURIComponent(src) + '&interval=' + interval, { method: 'POST' });
+        '/rt/start?session=' + rtSess + (src ? '&src=' + encodeURIComponent(src) : '') + '&interval=' + interval,
+        { method: 'POST', body: rtBlob || new Uint8Array(0) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || 'start failed');
     $('rtstop').disabled = $('say').disabled = false;
     $('rtstatus').textContent = '流运行中：' + src;
-    meta('▶ 开始观察 ' + src);
+    meta('▶ 开始观察 ' + (rtBlob ? rtBlob.name : src));
     poller = setInterval(poll, 1000);
   } catch (e) {
     $('rtstatus').textContent = '';

@@ -445,7 +445,11 @@ void discover_models() {
     for (auto & f : files) {
         std::string arch, ftype;
         if (!gguf_arch_of(g_models_dir + "/" + f, arch, ftype)) continue;
-        std::string tok = resolve_tokenizer(arch);
+        // per-model tokenizer wins: models/<gguf-stem>/tokenizer.json (the
+        // generic resolver can pick a same-vocab sibling whose added tokens
+        // differ - moss_vl's <|image_pad|>/<|silence|> only exist in its own)
+        std::string own = std::string("models/") + stem_of(f) + "/tokenizer.json";
+        std::string tok = file_exists(own) ? own : resolve_tokenizer(arch);
         if (!g_tokenizer.empty()) tok = g_tokenizer;
         if (arch == "moondream3") {
             if (vision_path.empty() || !file_exists(tok)) {
@@ -543,8 +547,17 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 std::string err;
                 if (!ensure_loaded(*e, err)) { send_error(c, err); return true; }
                 g_loaded->session_reset();   // a new stream always starts fresh
-                const std::string src = query_param(req.query, "src");
-                if (src.empty()) { send_error(c, "need ?src=<camera|path|url>"); return true; }
+                std::string src = query_param(req.query, "src");
+                if (src.empty() && !req.body.empty()) {
+                    // uploaded video = the stream itself (plays in realtime with -re)
+                    static std::string up = "rt_upload.tmp";
+                    FILE * f = fopen(up.c_str(), "wb");
+                    if (!f) { send_error(c, "cannot write upload"); return true; }
+                    fwrite(req.body.data(), 1, req.body.size(), f);
+                    fclose(f);
+                    src = up;
+                }
+                if (src.empty()) { send_error(c, "need ?src=<camera|path|url> or a video body"); return true; }
                 double interval = atof(query_param(req.query, "interval").c_str());
                 int fpt = atoi(query_param(req.query, "frames").c_str());
                 std::string rerr;
