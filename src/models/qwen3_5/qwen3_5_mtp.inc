@@ -27,7 +27,7 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     const int blk = std::min(vqa::block_for(slot + 1), n_ctx);
     const int D = n_embd, HD = head_dim, NH = n_head, NKV = n_kv_head;
     SpecCache & c = spec_d;
-    ggml_tensor * t_tok, * t_h, * t_mpos, * t_mask, * logits, * h_out_t;
+    ggml_tensor * t_tok, * t_h, * t_mpos, * t_mask, * logits, * h_out_t, * t_am;
     if (c.blk == blk && c.gf) {
         t_tok   = ggml_graph_get_tensor(c.gf, "dt_tok");
         t_h     = ggml_graph_get_tensor(c.gf, "dt_h");
@@ -35,7 +35,8 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
         t_mask  = ggml_graph_get_tensor(c.gf, "dt_mask");
         logits  = ggml_graph_get_tensor(c.gf, "mtp_logits");
         h_out_t = ggml_graph_get_tensor(c.gf, "mtp_h");
-        if (!t_tok || !t_h || !t_mpos || !t_mask || !logits || !h_out_t) return -1;
+        t_am    = ggml_graph_get_tensor(c.gf, "dt_am");
+        if (!t_tok || !t_h || !t_mpos || !t_mask || !logits || !h_out_t || !t_am) return -1;
     } else {
         if (c.ctx) ggml_free(c.ctx);
         struct ggml_init_params ip = { 32ull * 1024 * 1024, NULL, /*no_alloc*/ true };
@@ -99,8 +100,16 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     ggml_set_name(h_out_t, "mtp_h");
     logits = ggml_mul_mat(ctx, tok_embd, h_out_t);
     ggml_set_name(logits, "mtp_logits");
+    // argmax on the device: the round loop only consumes the drafted token id,
+    // so the [n_vocab] logits never cross back to the host (600+ KB of D2H per
+    // draft step used to dominate the round)
+    ggml_tensor * am = ggml_argmax(ctx, logits);
+    ggml_set_name(am, "dt_am");
+    t_am = am;
     ggml_build_forward_expand(gf, logits);
-        if (!ggml_gallocr_alloc_graph(allocr, gf)) { ggml_free(ctx); c.ctx = nullptr; c.blk = -1; return -1; }
+    ggml_build_forward_expand(gf, am);
+        if (!c.alloc) c.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(c.alloc, gf)) { ggml_free(ctx); c.ctx = nullptr; c.blk = -1; return -1; }
     }
     ggml_backend_tensor_set(t_tok, &tok, 0, sizeof(int));
     ggml_backend_tensor_set(t_h, h, 0, sizeof(float) * D);
@@ -108,19 +117,20 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     ggml_backend_tensor_set(t_mpos, mpos, 0, sizeof(mpos));
     vqa::set_causal_mask(t_mask, slot, 1);
     if (ggml_backend_graph_compute(backend, c.gf) != GGML_STATUS_SUCCESS) return -1;
-    logits_out.resize(n_vocab);
     h_out.resize(D);
-    ggml_backend_tensor_get(logits, logits_out.data(), 0, sizeof(float) * n_vocab);
     ggml_backend_tensor_get(h_out_t, h_out.data(), 0, sizeof(float) * D);
-    int best = 0;
-    for (int i = 1; i < n_vocab; i++) if (logits_out[i] > logits_out[best]) best = i;
+    int best = -1;
+    ggml_backend_tensor_get(t_am, &best, 0, sizeof(int));
     return best;
 }
 
 // verify forward: target over the two drafted tokens; returns logits for both
 // positions [2][n_vocab] and the hidden after both (next draft seed).
-bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot, std::vector<float> & logits2, std::vector<float> & h_out) {
+bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot, std::vector<float> & logits2, std::vector<float> & h_out, int am_out[2]) {
     static const char * const sdump = getenv("QWEN35_SPEC_DUMP");
+    // full-logits readback is debug-only: the accept decision needs just the
+    // two per-column argmaxes, computed in-graph (2 ints instead of 2*n_vocab)
+    static const bool want_logits = getenv("QWEN35_SPEC_TRACE") || getenv("QWEN35_SPEC_LIVECHK") || getenv("QWEN35_SPEC_SELFTEST");
     static const char * const dump_names[] = {
         "emb", "t_l0_la_qkv", "t_l0_la_z", "t_l0_la_conv", "t_l0_la_core",
         "t_l0_out", "t_final_norm", nullptr,
@@ -136,7 +146,16 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
         TextGraph g;
         if (!build_text_graph(g, T, S, 0, state_slot, /*logits_all*/ true)) return false;
         if (sdump) vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
-        if (!ggml_gallocr_alloc_graph(allocr, g.gf)) { ggml_free(g.ctx); return false; }
+        // per-column argmax of the [n_vocab, T] logits, kept on the device
+        // (must be expanded BEFORE gallocr_alloc, or its output never lands
+        // in a buffer and the kernel writes through a null pointer)
+        if (!want_logits) {
+            c.am = ggml_argmax(g.ctx, g.logits);
+            ggml_set_name(c.am, "v_am");
+            ggml_build_forward_expand(g.gf, c.am);
+        }
+        if (!c.alloc) c.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(c.alloc, g.gf)) { ggml_free(g.ctx); return false; }
         c.ctx = g.ctx; c.gf = g.gf; c.blk = S; c.slot = state_slot;
         c.tok = g.tok_in; c.mpos = g.mpos_in; c.mask = g.mask_in; c.logits = g.logits;
         c.hout = ggml_graph_get_tensor(g.gf, "t_final_norm");
@@ -151,8 +170,20 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
     ggml_backend_tensor_set(g_mpos, mpos, 0, sizeof(mpos));
     vqa::set_causal_mask(g_mask, n_past, T);
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) return false;
-    logits2.resize((size_t)2 * n_vocab);
-    ggml_backend_tensor_get(g_logits, logits2.data(), 0, sizeof(float) * logits2.size());
+    int am[2] = { 0, 0 };
+    if (c.am) {
+        ggml_backend_tensor_get(c.am, am, 0, sizeof(am));
+    } else {
+        logits2.resize((size_t)2 * n_vocab);
+        ggml_backend_tensor_get(g_logits, logits2.data(), 0, sizeof(float) * logits2.size());
+        for (int i = 1; i < n_vocab; i++) { if (logits2[i] > logits2[am[0]]) am[0] = i; if (logits2[n_vocab + i] > logits2[n_vocab + am[1]]) am[1] = i; }
+    }
+    if (am_out) { am_out[0] = am[0]; am_out[1] = am[1]; }
+    if (want_logits) {
+        if (logits2.empty()) { logits2.resize((size_t)2 * n_vocab); ggml_backend_tensor_get(g_logits, logits2.data(), 0, sizeof(float) * logits2.size()); }
+    } else {
+        logits2.clear();
+    }
     h_out.resize((size_t)2 * n_embd);   // col0 = after one token, col1 = after both
     ggml_backend_tensor_get(g_hn, h_out.data(), 0, sizeof(float) * 2 * n_embd);
     if (sdump) {
@@ -488,7 +519,8 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
                 ggml_backend_tensor_get((state_slot == 1 ? conv_state_b : conv_state)[i], cv_main[i].data(), 0, cv_main[i].size());
             }
         }
-        if (!mtp_verify(toks, write_base, cur + 1, state_slot, L2, h_d)) return false;
+        int v_am[2] = { -1, -1 };
+        if (!mtp_verify(toks, write_base, cur + 1, state_slot, L2, h_d, v_am)) return false;
         // snapshot verify's persistent writes for the state comparison below
         std::vector<std::vector<char>> sv_post, cv_post, kv_post;
         if (do_chk) {
@@ -573,10 +605,13 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             fprintf(stderr, "[livechk]     state: ssm=%.3e conv=%.3e | KV k=%.3e v=%.3e\n", ws, wc2, wk, wv);
             // continue on the reference chain (identical if verify is exact)
         }
-        const float * L1 = L2.data();
-        const float * L2c = L2.data() + n_vocab;
-        int g1 = 0;
-        for (int i = 1; i < n_vocab; i++) if (L1[i] > L1[g1]) g1 = i;
+        // fast path: the two argmaxes come from the verify graph (device-side);
+        // the full-logits CPU argmax only exists under the debug switches
+        const bool have_logits = (int)L2.size() == 2 * n_vocab;
+        const float * L1 = have_logits ? L2.data() : nullptr;
+        const float * L2c = have_logits ? L2.data() + n_vocab : nullptr;
+        int g1 = v_am[0];
+        if (have_logits) { g1 = 0; for (int i = 1; i < n_vocab; i++) if (L1[i] > L1[g1]) g1 = i; }
         if (trace) fprintf(stderr, "[trace] r%ld wb=%d cur=%d slot=%d seed=%d pend=%d d1=%d g1=%d",
                            rounds, write_base, cur, state_slot, seed_tok, pending, d1, g1);
         // emit the (already validated) token
@@ -593,15 +628,17 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             raw += p2;
             if (gp.on_token) gp.on_token(p2.c_str(), gp.on_token_ud);
             n_dec++; accepted++;
-            int g2 = 0;
-            for (int i = 1; i < n_vocab; i++) if (L2c[i] > L2c[g2]) g2 = i;
+            int g2 = v_am[1];
+            if (have_logits) { g2 = 0; for (int i = 1; i < n_vocab; i++) if (L2c[i] > L2c[g2]) g2 = i; }
             if (trace) fprintf(stderr, " ACC d1=%d g2=%d", d1, g2);
-            seed_tok = d1; pending = g2; L_prev.assign(L2c, L2c + n_vocab);
+            seed_tok = d1; pending = g2;
+            if (have_logits) L_prev.assign(L2c, L2c + n_vocab);
             h.assign(h_d.begin() + n_embd, h_d.end());
             state_slot = 0; write_base += 2; cur += 2;
         } else {
             // rollback keeps the state after `pending`: that IS the new seed
-            seed_tok = pending; pending = g1; L_prev.assign(L1, L1 + n_vocab);
+            seed_tok = pending; pending = g1;
+            if (have_logits) L_prev.assign(L1, L1 + n_vocab);
             h.assign(h_d.begin(), h_d.begin() + n_embd);
             state_slot = 1; write_base += 1; cur += 1;
         }

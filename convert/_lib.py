@@ -20,6 +20,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import struct
 import sys
 
 import numpy as np
@@ -27,7 +28,44 @@ import gguf
 from gguf import quants
 from safetensors import safe_open
 
+try:
+    import torch  # optional: faster tensor decode; numpy fallback below
+except ImportError:
+    torch = None
+
 LOG_PREFIX = "[convert]"
+
+class _RawSafetensors:
+    """Minimal torch-free safetensors reader decoding bf16/fp16 to float32."""
+
+    _DT = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32,
+           "I64": np.int64, "I32": np.int32, "U8": np.uint8, "U16": np.uint16,
+           "U32": np.uint32, "I8": np.int8, "U64": np.uint64, "F64": np.float64,
+           "BOOL": np.uint8}
+
+    def __init__(self, path):
+        self._m = open(path, "rb").read()
+        n = struct.unpack("<Q", self._m[:8])[0]
+        self.meta = json.loads(self._m[8:8 + n])
+        self._base = 8 + n
+
+    def keys(self):
+        return [k for k in self.meta if k != "__metadata__"]
+
+    def __contains__(self, name):
+        return name in self.meta
+
+    def get(self, name):
+        e = self.meta[name]
+        dt, shape = e["dtype"], e["shape"]
+        s, t = self._base + e["data_offsets"][0], self._base + e["data_offsets"][1]
+        raw = self._m[s:t]
+        arr = np.frombuffer(raw, dtype=self._DT[dt]).reshape(shape)
+        if dt == "BF16":
+            arr = (arr.astype(np.uint32) << np.uint32(16)).view(np.float32)
+        elif dt == "F16":
+            arr = arr.astype(np.float32)
+        return arr
 
 
 def log(msg: str) -> None:
@@ -107,7 +145,11 @@ class TensorSource:
             os.path.basename(p) for p in glob.glob(os.path.join(self.dir, "*.safetensors")))
         if not files:
             fail(f"no *.safetensors found in {self.dir}")
-        self.handles = {f: safe_open(os.path.join(self.dir, f), framework="pt") for f in files}
+        if torch is not None:
+            self.handles = {f: safe_open(os.path.join(self.dir, f), framework="pt") for f in files}
+        else:
+            # torch-free path: raw safetensors reader (safetensors-np rejects bf16)
+            self.handles = {f: _RawSafetensors(os.path.join(self.dir, f)) for f in files}
         self.files = files
 
     def __len__(self) -> int:
@@ -136,4 +178,6 @@ class TensorSource:
         else:
             handle = next(h for h in self.handles.values() if name in h.keys())
         # framework="pt" always hands back a torch tensor (bf16/fp16 included)
-        return handle.get_tensor(name).to("cpu").float().numpy().astype(dtype, copy=False)
+        if torch is not None:
+            return handle.get_tensor(name).to("cpu").float().numpy().astype(dtype, copy=False)
+        return handle.get(name).astype(dtype, copy=False)

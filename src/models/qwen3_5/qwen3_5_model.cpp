@@ -110,7 +110,7 @@ private:
     int mtp_draft_step(int tok, const float * h, int slot, int axis,
                        std::vector<float> & logits_out, std::vector<float> & h_out);
     bool mtp_verify(const int * toks, int n_past, int axis0, int state_slot,
-                    std::vector<float> & logits2, std::vector<float> & h_out);
+                    std::vector<float> & logits2, std::vector<float> & h_out, int am_out[2] = nullptr);
     bool run_speculative(int next, int seed0, const std::vector<float> & logits_prev, float * h_seed,
                          int max_new, const vqa::GenParams & gp, std::string & raw, int & n_dec);
     bool run_text(TextGraph & g, const std::vector<int> & toks,
@@ -196,6 +196,12 @@ private:
         int blk = -1, slot = -1;
         ggml_tensor * tok = nullptr, * mpos = nullptr, * mask = nullptr;
         ggml_tensor * logits = nullptr, * hout = nullptr;
+        ggml_tensor * am = nullptr;          // per-column argmax (I32), device-side
+        // dedicated gallocr: a shared allocr re-reserves (and can relocate) its
+        // buffer whenever a BIGGER graph is allocated, dangling every pointer
+        // of the graphs allocated before it - hit as a segfault in tensor_set
+        // on the second spec round when the T=2 verify graph outgrew the draft
+        ggml_gallocr_t alloc = nullptr;
     };
     SpecCache spec_v[2];
     SpecCache spec_d;
@@ -241,8 +247,12 @@ static float randf_(uint64_t & s) {
 
 Qwen3_5::~Qwen3_5() {
     if (dec_ctx) ggml_free(dec_ctx);
-    for (auto & c : spec_v) if (c.ctx) ggml_free(c.ctx);
+    for (auto & c : spec_v) {
+        if (c.ctx) ggml_free(c.ctx);
+        if (c.alloc) ggml_gallocr_free(c.alloc);
+    }
     if (spec_d.ctx) ggml_free(spec_d.ctx);
+    if (spec_d.alloc) ggml_gallocr_free(spec_d.alloc);
     if (sctx) ggml_free(sctx);
     if (sbuf) ggml_backend_buffer_free(sbuf);
     kv.free();
@@ -972,7 +982,11 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
             ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[ki], HD, S, NKV,
                                             kv.v[ki]->nb[1], HD * sizeof(ggml_fp16_t), 0);
             ggml_tensor * attn = nullptr;
-            if (logits_all && T > 1) {
+            // QWEN35_SPEC_FUSED=1: verify uses ONE fused T=2 flash-attn call
+            // (the mma-f16 kernel, ~2% logits drift vs the vector kernel) —
+            // trades bit-exactness vs plain decode for per-round latency
+            static const bool spec_fused_fa = getenv("QWEN35_SPEC_FUSED") != nullptr;
+            if (logits_all && T > 1 && !spec_fused_fa) {
                 // speculative verify: run flash attention PER TOKEN (T=1
                 // queries) instead of one fused T=2 call. The fused call
                 // lands on the mma-f16 kernel whose f16 Q*K costs ~2% logits
