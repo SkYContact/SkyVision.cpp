@@ -97,6 +97,7 @@ public:
 // Backend factories (one per architecture).
 Model * create_moondream();
 Model * create_videochat3();
+Model * create_marlin();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);

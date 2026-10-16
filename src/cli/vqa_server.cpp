@@ -109,7 +109,7 @@ std::string resolve_tokenizer(const std::string & arch) {
         FindClose(hd);
     }
 #endif
-    const bool need_qwen = arch == "videochat3";
+    const bool need_qwen = arch == "videochat3" || arch == "marlin";
     for (auto & c : cands) {
         FILE * f = fopen(c.c_str(), "rb");
         if (!f) continue;
@@ -159,7 +159,7 @@ void discover_models() {
                         vision_path.empty() ? "*-vision.gguf" : "tokenizer.json");
                 continue;
             }
-        } else if (arch == "videochat3") {
+        } else if (arch == "videochat3" || arch == "marlin") {
             if (!file_exists(tok)) {
                 fprintf(stderr, "serve: skip %s (needs tokenizer.json)\n", f.c_str());
                 continue;

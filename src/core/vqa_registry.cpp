@@ -59,6 +59,7 @@ namespace vqa {
 
 Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
+    if (arch == "marlin") return create_marlin();
     if (arch == "moondream3") return create_moondream();
     return nullptr;
 }
