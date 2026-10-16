@@ -495,8 +495,50 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
         }
         return false;
     }
+    // Adaptive drafting, llama.cpp speculative-style n_min/p_min gating: when
+    // the recent double-hit rate drops too low, a plain T=1 decode round is
+    // cheaper than paying the T=2 verify for a likely single-token round. The
+    // floor is therefore base speed, and every PROBE_INTERVAL plain rounds a
+    // real spec round re-measures acceptance so recovery is picked up.
+    double ema = 0.5;                 // EMA of per-round double-hit
+    int plain_streak = 0;
+    int plain_streak_total = 0;
+    const double ema_min = getenv("QWEN35_SPEC_EMA_MIN") ? atof(getenv("QWEN35_SPEC_EMA_MIN")) : 0.30;
+    const int probe_interval = getenv("QWEN35_SPEC_PROBE") ? atoi(getenv("QWEN35_SPEC_PROBE")) : 32;
+    TextGraph g_plain;
     while (n_dec < max_new) {
         if (pending == id_eos || pending == id_endoftext) break;
+        if (ema < ema_min && plain_streak < probe_interval) {
+            // plain round: process `pending` through the static decode path.
+            // after a reject the live SSM/conv state lives in the slot-b
+            // rollback tensors (state_slot == 1); the static graph only reads
+            // the main states, so restore them first or the round continues
+            // from a stale state and the text degenerates
+            if (state_slot == 1) {
+                const int n_linp = n_layer - n_full_layers;
+                for (int i = 0; i < n_linp; i++) {
+                    ggml_backend_tensor_copy(ssm_state_b[i], ssm_state[i]);
+                    ggml_backend_tensor_copy(conv_state_b[i], conv_state[i]);
+                }
+            }
+            std::vector<float> Lp(n_vocab), hp(n_embd);
+            std::vector<int> pp = { cur + 1, cur + 1, cur + 1, write_base };
+            n_past = write_base;    // run_text's static path derives the KV
+                                    // window + mask base from the member
+            if (!run_text(g_plain, { pending }, nullptr, nullptr, pp, Lp, &hp)) return false;
+            const std::string piece = tok_.decode({pending});
+            raw += piece;
+            if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+            n_dec++; rounds++;
+            int gn = 0;
+            for (int i = 1; i < n_vocab; i++) if (Lp[i] > Lp[gn]) gn = i;
+            seed_tok = pending; pending = gn;
+            h.assign(hp.begin(), hp.end());
+            state_slot = 0; write_base += 1; cur += 1;
+            plain_streak++; plain_streak_total++;
+            continue;
+        }
+        plain_streak = 0;
         // two-step MTP recursion: step 1 predicts the PENDING position (already
         // decided - only its hidden feeds the chain), step 2 predicts d1
         const int d0 = mtp_draft_step(seed_tok, h.data(), write_base, cur + 1, dlog, dh);
@@ -635,18 +677,20 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             if (have_logits) L_prev.assign(L2c, L2c + n_vocab);
             h.assign(h_d.begin() + n_embd, h_d.end());
             state_slot = 0; write_base += 2; cur += 2;
+            ema = 0.8 * ema + 0.2;
         } else {
             // rollback keeps the state after `pending`: that IS the new seed
             seed_tok = pending; pending = g1;
             if (have_logits) L_prev.assign(L1, L1 + n_vocab);
             h.assign(h_d.begin(), h_d.begin() + n_embd);
             state_slot = 1; write_base += 1; cur += 1;
+            ema = 0.8 * ema;
         }
     }
     n_past = write_base;
     last_mpos = { cur, cur, cur };
-    fprintf(stderr, "[spec] %d rounds, %ld double-hits (%.0f%%), %d tokens, %.1f tok/round\n",
-            (int)rounds, accepted, rounds ? 100.0 * accepted / rounds : 0.0f, n_dec,
+    fprintf(stderr, "[spec] %d rounds (%d plain), %ld double-hits (%.0f%%), %d tokens, %.1f tok/round\n",
+            (int)rounds, plain_streak_total, accepted, rounds ? 100.0 * accepted / rounds : 0.0f, n_dec,
             rounds ? (double)n_dec / rounds : 0.0);
     return true;
 }
