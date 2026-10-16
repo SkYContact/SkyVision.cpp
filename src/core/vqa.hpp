@@ -94,6 +94,16 @@ public:
                      const std::string & mode, const GenParams & gp,
                      std::string & out_text) = 0;
 
+    // Realtime streaming session: like ask(), but turn 1 establishes a live
+    // session and later turns append frames/prompts incrementally onto the
+    // KV caches (no full-context rebuild). Backends without session support
+    // fall back to plain ask(). session_reset() drops the live state.
+    virtual bool ask_session(const MediaInput & media, const std::string & prompt,
+                             const GenParams & gp, std::string & out_text) {
+        return ask(media, prompt, "", gp, out_text);
+    }
+    virtual void session_reset() {}
+
     // batched text-only decode driver (one prompt per line); -1 = unsupported
     virtual int run_batch(const std::string & batch_path, int n_gen) { (void)batch_path; (void)n_gen; return -1; }
 };

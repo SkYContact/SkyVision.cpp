@@ -182,6 +182,9 @@ public:
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override;
     const vqa::Capabilities & caps() const override { return caps_; }
     const char * name() const override { return "moss-vl-realtime"; }
+    bool ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                     const vqa::GenParams & gp, std::string & out_text) override;
+    void session_reset() override { sess_active = false; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
 
@@ -201,10 +204,13 @@ private:
     bool build_prompt(const vqa::MediaInput & media, const std::string & user_text,
                       const std::vector<int> & grids, PromptPlan & plan,
                       const std::string & history = "");
+    bool plan_from_text(const std::string & text, const std::vector<int> & grids,
+                        PromptPlan & plan, int pos_base = 0, int slot_base = 0, int v_base = 0);
     bool encode_vision(const std::vector<float> & patches, const std::vector<float> & pos,
                        const std::vector<int> & vpos, int N, std::vector<float> & merged,
                        const PromptPlan * plan = nullptr);   // plan != null: also project cross-KV in-graph
-    bool project_cross_kv(const std::vector<float> & merged, const PromptPlan & plan);
+    bool project_cross_kv(const std::vector<float> & merged, const PromptPlan & plan,
+                          int row_base = 0);
     // appends the fused cross-KV projection chain onto a graph; cs is the
     // [out_hidden, V] cross-state input (host tensor or in-graph concat)
     bool append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor * cs,
@@ -275,6 +281,12 @@ private:
 
     int id_image_pad = 151655, id_vision_start = 151652, id_vision_end = 151653;
     int id_im_start = 151644, id_im_end = 151645, id_eos = 151645, id_endoftext = 151643;
+    int id_silence = -1;
+    // live realtime session state (ask_session): text KV keeps growing via
+    // n_past/rope_delta, cross-KV rows via sess_vrows
+    bool sess_active = false;
+    int sess_vrows = 0;
+    PromptPlan sess_plan;
     int id_time_start = 151669, id_time_end = 151670;
 
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
@@ -371,6 +383,7 @@ bool MossVL::load(const std::string & gguf_path, const std::string & tokenizer_p
     id_vision_end = pick("<|vision_end|>", id_vision_end);
     id_im_start = pick("<|im_start|>", id_im_start);
     id_im_end = pick("<|im_end|>", id_im_end);
+    id_silence = tok_.id_of("<|silence|>");
     id_time_start = pick("<|time_start|>", id_time_start);
     id_time_end = pick("<|time_end|>", id_time_end);
     id_eos = id_im_end;
@@ -754,7 +767,18 @@ bool MossVL::build_prompt(const vqa::MediaInput & media, const std::string & use
     }
     text += user_text;
     text += "<|im_end|>\n<|im_start|>assistant\n";
+    return plan_from_text(text, grids, plan);
+}
 
+// turn `text` (already formatted, image_pad placeholders for F frames given by
+// `grids`) into a PromptPlan. The *_base offsets support incremental session
+// turns appended onto live KV caches:
+//   pos_base  - mrope position of the segment's first regular token
+//   slot_base - self-attn KV slot of the segment's first token
+//   v_base    - cross-KV rows already used by earlier turns
+bool MossVL::plan_from_text(const std::string & text, const std::vector<int> & grids,
+                            PromptPlan & plan, int pos_base, int slot_base, int v_base) {
+    const int F = (int)grids.size() / 2;
     plan.ids = tok_.encode(text);
     std::vector<int> pads;
     for (int i = 0; i < (int)plan.ids.size(); i++)
@@ -768,16 +792,16 @@ bool MossVL::build_prompt(const vqa::MediaInput & media, const std::string & use
     const int T = (int)plan.ids.size();
     plan.frames.resize(F);
     plan.colmask.assign(T, 0.0f);
-    plan.n_vtot = 0;
-    int cum_shift = 0;
+    plan.n_vtot = v_base;
+    int cs = 0;   // cs_start stays LOCAL to this segment (cross-KV mpos index)
     for (int k = 0; k < F; k++) {
         FrameMeta & fm = plan.frames[k];
         fm.eh = grids[k * 2 + 0];
         fm.ew = grids[k * 2 + 1];
         fm.tpf = fm.eh * fm.ew;
-        fm.cs_start = plan.n_vtot;
+        fm.cs_start = cs;
+        cs += fm.tpf + 1;
         plan.n_vtot += fm.tpf + 1;
-        cum_shift += std::max(fm.eh, fm.ew) + 1;
     }
 
     // base position = count of regular tokens before i; image_pad rows sit one
@@ -790,7 +814,7 @@ bool MossVL::build_prompt(const vqa::MediaInput & media, const std::string & use
     {
         int shift = 0;
         for (int k = 0; k < F; k++) {
-            plan.frames[k].t0 = (float)(base[pads[k]] + shift);
+            plan.frames[k].t0 = (float)(pos_base + base[pads[k]] + shift);
             shift += std::max(plan.frames[k].eh, plan.frames[k].ew) + 1;
         }
     }
@@ -800,30 +824,39 @@ bool MossVL::build_prompt(const vqa::MediaInput & media, const std::string & use
         int shift = 0;
         for (int k = 0; k < F; k++)
             if (pads[k] <= i) shift += std::max(plan.frames[k].eh, plan.frames[k].ew) + 1;
-        int pos = base[i] + shift;
+        int pos = pos_base + base[i] + shift;
         if (plan.ids[i] == id_image_pad) pos -= 1;
         // ggml mrope PLANAR layout: [t(T), h(T), w(T), e(T), slot(T)]
         for (int a = 0; a < 4; a++) plan.mpos[(size_t)a * T + i] = pos;
-        plan.mpos[(size_t)4 * T + i] = i;   // self-attn KV slot (sequential)
+        plan.mpos[(size_t)4 * T + i] = slot_base + i;   // self-attn KV slot
         if (pos > last_pos) last_pos = pos;
     }
-    plan.rope_delta = last_pos + 1 - T;
-    // rows from the first image_pad onward see at least one frame
-    for (int i = 0, k = 0; i < T; i++) {
-        while (k < F && pads[k] == i) k++;
-        plan.colmask[i] = k > 0 ? 1.0f : 0.0f;
+    // delta maps a follow-up decode slot to its mrope position: the token right
+    // after this segment sits at slot slot_base+T with position last_pos+1
+    plan.rope_delta = last_pos + 1 - (slot_base + T);
+    // rows from the first image_pad onward see at least one frame (earlier
+    // turns' frames count when appending)
+    if (v_base > 0 && F == 0) {
+        std::fill(plan.colmask.begin(), plan.colmask.end(), 1.0f);
+    } else {
+        for (int i = 0, k = 0; i < T; i++) {
+            while (k < F && pads[k] == i) k++;
+            plan.colmask[i] = (k > 0 || v_base > 0) ? 1.0f : 0.0f;
+        }
     }
-    // prefill segments: rows before pad_0 see nothing; rows [pad_k, pad_{k+1})
-    // see k+1 frames
+    // prefill segments: rows before pad_0 see what earlier turns had; rows
+    // [pad_k, pad_{k+1}) see v_base + k+1 new frames
     plan.segments.clear();
     if (F > 0) {
-        if (pads[0] > 0) plan.segments.push_back({0, pads[0], 0});
+        if (pads[0] > 0) plan.segments.push_back({0, pads[0], v_base});
         for (int k = 0; k < F; k++) {
             const int end = k + 1 < F ? pads[k + 1] : T;
-            int v_end = 0;
+            int v_end = v_base;
             for (int j = 0; j <= k; j++) v_end += plan.frames[j].tpf + 1;
             plan.segments.push_back({pads[k], end - pads[k], v_end});
         }
+    } else if (v_base > 0) {
+        plan.segments.push_back({0, T, v_base});
     }
     return true;
 }
@@ -1092,12 +1125,14 @@ bool MossVL::append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor 
     return true;
 }
 
-bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPlan & plan) {
+bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPlan & plan,
+                              int row_base) {
     const double t_ck = ggml_time_ms();
     if (plan.n_vtot == 0) return true;
     const int M = (int)(merged.size() / vc.out_hidden);
-    const int V = plan.n_vtot;
-    if (V > xctx) {
+    const int V = plan.n_vtot - row_base;   // rows of THIS batch (plan.n_vtot is cumulative)
+    if (V <= 0) return true;
+    if (row_base + V > xctx) {
         fprintf(stderr, "vision tokens %d exceed cross-KV capacity %d (raise MOSS_XCTX)\n", V, xctx);
         return false;
     }
@@ -1131,7 +1166,7 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
         return false;
     }
     std::vector<int> rows(V);
-    for (int i = 0; i < V; i++) rows[i] = i;
+    for (int i = 0; i < V; i++) rows[i] = row_base + i;
     ggml_tensor * t_rows = ggml_graph_get_tensor(gf, "xkv_t_rows");   // the one set_rows reads
 
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
@@ -1544,6 +1579,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
     n_past = 0;
     kv.clear();
     xkv.clear();
+    sess_active = false;   // a fresh ask() invalidates any live session
     if (T > 0) {
         uint64_t key = 1469598103934665603ull;
         for (const auto & fr : media.frames) {
@@ -1597,6 +1633,132 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count(),
             n_dec > 0 ? n_dec * 1000.0 / std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t1).count() : 0.0);
+    sess_plan = plan;      // snapshot for a session started on top of this ask
+    sess_vrows = plan.n_vtot;
+    return true;
+}
+
+// realtime session turn: appends (frames | user prompt | both) onto the live
+// KV caches instead of rebuilding the whole context. Mirrors the official
+// real_time_generate splice format:
+//   prompt turn: <|im_end|>\n<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n
+//                (+ <|silence|> SFT-alignment token when frames follow)
+//   frames:      <|vision_start|><|time_start|>t<|time_end|><|image_pad|>...<|vision_end|>
+bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                         const vqa::GenParams & gp, std::string & out_text) {
+    if (!sess_active) {
+        // turn 1: full prefill via the offline path, then keep the caches alive
+        if (!ask(media, prompt, "", gp, out_text)) return false;
+        sess_active = true;
+        return true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // 1. vision for the new frames (host path: incremental rows into the cache)
+    const int T_new = (int)media.frames.size();
+    std::vector<float> patches, pos;
+    std::vector<int> vpos;
+    int gh = 0, gw = 0;
+    if (T_new > 0) {
+        const int budget = n_ctx - n_past - gp.max_tokens - 64;
+        if (!prepare_media(media, budget, patches, pos, vpos, &gh, &gw)) return false;
+    }
+    std::vector<int> grids;
+    if (T_new > 0) {
+        const int eh = gh / vc.merge, ew = gw / vc.merge;
+        for (int f = 0; f < T_new; f++) { grids.push_back(eh); grids.push_back(ew); }
+    }
+
+    // 2. build the splice text exactly like the official realtime loop
+    std::string text;
+    if (!prompt.empty()) {
+        text += "<|im_end|>\n<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+        if (T_new > 0 && getenv("MOSS_RT_SILENCE")) text += "<|silence|>";   // SFT alignment (optional)
+    }
+    if (T_new > 0) {
+        text += "<|vision_start|>";
+        for (int f = 0; f < T_new; f++) {
+            char ts[64];
+            const double t = f < (int)media.timestamps.size() ? media.timestamps[f]
+                             : (media.fps > 0 ? f / media.fps : (double)f);
+            snprintf(ts, sizeof(ts), "<|time_start|>%.1f seconds<|time_end|>", t);
+            text += ts;
+            text += "<|image_pad|>";
+        }
+        text += "<|vision_end|>";
+    }
+
+    // 3. plan the segment against the live caches
+    PromptPlan seg;
+    const int pos_base = n_past + sess_plan.rope_delta;   // mrope pos of slot n_past
+    if (!plan_from_text(text, grids, seg, pos_base, n_past, sess_vrows)) return false;
+    if (seg.n_vtot + gp.max_tokens + n_past + (int)seg.ids.size() > n_ctx) {
+        fprintf(stderr, "session context overflow (%d used)\n", n_past + (int)seg.ids.size());
+        return false;
+    }
+
+    // 4. project the new frames' cross-KV rows (appended after the old ones)
+    if (T_new > 0) {
+        static struct {
+            uint64_t key = 0;
+            std::vector<float> merged;
+        } scache;
+        uint64_t key = 1469598103934665603ull;
+        for (const auto & fr : media.frames) {
+            key ^= fr.rgb.size(); key *= 1099511628211ull;
+            for (size_t k = 0; k < fr.rgb.size(); k++) { key ^= fr.rgb[k]; key *= 1099511628211ull; }
+        }
+        key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
+        if (scache.key == key && !scache.merged.empty()) {
+            fprintf(stderr, "session vision: cache hit\n");
+        } else {
+            const int N = (int)(patches.size() / (3 * vc.patch * vc.patch));
+            if (!encode_vision(patches, pos, vpos, N, scache.merged)) return false;
+            scache.key = key;
+        }
+        if (!project_cross_kv(scache.merged, seg, sess_vrows)) return false;
+    }
+
+    // 5. prefill the segment onto the live text KV, then decode
+    TextGraph g;
+    std::vector<float> logits;
+    if (!run_text(g, seg, seg.ids, 0, logits)) return false;
+    const auto t1 = std::chrono::steady_clock::now();
+
+    out_text.clear();
+    int next = sample(logits, gp);
+    int n_dec = 0;
+    const int max_new = gp.max_tokens;
+    for (int step = 0; step < max_new; step++) {
+        if (next == id_eos || next == id_endoftext) break;
+        if (next == id_silence) {   // trained idle signal: nothing to say
+            if (getenv("MOSS_RT_DEBUG")) {
+                std::vector<std::pair<float, int>> top(logits.size());
+                for (int i = 0; i < (int)logits.size(); i++) top[i] = {logits[i], i};
+                std::partial_sort(top.begin(), top.begin() + 5, top.end(),
+                                  [](auto & a, auto & b) { return a.first > b.first; });
+                fprintf(stderr, "[rt-dbg] silence; top5:");
+                for (int i = 0; i < 5; i++)
+                    fprintf(stderr, " %d(%.2f)", top[i].second, top[i].first);
+                fprintf(stderr, "\n");
+            }
+            break;
+        }
+        const std::string piece = tok_.decode({next});
+        out_text += piece;
+        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+        n_dec++;
+        if (step + 1 >= max_new) break;
+        if (!run_text(g, seg, {next}, n_past, logits)) break;
+        next = sample(logits, gp);
+    }
+    fprintf(stderr, "[perf] session turn: prefill %d tok in %.0f ms | decode %d tok in %.0f ms\n",
+            (int)seg.ids.size(),
+            std::chrono::duration<double, std::milli>(t1 - t0).count(), n_dec,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
+    // carry the session forward: decode positions continue via seg.rope_delta
+    sess_plan = seg;
+    sess_vrows = seg.n_vtot;
     return true;
 }
 

@@ -307,13 +307,17 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             // --- multi-turn sessions (?session=<id>, ?reset=1 clears) ---
             static std::map<std::string, std::vector<std::pair<std::string, std::string>>> sessions;
             const std::string sess = query_param(req.query, "session");
-            if (!sess.empty() && query_param(req.query, "reset") == "1") sessions.erase(sess);
+            const bool realtime = query_param(req.query, "rt") == "1";   // incremental KV session
+            if (!sess.empty() && query_param(req.query, "reset") == "1") {
+                sessions.erase(sess);
+                if (realtime) g_loaded->session_reset();
+            }
             if (sess.empty() && query_param(req.query, "reset") == "1" && q.empty()) {
                 send_json(c, "{\"ok\":true}"); return true;
             }
             // rebuild the conversation prefix from the stored turns (text-only:
             // media from earlier turns is not re-sent; ask about it again)
-            if (!sess.empty()) {
+            if (!sess.empty() && !realtime) {   // rt sessions carry context engine-side
                 auto & turns = sessions[sess];
                 while (turns.size() > 12) turns.erase(turns.begin());   // keep the last 12 turns
                 std::string hist;
@@ -375,7 +379,11 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 }
             }
             std::string out;
-            if (!g_loaded->ask(media, q, mode, gp, out)) {
+            const bool ran = realtime && sess.empty()
+                ? false
+                : (realtime ? g_loaded->ask_session(media, q, gp, out)
+                            : g_loaded->ask(media, q, mode, gp, out));
+            if (!ran) {
                 if (stream) { send_chunk_str(c, "{\"error\":\"inference failed (see server log)\"}\n"); send_stream_end(c); }
                 else send_error(c, "inference failed");
                 return true;

@@ -40,6 +40,7 @@
 
 | MOSS-VL-Realtime 图像/视频问答 | ✅ 端到端 + 官方栈对拍：图像 prefill token 流 24/24、视频 78/78 逐位一致；layer2 cross-attn 中间量 corr ≥ 0.999；KV cache 回读 vs 官方 roped K corr 0.9997。CUDA（5070 Ti Laptop，Q4_K）：视觉 213ms/图、decode 67 tok/s；CPU 16 线程 decode 8.9 tok/s |
 | MOSS-VL 多轮会话 | ✅ `--serve` 的 `/ask?session=<id>`（`reset=1` 清空）：server 维护最近 12 轮文本历史，引擎 prompt 重建（媒体缓存命中时视觉塔免重跑） |
+| MOSS-VL 实时流会话 | ✅ `/ask?session=<id>&rt=1`：官方 real_time_generate 的引擎侧实现——新帧/新问题增量追加到活跌 KV（文本 KV 续写 + cross-KV 行追加，不重建全上下文），位置按官方增量 MRoPE 公式；`<|silence|>` 作为闲置信号终止本轮。已验证：跨轮记忆（两张图分别在后续追问中正确引用） |
 ## 快速开始
 
 ### 1. 构建
