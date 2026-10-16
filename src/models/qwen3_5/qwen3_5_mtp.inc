@@ -21,7 +21,7 @@
 //   axis  : mrope axis position for the drafted token
 // Writes logits_out [n_vocab] and h_out [n_embd]; returns argmax token.
 int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
-                          std::vector<float> & logits_out, std::vector<float> & h_out) {
+                          std::vector<float> & logits_out, std::vector<float> & h_out, int win_lo) {
     // graph is cached per 512-block window (mask/KV views padded to the block
     // so the tensor shapes are stable); per call we only set inputs + compute
     const int blk = std::min(vqa::block_for(slot + 1), n_ctx);
@@ -116,15 +116,20 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     int mpos[4] = { axis, axis, axis, slot };
     ggml_backend_tensor_set(t_mpos, mpos, 0, sizeof(mpos));
     static const bool selfkv = getenv("QWEN35_SPEC_SELFKV") != nullptr;
+    static const bool freshkv = getenv("QWEN35_SPEC_FRESHKV") != nullptr;
     if (selfkv) {
-        // attend only to the draft token's own KV: cols < slot hold entries
-        // drafted for OTHER tokens in earlier rounds (drafted != accepted), so
-        // the causal window feeds the head stale keys - llama.cpp resets the
-        // draft-region KV for the same reason
+        // attend only to the draft token's own KV
         const int S = (int)t_mask->ne[0];
         std::vector<ggml_fp16_t> mv((size_t)S, ggml_fp32_to_fp16(-INFINITY));
         if (slot >= 0 && slot < S) mv[(size_t)slot] = ggml_fp32_to_fp16(0.0f);
         ggml_backend_tensor_set(t_mask, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
+    } else if (freshkv) {
+        // llama.cpp-equivalent draft-region reset, on the cheap: cols < the
+        // round's write_base hold KV of drafts for OTHER tokens (drafted was
+        // not always accepted), so start the attention window at write_base;
+        // cols [write_base, slot] were written fresh by this round's steps
+        std::vector<int> lo{win_lo}, hi{slot + 1}, pos{slot};
+        vqa::set_window_mask(t_mask, lo, hi, pos);
     } else {
         vqa::set_causal_mask(t_mask, slot, 1);
     }
@@ -571,9 +576,9 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
         plain_streak = 0;
         // two-step MTP recursion: step 1 predicts the PENDING position (already
         // decided - only its hidden feeds the chain), step 2 predicts d1
-        const int d0 = mtp_draft_step(seed_tok, h.data(), write_base, cur + 1, dlog, dh);
+        const int d0 = mtp_draft_step(seed_tok, h.data(), write_base, cur + 1, dlog, dh, write_base);
         if (d0 < 0) return false;
-        const int d1 = mtp_draft_step(d0, dh.data(), write_base + 1, cur + 2, dlog, dh);
+        const int d1 = mtp_draft_step(d0, dh.data(), write_base + 1, cur + 2, dlog, dh, write_base);
         if (d1 < 0) return false;
         const int toks[2] = { pending, d1 };
         static const int livechk = getenv("QWEN35_SPEC_LIVECHK") ? atoi(getenv("QWEN35_SPEC_LIVECHK")) : 0;

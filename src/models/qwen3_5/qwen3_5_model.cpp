@@ -108,7 +108,7 @@ private:
     bool build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot = 0, bool logits_all = false);
     // qwen3_5_mtp.inc
     int mtp_draft_step(int tok, const float * h, int slot, int axis,
-                       std::vector<float> & logits_out, std::vector<float> & h_out);
+                       std::vector<float> & logits_out, std::vector<float> & h_out, int win_lo = -1);
     bool mtp_verify(const int * toks, int n_past, int axis0, int state_slot,
                     std::vector<float> & logits2, std::vector<float> & h_out, int am_out[2] = nullptr);
     bool run_speculative(int next, int seed0, const std::vector<float> & logits_prev, float * h_seed,
