@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__MODEL_ID__ — SkyVision.cpp</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 24px; }
+  a.back { color: #7aa2f7; font-size: 13px; text-decoration: none; }
+  h1 { font-size: 18px; margin: 10px 0 4px; word-break: break-all; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 20px; }
+  h2 { font-size: 14px; color: #9aa5b8; margin: 28px 0 10px; border-bottom: 1px solid #232833; padding-bottom: 6px; }
+  #drop { display: block; border: 2px dashed #333a48; border-radius: 12px; padding: 26px; text-align: center;
+          color: #7d8798; cursor: pointer; transition: border-color .15s; }
+  #drop:hover, #drop.on { border-color: #7aa2f7; }
+  #preview { max-width: 100%; max-height: 320px; border-radius: 8px; margin-top: 12px; display: none; }
+  video#preview { width: 100%; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+  input[type=text] { flex: 1; min-width: 160px; background: #171a21; border: 1px solid #262b36; color: #e6e6e6;
+                     border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+  select { background: #171a21; border: 1px solid #262b36; color: #e6e6e6; border-radius: 8px; padding: 10px; }
+  button { background: #7aa2f7; border: none; color: #0f1115; font-weight: 700; border-radius: 8px;
+           padding: 10px 22px; cursor: pointer; }
+  button:disabled { background: #333a48; color: #7d8798; cursor: default; }
+  button.stop { background: #e06c75; }
+  .chk { display: flex; align-items: center; gap: 6px; color: #9aa5b8; font-size: 13px; }
+  #out, #log { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 16px;
+         margin-top: 18px; white-space: pre-wrap; font-size: 14px; line-height: 1.6; min-height: 20px; }
+  #status, #rtstatus { color: #888; font-size: 12px; margin-top: 10px; }
+  .msg { border-radius: 10px; padding: 10px 14px; margin: 8px 0; font-size: 14px; line-height: 1.55; white-space: pre-wrap; }
+  .msg.user { background: #22304a; }
+  .msg.model { background: #1b2430; }
+  .msg.meta { background: transparent; color: #5d6779; font-size: 12px; padding: 2px 14px; }
+  .tag { display: inline-block; font-size: 11px; color: #7aa2f7; margin-right: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">&larr; 所有模型</a>
+  <h1>__MODEL_ID__</h1>
+  <div class="sub">MOSS-VL-Realtime · 图像 / 视频问答 + 多轮会话 + 实时流观察</div>
+
+  <h2>单次问答</h2>
+  <label id="drop" for="file">点击或拖入图片 / 视频（mp4 等）</label>
+  <img id="preview" alt="">
+  <video id="preview" controls style="display:none"></video>
+  <input type="file" id="file" accept="image/*,video/*" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden">
+
+  <div class="row">
+    <input type="text" id="q" placeholder="问点什么…" value="Describe this media.">
+    <label class="chk"><input type="checkbox" id="sess" checked> 多轮会话</label>
+    <button id="go">运行</button>
+  </div>
+  <div id="status"></div>
+  <div id="out"></div>
+
+  <h2>实时流观察（模型主动解说）</h2>
+  <div class="sub" style="margin-bottom:8px">
+    输入源：视频文件路径 / 摄像头（Windows 填 <code>video=摄像头名</code>）/ 流 URL。模型按节奏观察新画面，
+    有值得说的会自己开口，没话说会保持沉默（&lt;|silence|&gt;）；随时可以插话提问。
+  </div>
+  <div class="row">
+    <input type="text" id="src" placeholder="src：如 D:\clips\demo.mp4 或 video=USB Camera">
+    <select id="interval">
+      <option value="2">每 2 秒</option>
+      <option value="3" selected>每 3 秒</option>
+      <option value="5">每 5 秒</option>
+    </select>
+    <button id="rtgo">开始</button>
+    <button id="rtstop" class="stop" disabled>停止</button>
+  </div>
+  <div class="row">
+    <input type="text" id="sayq" placeholder="流内插话…（如：现在画面里有什么颜色？）">
+    <button id="say" disabled>提问</button>
+  </div>
+  <div id="rtstatus"></div>
+  <div id="log"></div>
+</div>
+<script>
+const MODEL = '__MODEL_ID__';
+const $ = id => document.getElementById(id);
+
+/* ---------------- single-shot QA (with optional rt session) ---------------- */
+const drop = $('drop'), file = $('file');
+const imgP = document.querySelector('img#preview'), vidP = document.querySelector('video#preview');
+let blob = null, isVideo = false;
+
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('on'); };
+drop.ondragleave = () => drop.classList.remove('on');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('on'); take(e.dataTransfer.files[0]); };
+file.onchange = () => take(file.files[0]);
+function take(f) {
+  if (!f) return;
+  blob = f;
+  file.value = '';
+  isVideo = f.type.startsWith('video');
+  drop.textContent = f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB) — 点击替换';
+  imgP.style.display = vidP.style.display = 'none';
+  if (isVideo) { vidP.src = URL.createObjectURL(f); vidP.style.display = 'block'; }
+  else { imgP.src = URL.createObjectURL(f); imgP.style.display = 'block'; }
+}
+
+$('go').onclick = async () => {
+  const q = $('q').value;
+  if (!blob && !q) return;
+  $('go').disabled = true;
+  $('out').textContent = '';
+  const useSess = $('sess').checked;
+  const sess = useSess ? 'w' + Date.now() : '';
+  const t0 = performance.now();
+  $('status').textContent = '加载模型（首次约 30 秒）…';
+  try {
+    let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).error || 'load failed');
+    $('status').textContent = '视觉编码…';
+    const kind = isVideo ? '&kind=video&fps=1&max-frames=8' : '';
+    const rt = useSess ? '&session=' + sess + '&rt=1' : '';
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask&q=' + encodeURIComponent(q) + kind + '&n=300&stream=1' + rt, {
+      method: 'POST', body: blob || new Uint8Array(0)
+    });
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', text = '', nt = 0, tg0 = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.error) throw new Error(ev.error);
+        if (ev.stage) { $('status').textContent = '视觉编码 ' + ev.done + '/' + ev.total + '…'; continue; }
+        if (ev.phase) { continue; }
+        if (ev.t) {
+          if (!nt) { $('status').textContent = '生成中…'; tg0 = performance.now(); }
+          text += ev.t; nt++;
+          $('out').textContent = text;
+        }
+        if (ev.done) {
+          const tv = ((performance.now() - tg0) / 1000).toFixed(1);
+          $('status').textContent = '完成，' + nt + ' token' +
+              (nt > 5 && tv > 0 ? '（' + (nt / tv).toFixed(1) + ' tok/s）' : '') +
+              (useSess ? ' · 会话 ' + sess + '（追问将带上本次图片）' : '');
+        }
+      }
+    }
+    if (!text && !$('status').textContent.startsWith('完成')) throw new Error('empty response');
+    window._qa_sess = sess;   // remember for follow-ups without media
+  } catch (e) {
+    $('out').textContent = '错误：' + e.message;
+    $('status').textContent = '';
+  }
+  $('go').disabled = false;
+};
+
+/* ---------------- realtime stream panel ---------------- */
+let rtSess = '', since = 0, curTurn = null, poller = null;
+
+function bubble(cls, tag) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  if (tag) { const t = document.createElement('span'); t.className = 'tag'; t.textContent = tag; d.appendChild(t); }
+  $('log').appendChild(d);
+  $('log').scrollTop = 1e9;
+  return d;
+}
+function meta(text) { const d = bubble('meta'); d.textContent = text; }
+
+async function poll() {
+  try {
+    const r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/rt/events?session=' + rtSess + '&since=' + since);
+    if (!r.ok) return;
+    const body = await r.text();
+    for (const line of body.split('\n')) {
+      if (!line.trim()) continue;
+      let ev; try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.seq) since = Math.max(since, ev.seq);
+      if (ev.error) { meta('⚠ ' + ev.error); continue; }
+      if (ev.event === 'observe') { curTurn = bubble('model', '观察'); continue; }
+      if (ev.event === 'ask') { bubble('user', '提问').appendChild(document.createTextNode(ev.q)); curTurn = bubble('model'); continue; }
+      if (ev.event === 'silence') { meta('· （沉默：没什么可说的）'); curTurn = null; continue; }
+      if (ev.event === 'turn_end') { curTurn = null; continue; }
+      if (ev.event === 'source_end') { meta('· 视频源播放结束（会话仍可提问）'); continue; }
+      if (ev.t !== undefined && curTurn) curTurn.appendChild(document.createTextNode(ev.t));
+    }
+  } catch {}
+}
+
+$('rtgo').onclick = async () => {
+  const src = $('src').value.trim();
+  if (!src) { $('rtstatus').textContent = '请先填入视频源'; return; }
+  $('rtgo').disabled = true;
+  $('rtstatus').textContent = '启动中（加载模型 + 打开视频源）…';
+  try {
+    let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).error || 'load failed');
+    const interval = $('interval').value;
+    rtSess = 'rt' + Date.now();   // fresh engine session each start
+    since = 0;
+    r = await fetch('/api/model/' + encodeURIComponent(MODEL) +
+        '/rt/start?session=' + rtSess + '&src=' + encodeURIComponent(src) + '&interval=' + interval, { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'start failed');
+    $('rtstop').disabled = $('say').disabled = false;
+    $('rtstatus').textContent = '流运行中：' + src;
+    meta('▶ 开始观察 ' + src);
+    poller = setInterval(poll, 1000);
+  } catch (e) {
+    $('rtstatus').textContent = '';
+    meta('⚠ ' + e.message);
+    $('rtgo').disabled = false;
+  }
+};
+
+$('rtstop').onclick = async () => {
+  if (poller) { clearInterval(poller); poller = null; }
+  await fetch('/api/model/' + encodeURIComponent(MODEL) + '/rt/stop?session=' + rtSess, { method: 'POST' }).catch(() => {});
+  meta('■ 停止');
+  $('rtstop').disabled = $('say').disabled = true;
+  $('rtgo').disabled = false;
+  $('rtstatus').textContent = '';
+};
+
+$('say').onclick = async () => {
+  const q = $('sayq').value.trim();
+  if (!q) return;
+  $('sayq').value = '';
+  bubble('user', '提问').appendChild(document.createTextNode(q));
+  await fetch('/api/model/' + encodeURIComponent(MODEL) + '/rt/say?session=' + rtSess + '&q=' + encodeURIComponent(q), { method: 'POST' }).catch(() => {});
+};
+$('sayq').addEventListener('keydown', e => { if (e.key === 'Enter') $('say').onclick(); });
+</script>
+</body>
+</html>

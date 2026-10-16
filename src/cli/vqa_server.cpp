@@ -786,7 +786,9 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         g_id_placeholder = id;
         const ModelEntry * e = find_model(id);
         if (!e) { send(c, "404 Not Found", "text/plain", "unknown model"); return true; }
-        serve_page(e->arch == "moondream3" ? "moondream.html" : "vc3.html");
+        serve_page(e->arch == "moondream3" ? "moondream.html"
+                 : e->arch == "moss_vl" ? "moss.html"
+                 : "vc3.html");
         return true;
     }
     send(c, "404 Not Found", "text/plain", "not found");
