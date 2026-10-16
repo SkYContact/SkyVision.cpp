@@ -142,7 +142,7 @@ private:
     ggml_backend_t backend = nullptr;
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr, wbuf_plain = nullptr;
-    std::vector<char> host_f32_storage;
+    vqa::AlignedBuf host_f32_storage;
     vqa::MMap mm;
     std::vector<float> patch_bias;       // v.patch_embd.bias, read on the host at load time
     vqa::StageBuffer tower_buf;          // device-side tower output, host never touched between steps
@@ -363,7 +363,7 @@ bool Qwen3_5::load_weights(const char * path) {
     gguf_free(gu);
 
     // 1D tensors (norms, biases, dt/a vectors, conv kernels) -> host F32
-    std::vector<char> host_f32;
+    vqa::AlignedBuf host_f32;
     {
         size_t total = 0;
         for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {

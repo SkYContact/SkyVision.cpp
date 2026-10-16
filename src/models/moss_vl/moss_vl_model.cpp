@@ -239,7 +239,7 @@ private:
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
     ggml_backend_buffer_t wbuf_plain = nullptr;
-    std::vector<char> host_f32_storage;
+    vqa::AlignedBuf host_f32_storage;
     vqa::MMap mm;
 
     std::vector<float> pos_emb_host;          // learned (48*48, 1152) table
@@ -468,7 +468,7 @@ bool MossVL::load_weights(const char * path) {
     }
 
     // 1D tensors (norms, biases, gates, separator) -> host F32
-    std::vector<char> host_f32;
+    vqa::AlignedBuf host_f32;
     {
         size_t total = 0;
         for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {

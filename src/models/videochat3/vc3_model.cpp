@@ -123,7 +123,7 @@ private:
     ggml_backend_buffer_t wbuf = nullptr;         // weights: mmap-backed (CPU) or uploaded
     ggml_backend_buffer_t wbuf_plain = nullptr;   // host f32 block holding the 1D tensors
     ggml_backend_buffer_t wbuf_fold = nullptr;    // host block holding LN-folded vision weights (CPU path)
-    std::vector<char> host_f32_storage;           // keeps that block alive on the CPU path
+    vqa::AlignedBuf host_f32_storage;           // keeps that block alive on the CPU path
     std::vector<char> fold_storage;               // keeps the folded weights alive (both paths)
     bool fold_bias = false;                       // LN bias absorbed into the matmul bias (exact, F32)
     bool fold_scale = false;                      // LN gain folded into the weight (VC3_FOLD_W=1; re-rounds F16, lossy)
@@ -344,7 +344,7 @@ bool VideoChat3::load_weights(const char * path) {
     gguf_free(gu);
 
     // 1D tensors (norms, biases) -> host F32: ggml elementwise ops need matching types
-    std::vector<char> host_f32;
+    vqa::AlignedBuf host_f32;
     {
         size_t total = 0;
         for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
