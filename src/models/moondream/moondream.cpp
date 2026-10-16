@@ -68,6 +68,7 @@
 // regex pre-tokenizer, no <|...|> specials).
 #include "tokenizer.hpp"
 #include "vqa_util.hpp"
+#include "ggml_dump.hpp"
 using vqa::MMap;
 using vqa::Tokenizer;
 using vqa::init_byte_table;
@@ -559,6 +560,14 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
     ggml_set_name(logits, "logits");
 
     ggml_build_forward_expand(gf, logits);
+    if (getenv("MD_DUMP")) {
+        static const char * const dump_names[] = {
+            "d_h_emb", "d_l0_ln", "d_l0_qkv", "d_l0_q_tau", "d_l0_q_rope", "d_l0_k_rope",
+            "d_l0_v2", "d_l0_scores", "d_l0_attnw", "d_l0_attn_out3", "d_l0_attn_out",
+            "d_l0_attn_proj", "d_l0_mlp", "d_h_L0", "hidden", nullptr,
+        };
+        vqa::dump::mark_sinks(gctx, gf, dump_names);
+    }
     return gf;
 }
 

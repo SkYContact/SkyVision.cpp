@@ -29,6 +29,7 @@
 #include "attention.hpp"
 #include "sampler.hpp"
 #include "vqa_util.hpp"
+#include "ggml_dump.hpp"
 #include "../videochat3/vc3_preprocess.hpp"   // smart_resize / resize_bicubic_antialias
 #include "marlin_preprocess.hpp"
 
@@ -509,56 +510,9 @@ bool Marlin::alloc_state() {
     return true;
 }
 
-// gallocr reuses the buffers of intermediates that are not direct graph nodes,
-// so dumped intermediates come back polluted (only true sinks survive). Making
-// each wanted tensor a direct graph node extends its lifetime to the whole
-// compute and makes every dump trustworthy. No-op unless dumping is enabled.
-static void mark_dump_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * dump_dir) {
-    if (!dump_dir || !*dump_dir) return;
-    static const char * const names[] = {
-        "emb", "t_l0_q", "t_l0_q_norm", "t_l0_q_rope", "t_l0_k_rope", "t_l0_attn",
-        "t_l0_la_qkv", "t_l0_la_z", "t_l0_la_beta", "t_l0_la_g", "t_l0_la_conv",
-        "t_l0_la_core", "t_l0_swiglu", "t_l0_out", "t_final_norm",
-        "patches", "v_pos_in", "v_patch_out", "v_blk0_attn_out", "v_blk0_out",
-        "v_final", "v_merge", "v_proj_out",
-    };
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-        if (!t->name[0]) continue;
-        for (const char * n : names) {
-            if (!strcmp(t->name, n)) {
-                // build_forward_expand is a no-op for tensors already in the
-                // graph; a fresh trailing consumer (identity scale) extends the
-                // tensor's buffer lifetime past the whole compute
-                ggml_tensor * keep = ggml_scale(ctx, t, 1.0f);
-                ggml_set_name(keep, "dump_sink");
-                ggml_build_forward_expand(gf, keep);
-                break;
-            }
-        }
-    }
-}
-
 void Marlin::dump(const ggml_cgraph * gf, const char * name) {
     if (dump_dir.empty()) return;
-    ggml_tensor * t = ggml_graph_get_tensor((ggml_cgraph *)gf, name);
-    if (!t || !t->data) return;
-    std::string path = dump_dir + "/cpp_" + name + ".bin";
-    std::vector<float> tmp((size_t)ggml_nelements(t));
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, tmp.data(), 0, sizeof(float) * tmp.size());
-    } else {
-        std::vector<ggml_fp16_t> h(ggml_nelements(t));
-        ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
-        for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
-    }
-    FILE * f = fopen(path.c_str(), "wb");
-    if (f) { fwrite(tmp.data(), sizeof(float), tmp.size(), f); fclose(f); }
-    FILE * m = fopen((dump_dir + "/cpp_" + name + ".shape").c_str(), "w");
-    if (m) {
-        fprintf(m, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1],
-                (long long)t->ne[2], (long long)t->ne[3]);
-        fclose(m);
-    }
+    vqa::dump::write((ggml_cgraph *)gf, dump_dir.c_str(), name);
 }
 
 // ---------------------------------------------------------------- vision
@@ -727,7 +681,13 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         ggml_set_name(x, "v_patch_out");
 
         auto run_chunk = [&](const char * out_name, std::vector<float> & dest) -> bool {
-            mark_dump_sinks(gctx, gf, dump_dir.c_str());
+            if (!dump_dir.empty()) {
+                static const char * const dump_names[] = {
+                    "patches", "v_pos_in", "v_patch_out", "v_blk0_attn_out", "v_blk0_out",
+                    "v_final", nullptr,
+                };
+                vqa::dump::mark_sinks(gctx, gf, dump_names);
+            }
             if (!ggml_gallocr_alloc_graph(allocr, gf)) {
                 fprintf(stderr, "vision graph allocation failed\n");
                 return false;
@@ -807,7 +767,10 @@ bool Marlin::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         ggml_tensor * x = t_x;
 
         auto run_merger = [&](const char * out_name) -> bool {
-            mark_dump_sinks(mctx, mgf, dump_dir.c_str());
+            if (!dump_dir.empty()) {
+                static const char * const dump_names[] = { "v_merge", "v_proj_out", nullptr };
+                vqa::dump::mark_sinks(mctx, mgf, dump_names);
+            }
             if (!ggml_gallocr_alloc_graph(allocr, mgf)) {
                 fprintf(stderr, "merger graph allocation failed\n");
                 return false;
@@ -1057,7 +1020,14 @@ bool Marlin::build_text_graph(TextGraph & g, int T, int S, int n_img) {
     }
     ggml_set_name(g.logits, "logits");
     ggml_build_forward_expand(g.gf, g.logits);
-    mark_dump_sinks(g.ctx, g.gf, dump_dir.c_str());
+    if (!dump_dir.empty()) {
+        static const char * const dump_names[] = {
+            "emb", "t_l0_q", "t_l0_q_norm", "t_l0_q_rope", "t_l0_k_rope", "t_l0_attn",
+            "t_l0_la_qkv", "t_l0_la_z", "t_l0_la_beta", "t_l0_la_g", "t_l0_la_conv",
+            "t_l0_la_core", "t_l0_swiglu", "t_l0_out", "t_final_norm", nullptr,
+        };
+        vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
+    }
     return true;
 }
 

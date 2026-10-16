@@ -25,6 +25,7 @@
 #   include "ggml-cuda.h"   // ggml_backend_cuda_init
 #endif
 #include "tokenizer.hpp"
+#include "ggml_dump.hpp"
 #include "vc3_preprocess.hpp"
 #include "attention.hpp"
 #include "sampler.hpp"
@@ -917,6 +918,13 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 
         auto run_chunk = [&](const char * out_name, std::vector<float> & dest) -> bool {
             const auto ra = t_now();
+            if (!dump_dir.empty()) {
+                static const char * const dump_names[] = {
+                    "v_patch_out", "v_blk0_qkv", "v_blk0_q_rope", "v_blk0_attn_out",
+                    "v_blk0_out", "v_final", nullptr,
+                };
+                vqa::dump::mark_sinks(gctx, gf, dump_names);
+            }
             if (!ggml_gallocr_alloc_graph(allocr, gf)) {
                 fprintf(stderr, "vision graph allocation failed\n");
                 return false;
@@ -1021,6 +1029,10 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_tensor * x = t_x;
 
         auto run_merger = [&](const char * out_name) -> bool {
+            if (!dump_dir.empty()) {
+                static const char * const dump_names[] = { "v_merge", "v_proj_out", nullptr };
+                vqa::dump::mark_sinks(mctx, mgf, dump_names);
+            }
             if (!ggml_gallocr_alloc_graph(allocr, mgf)) {
                 fprintf(stderr, "merger graph allocation failed\n");
                 return false;
@@ -1251,6 +1263,13 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
     }
     ggml_set_name(g.logits, "logits");
     ggml_build_forward_expand(g.gf, g.logits);
+    if (!dump_dir.empty()) {
+        static const char * const dump_names[] = {
+            "emb", "t_l0_norm", "t_l0_q", "t_l0_q_norm", "t_l0_q_rope", "t_l0_attn",
+            "t_l0_out", "t_final_norm", nullptr,
+        };
+        vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
+    }
     return true;
 }
 
