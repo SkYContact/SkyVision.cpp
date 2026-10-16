@@ -1619,6 +1619,13 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
     const int max_new = gp.max_tokens;
     for (int step = 0; step < max_new; step++) {
         if (next == id_eos || next == id_endoftext) break;
+        // specials decode to the empty string; a stream of them is turn
+        // machinery (silence / markers), not content — stop instead of
+        // burning max_tokens on invisible output
+        if (next >= 151643 && next != id_im_start && tok_.decode({next}).empty()) {
+            fprintf(stderr, "moss_vl: stopping on empty special %d\n", next);
+            break;
+        }
         const std::string piece = tok_.decode({next});
         out_text += piece;
         if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
@@ -1731,17 +1738,28 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
     const int max_new = gp.max_tokens;
     for (int step = 0; step < max_new; step++) {
         if (next == id_eos || next == id_endoftext) break;
-        if (next == id_silence) {   // trained idle signal: nothing to say
+        // specials decode to the empty string; a flood of them means the turn
+        // is over in spirit (silence/turn markers etc.) — stop instead of
+        // burning max_tokens on invisible output. The official realtime loop
+        // feeds EVERY generated token (incl. <|silence|>) back into the
+        // context, so the closing token must enter the KV before we break —
+        // otherwise follow-up prompts land off-distribution.
+        if (next >= 151643 && tok_.decode({next}).empty()) {
             if (getenv("MOSS_RT_DEBUG")) {
                 std::vector<std::pair<float, int>> top(logits.size());
                 for (int i = 0; i < (int)logits.size(); i++) top[i] = {logits[i], i};
                 std::partial_sort(top.begin(), top.begin() + 5, top.end(),
                                   [](auto & a, auto & b) { return a.first > b.first; });
-                fprintf(stderr, "[rt-dbg] silence; top5:");
+                fprintf(stderr, "[rt-dbg] stop token %d; top5:", next);
                 for (int i = 0; i < 5; i++)
                     fprintf(stderr, " %d(%.2f)", top[i].second, top[i].first);
                 fprintf(stderr, "\n");
             }
+            run_text(g, seg, {next}, n_past, logits);   // closing token enters the KV
+            break;
+        }
+        if (next == id_silence) {
+            run_text(g, seg, {next}, n_past, logits);
             break;
         }
         const std::string piece = tok_.decode({next});

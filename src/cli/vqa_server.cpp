@@ -18,6 +18,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <set>
+#include <deque>
+#include <memory>
+#include <thread>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -25,6 +31,9 @@
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
+  #ifndef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0601
+  #endif
   #include <windows.h>
 #endif
 
@@ -48,6 +57,280 @@ std::mutex g_mu;                      // serializes model access
 std::string g_id_placeholder;         // substituted into pages per request
 vqa::Model * g_loaded = nullptr;
 std::string g_loaded_id;
+
+// ---------------------------------------------------------------- realtime
+// live stream session: one ffmpeg capture process + a resident inference loop
+// that feeds new frames (and any queued user questions) into the model's
+// incremental session every `interval` seconds. The model speaks on its own —
+// the trained <|silence|> token means "nothing to say" and ends the turn.
+// Clients observe via rt/events (poll with ?since=<seq> for NDJSON events).
+#ifdef _WIN32
+#ifndef STARTF_USESTDHANDLE
+#define STARTF_USESTDHANDLE 0x100
+#endif
+struct CapProc {
+    PROCESS_INFORMATION pi = {};
+    HANDLE rh = INVALID_HANDLE_VALUE;
+    bool spawn(const std::string & cmd) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+        HANDLE wh;
+        if (!CreatePipe(&rh, &wh, &sa, 0)) return false;
+        SetHandleInformation(rh, HANDLE_FLAG_INHERIT, 0);
+        // NOTE: no "cmd /c" here — cmd's quote-stripping rules mangle commands
+        // with 3+ quotes (path + args); CreateProcessA parses them natively
+        std::string full = cmd;
+        STARTUPINFOA si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLE | STARTF_USESHOWWINDOW;
+        si.hStdOutput = wh;
+        // NUL for stdin/stderr: with STARTF_USESTDHANDLE all three handles
+        // must be valid, and inheriting the console's breaks hidden starts
+        HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE,
+                                 &sa, OPEN_EXISTING, 0, nullptr);
+        si.hStdError = nul;
+        si.hStdInput = nul == INVALID_HANDLE_VALUE ? wh : nul;
+        si.wShowWindow = SW_HIDE;
+        std::vector<char> buf(full.begin(), full.end());
+        buf.push_back(0);
+        if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(rh); rh = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        CloseHandle(wh);   // child owns the write end now
+        return true;
+    }
+    int read(char * out, int n) {
+        DWORD got = 0;
+        if (!ReadFile(rh, out, (DWORD)n, &got, nullptr)) return 0;
+        return (int)got;
+    }
+    void stop() {
+        if (pi.hProcess) { TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 2000); }
+        if (rh != INVALID_HANDLE_VALUE) { CloseHandle(rh); rh = INVALID_HANDLE_VALUE; }
+        if (pi.hProcess) CloseHandle(pi.hProcess);
+        if (pi.hThread) CloseHandle(pi.hThread);
+        pi = {};
+    }
+};
+#else
+    #include <cstdio>
+struct CapProc {
+    FILE * p = nullptr;
+    bool spawn(const std::string & cmd) { p = popen((cmd + " 2>/dev/null").c_str(), "r"); return p != nullptr; }
+    int read(char * out, int n) { return p ? (int)fread(out, 1, n, p) : 0; }
+    void stop() { if (p) pclose(p); p = nullptr; }
+};
+#endif
+
+struct RtStream {
+    std::string session, src;
+    double interval = 3.0;
+    int frames_per_turn = 1;
+    bool use_sys_prompt = true;
+    CapProc cap;
+    std::thread reader, worker;
+    std::mutex mu;
+    std::deque<std::pair<std::vector<unsigned char>, double>> jpegs;  // pending (frame, t)
+    std::deque<std::string> prompts;
+    std::deque<std::string> events;   // NDJSON lines, oldest first
+    long seq = 0;
+    std::atomic<bool> stop_flag{false};
+    bool started = false;
+
+    void push_event(const std::string & line) {
+        std::lock_guard<std::mutex> lk(mu);
+        // embed the sequence number as the first field so rt/events can page
+        events.push_back("{\"seq\":" + std::to_string(++seq) + "," + line.substr(1));
+        if (events.size() > 4096) events.erase(events.begin(), events.end() - 4096);
+    }
+    ~RtStream() {
+        stop_flag = true;
+        cap.stop();
+        if (reader.joinable()) reader.join();
+        if (worker.joinable()) worker.join();
+    }
+};
+static std::map<std::string, std::shared_ptr<RtStream>> g_rt;
+static std::mutex g_rt_mu;
+
+static std::string ffmpeg_path() {
+    if (const char * e = getenv("FFMPEG")) return e;
+    return "ffmpeg";
+}
+
+// the official real_time_generate system prompt: makes the model narrate what
+// the camera sees and stay silent when nothing relevant happens
+static const char * RT_SYSTEM_PROMPT =
+    "You are a helpful AI assistant. You perceive and understand the surrounding environment in real-time "
+    "through the camera and interact with the user. Whether or not the user actively asks questions, you "
+    "continuously observe and analyze visual information, maintaining awareness of the environment.\n\n"
+    "- Continuous Perception: Always observe and analyze the visual information captured by the camera.\n"
+    "- Observation-Based Answers: All answers must be based on visual observations, including historical "
+    "and real-time data.\n"
+    "- If you notice significant changes, promptly update your answers; when you cannot answer or have "
+    "finished, output <|silence|>.";
+
+static void rt_reader_loop(std::shared_ptr<RtStream> s) {
+    std::vector<unsigned char> buf;
+    char tmp[1 << 16];
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t frame_start = std::string::npos;
+    while (!s->stop_flag) {
+        int got = s->cap.read(tmp, sizeof(tmp));
+        if (got <= 0) {   // source ended or died
+            s->push_event("{\"event\":\"source_end\"}\n");
+            break;
+        }
+        buf.insert(buf.end(), tmp, tmp + got);
+        // split the mjpeg stream on SOI(FFD8)/EOI(FFD9) markers
+        for (size_t i = 1; i < buf.size(); i++) {
+            if (buf[i - 1] == 0xFF && buf[i] == 0xD9 && frame_start != std::string::npos) {
+                if (i + 1 - frame_start > 64) {
+                    double t = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    std::vector<unsigned char> jpg(buf.begin() + frame_start, buf.begin() + i + 1);
+                    {
+                        std::lock_guard<std::mutex> lk(s->mu);
+                        s->jpegs.push_back({jpg, t});
+                        while (s->jpegs.size() > 16) s->jpegs.pop_front();   // keep realtime
+                    }
+                }
+                buf.erase(buf.begin(), buf.begin() + i + 1);
+                frame_start = std::string::npos;
+                i = 0;
+                continue;
+            }
+            if (buf[i - 1] == 0xFF && buf[i] == 0xD8 && frame_start == std::string::npos)
+                frame_start = i - 1;
+        }
+    }
+}
+
+static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
+    bool first = true;
+    while (!s->stop_flag) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (s->stop_flag) break;
+        // wait out the turn interval
+        // (checked in 200ms slices so stop/say react quickly)
+        static thread_local double since = 0.0;
+        since += 0.2;
+        if (since < s->interval) continue;
+        since = 0.0;
+        // drain the pending frames + prompts. A queued question goes out on
+        // its own turn (frames wait for the next one): the realtime SFT is
+        // touchy about prompt+new-frame turns and reliably answers text-only
+        // questions while narration stays on frame-only turns.
+        vqa::MediaInput media;
+        media.kind = vqa::MediaKind::Video;
+        std::string q;
+        {
+            std::lock_guard<std::mutex> lk(s->mu);
+            bool has_q = !s->prompts.empty();
+            while (!s->prompts.empty()) {
+                if (!q.empty()) q += "\n";
+                q += s->prompts.front();
+                s->prompts.pop_front();
+            }
+            if (has_q) { /* text-only question turn */ }
+            else {
+            int n = std::min<int>((int)s->jpegs.size(), std::max(1, s->frames_per_turn));
+            for (int i = 0; i < n; i++) {
+                vqa::MediaInput one;
+                if (vqa::load_image_from_memory(
+                        std::string(s->jpegs.front().first.begin(), s->jpegs.front().first.end()), one)) {
+                    if (one.frames.empty()) continue;
+                    media.frames.push_back(std::move(one.frames[0]));
+                    media.width = one.width;
+                    media.height = one.height;
+                    media.timestamps.push_back(s->jpegs.front().second);
+                }
+                s->jpegs.pop_front();
+            }
+            }
+        }
+        if (media.frames.empty() && q.empty()) continue;   // nothing new to say
+        // model speaking on its own: frames-only turns, silence ends them
+        vqa::GenParams gp;
+        gp.max_tokens = 200;
+        std::string carry;
+        gp.on_token = [](const char * piece, void * ud) {
+            ((RtStream *)ud)->push_event(std::string("{\"t\":\"") +
+                                         vqa::http::json_escape(piece) + "\"}\n");
+        };
+        gp.on_token_ud = s.get();
+        if (first) {
+            first = false;
+            // the realtime SFT goes mute (and stays mute for later questions)
+            // when turn 1 carries no user text — seed one so the narration
+            // lands as a normal answer and the session stays responsive
+            if (q.empty()) q = "Please observe and describe what you see.";
+            if (s->use_sys_prompt)
+                gp.history = std::string("<|im_start|>system\n") + RT_SYSTEM_PROMPT + "<|im_end|>\n";
+        }
+        std::string out;
+        s->push_event(q.empty() ? "{\"event\":\"observe\"}\n"
+                                : std::string("{\"event\":\"ask\",\"q\":\"") + vqa::http::json_escape(q) + "\"}\n");
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (!g_loaded || g_loaded_id != model_id) {
+                s->push_event("{\"error\":\"model no longer loaded\"}\n");
+                break;
+            }
+            if (!g_loaded->ask_session(media, q, gp, out)) {
+                s->push_event("{\"error\":\"turn failed\"}\n");
+                continue;
+            }
+        }
+        s->push_event(out.empty() ? "{\"event\":\"silence\"}\n"
+                                  : "{\"event\":\"turn_end\"}\n");
+    }
+}
+
+static bool rt_start(const std::string & session, const std::string & src,
+                     double interval, int frames_per_turn, bool use_sys_prompt,
+                     std::string & err) {
+    std::lock_guard<std::mutex> lk(g_rt_mu);
+    if (g_rt.count(session)) { err = "session already streaming"; return false; }
+    auto s = std::make_shared<RtStream>();
+    s->session = session;
+    s->src = src;
+    s->interval = interval > 0.2 ? interval : 3.0;
+    s->frames_per_turn = frames_per_turn > 0 ? frames_per_turn : 1;
+    s->use_sys_prompt = use_sys_prompt;
+    // src: "video=..." -> Windows dshow camera; anything else is a path/URL
+    std::string input;
+    if (src.rfind("video=", 0) == 0)
+        input = "-f dshow -i \"" + src + "\"";
+    else
+        input = "-re -i \"" + src + "\"";
+    const double fps = 1.0 / s->interval;
+    char tail[160];
+    snprintf(tail, sizeof(tail), "-vf fps=%.3f -f image2pipe -vcodec mjpeg -", fps);
+    std::string cmd = "\"" + ffmpeg_path() + "\" -nostdin -hide_banner -loglevel error " + input + " " + tail;
+    if (!s->cap.spawn(cmd)) { err = "cannot spawn ffmpeg (check FFMPEG / source)"; return false; }
+    s->started = true;
+    g_rt[session] = s;
+    s->reader = std::thread(rt_reader_loop, s);
+    s->worker = std::thread(rt_worker_loop, s, g_loaded_id);
+    return true;
+}
+
+static void rt_stop(const std::string & session) {
+    std::shared_ptr<RtStream> s;
+    {
+        std::lock_guard<std::mutex> lk(g_rt_mu);
+        auto it = g_rt.find(session);
+        if (it == g_rt.end()) return;
+        s = it->second;
+        g_rt.erase(it);
+    }
+    s->stop_flag = true;
+    s->cap.stop();
+    if (s->reader.joinable()) s->reader.join();
+    if (s->worker.joinable()) s->worker.join();
+    if (g_loaded) g_loaded->session_reset();
+}
 
 bool file_exists(const std::string & p) {
 #ifdef _WIN32
@@ -242,6 +525,70 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         const ModelEntry * e = find_model(id);
         if (!e) { send_error(c, "unknown model: " + id); return true; }
 
+        if (action.rfind("rt/", 0) == 0) {
+            const std::string sess = query_param(req.query, "session");
+            if (sess.empty()) { send_error(c, "need ?session="); return true; }
+            if (action == "rt/start" && req.method == "POST") {
+                std::lock_guard<std::mutex> lk(g_mu);
+                std::string err;
+                if (!ensure_loaded(*e, err)) { send_error(c, err); return true; }
+                g_loaded->session_reset();   // a new stream always starts fresh
+                const std::string src = query_param(req.query, "src");
+                if (src.empty()) { send_error(c, "need ?src=<camera|path|url>"); return true; }
+                double interval = atof(query_param(req.query, "interval").c_str());
+                int fpt = atoi(query_param(req.query, "frames").c_str());
+                std::string rerr;
+                // the official realtime system prompt is an admitted placeholder
+                // (train/inference divergence suppresses speech) - off by default
+                const bool sysp = query_param(req.query, "sys") == "1";
+                if (!rt_start(sess, src, interval, fpt, sysp, rerr)) { send_error(c, rerr); return true; }
+                send_json(c, "{\"ok\":true}");
+                return true;
+            }
+            if (action == "rt/stop" && req.method == "POST") {
+                rt_stop(sess);
+                send_json(c, "{\"ok\":true}");
+                return true;
+            }
+            if (action == "rt/say" && req.method == "POST") {
+                std::lock_guard<std::mutex> lk(g_rt_mu);
+                auto it = g_rt.find(sess);
+                if (it == g_rt.end()) { send_error(c, "no such streaming session"); return true; }
+                std::string q = query_param(req.query, "q");
+                if (q.empty()) { send_error(c, "need ?q="); return true; }
+                {
+                    std::lock_guard<std::mutex> lk2(it->second->mu);
+                    it->second->prompts.push_back(q);
+                }
+                send_json(c, "{\"ok\":true}");
+                return true;
+            }
+            if (action == "rt/events" && req.method == "GET") {
+                long since = atol(query_param(req.query, "since").c_str());
+                std::shared_ptr<RtStream> s;
+                {
+                    std::lock_guard<std::mutex> lk(g_rt_mu);
+                    auto it = g_rt.find(sess);
+                    if (it != g_rt.end()) s = it->second;
+                }
+                std::string body;
+                long last = since;
+                if (s) {
+                    std::lock_guard<std::mutex> lk(s->mu);
+                    for (const auto & ev : s->events) {
+                        // events carry their seq as the first field: {"seq":N,...
+                        long eseq = atol(ev.c_str() + 7);
+                        if (eseq > since) { body += ev; last = eseq; }
+                    }
+                }
+                if (body.empty()) { send_json(c, "{\"events\":[],\"since\":" + std::to_string(last) + "}"); return true; }
+                send(c, "200 OK", "application/x-ndjson", body);
+                return true;
+            }
+            send_error(c, "bad rt action");
+            return true;
+        }
+
         if (req.method == "POST" && action == "load") {
             std::lock_guard<std::mutex> lk(g_mu);
             std::string err;
@@ -314,6 +661,17 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             }
             if (sess.empty() && query_param(req.query, "reset") == "1" && q.empty()) {
                 send_json(c, "{\"ok\":true}"); return true;
+            }
+            if (realtime) {
+                // the engine keeps ONE live session; a fresh HTTP session name
+                // must reset it, otherwise turn 1 splices onto a stranger's KV
+                static std::set<std::string> rt_sessions;
+                if (!sess.empty() && !rt_sessions.count(sess)) {
+                    rt_sessions.insert(sess);
+                    g_loaded->session_reset();
+                }
+                if (!sess.empty() && query_param(req.query, "reset") == "1")
+                    rt_sessions.erase(sess);
             }
             // rebuild the conversation prefix from the stored turns (text-only:
             // media from earlier turns is not re-sent; ask about it again)
