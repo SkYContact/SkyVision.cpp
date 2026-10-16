@@ -145,79 +145,53 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
     int state_slot = 0;
     long accepted = 0, rounds = 0;
     if (getenv("QWEN35_SPEC_SELFTEST") && n_past >= 2) {
-        // clean unit probe on the CPU backend (host-accessible state buffers):
-        // save the prefill state, run one T=2 verify, restore, run two T=1
-        // steps, compare the final hidden and logits
+        // minimal reject-path probe: verify_a [pending, X] (rolled back),
+        // then verify_b reading slot1 at write_base = np+1 - must equal the
+        // sequential [pending, g1, Y] chain exactly
         const int n_lin = n_layer - n_full_layers;
-        const size_t sst = (size_t)ssm_d_state * ssm_d_state * ssm_dt_rank * sizeof(float);
-        const size_t cst = (size_t)(ssm_d_conv - 1) * (2 * ssm_n_group * ssm_d_state + ssm_d_inner) * sizeof(float);
-        std::vector<char> s0(sst), s1(sst), c0(cst), c1(cst);
+        const size_t sst = (size_t)ssm_d_state * ssm_d_state * ssm_dt_rank * 4;
+        const size_t cst = (size_t)(ssm_d_conv - 1) * (2 * ssm_n_group * ssm_d_state + ssm_d_inner) * 4;
+        std::vector<std::vector<char>> sv(n_lin), cv(n_lin);
         for (int i = 0; i < n_lin; i++) {
-            ggml_backend_tensor_get(ssm_state[i], s0.data() + 0, 0, sst);   // placeholder per-layer below
-            break;
-        }
-        std::vector<std::vector<char>> ssave(n_lin), csave(n_lin);
-        for (int i = 0; i < n_lin; i++) {
-            ssave[i].resize(sst); csave[i].resize(cst);
-            ggml_backend_tensor_get(ssm_state[i], ssave[i].data(), 0, sst);
-            ggml_backend_tensor_get(conv_state[i], csave[i].data(), 0, cst);
+            sv[i].resize(sst); cv[i].resize(cst);
+            ggml_backend_tensor_get(ssm_state[i], sv[i].data(), 0, sst);
+            ggml_backend_tensor_get(conv_state[i], cv[i].data(), 0, cst);
         }
         std::vector<float> L2x((size_t)2 * n_vocab), hx(2 * n_embd);
-        const int t2[2] = { pending, 12345 };
         const int save_np = n_past;
-        mtp_verify(t2, save_np, cur + 1, 0, L2x, hx);
-        // stash the verify's slot0/slot1 outputs
-        std::vector<std::vector<char>> sa(n_lin), sb(n_lin), ca(n_lin), cb(n_lin);
+        const int ta[2] = { pending, 12345 };
+        mtp_verify(ta, save_np, cur + 1, 0, L2x, hx);
+        std::vector<float> Lb((size_t)2 * n_vocab), hb(2 * n_embd);
+        const int tb[2] = { 999, 998 };
+        mtp_verify(tb, save_np + 1, cur + 2, 1, Lb, hb);
+        std::vector<char> stB(sst);
+        ggml_backend_tensor_get(ssm_state[0], stB.data(), 0, sst);
+        // restore, reference: [pending, 999, 998]
         for (int i = 0; i < n_lin; i++) {
-            sa[i].resize(sst); sb[i].resize(sst); ca[i].resize(cst); cb[i].resize(cst);
-            ggml_backend_tensor_get(ssm_state[i], sa[i].data(), 0, sst);     // after both
-            ggml_backend_tensor_get(ssm_state_b[i], sb[i].data(), 0, sst);   // after one
-            ggml_backend_tensor_get(conv_state[i], ca[i].data(), 0, cst);
-            ggml_backend_tensor_get(conv_state_b[i], cb[i].data(), 0, cst);
-        }
-        // restore the prefill state and run the reference two T=1 steps
-        for (int i = 0; i < n_lin; i++) {
-            ggml_backend_tensor_set(ssm_state[i], ssave[i].data(), 0, sst);
-            ggml_backend_tensor_set(conv_state[i], csave[i].data(), 0, cst);
+            ggml_backend_tensor_set(ssm_state[i], sv[i].data(), 0, sst);
+            ggml_backend_tensor_set(conv_state[i], cv[i].data(), 0, cst);
         }
         n_past = save_np;
-        std::vector<float> L1s, L2s(n_vocab), h2(n_vocab ? n_embd : 0), dummy(n_vocab);
+        std::vector<float> Lr(n_vocab), dummy(n_vocab);
         TextGraph g;
-        std::vector<int> sp1 = { cur + 1, cur + 1, cur + 1, save_np };
-        run_text(g, { pending }, nullptr, nullptr, sp1, L1s, &dummy);
-        std::vector<int> sp2 = { cur + 2, cur + 2, cur + 2, save_np + 1 };
-        run_text(g, { 12345 }, nullptr, nullptr, sp2, L2s, nullptr);
-        // state after step 1 should equal the verify's slot1
-        double srel = 0;
-        {
-            std::vector<char> after1(sst);
-            ggml_backend_tensor_get(ssm_state[0], after1.data(), 0, sst);
-            const float * x = (const float *)after1.data(), * y = (const float *)sb[0].data();
+        std::vector<int> p1 = { cur + 1, cur + 1, cur + 1, save_np };
+        run_text(g, { pending }, nullptr, nullptr, p1, Lr, &dummy);
+        std::vector<int> p2 = { cur + 2, cur + 2, cur + 2, save_np + 1 };
+        run_text(g, { 999 }, nullptr, nullptr, p2, Lr, nullptr);
+        std::vector<int> p3 = { cur + 3, cur + 3, cur + 3, save_np + 2 };
+        run_text(g, { 998 }, nullptr, nullptr, p3, Lr, nullptr);
+        {   const float * x = (const float *)stB.data(), * y = (const float *)sv[0].data();  // y unused norm base
+            (void)y;
+            std::vector<char> ref3(sst);
+            ggml_backend_tensor_get(ssm_state[0], ref3.data(), 0, sst);
+            const float * r = (const float *)ref3.data(), * b = (const float *)stB.data();
             double num = 0, den = 0;
-            for (size_t i = 0; i < sst / 4; i++) { double d = x[i] - y[i]; num += d * d; den += (double)y[i] * y[i]; }
-            srel = sqrt(num / (den + 1e-12));
+            for (size_t i = 0; i < sst / 4; i++) { double d = r[i] - b[i]; num += d * d; den += (double)r[i] * r[i]; }
+            int amB = (int)(std::max_element(Lb.begin(), Lb.begin() + n_vocab) - Lb.begin());
+            int amR = (int)(std::max_element(Lr.begin(), Lr.end()) - Lr.begin());
+            fprintf(stderr, "[selftest] REJECT-PATH: state rel=%.3e argmax %d vs %d\n", sqrt(num / (den + 1e-12)), amB, amR);
         }
-        (void)s1; (void)c0; (void)c1; (void)s0; (void)ca; (void)sa;
-        double rel = 0, na = 0;
-        for (int i = 0; i < n_embd; i++) { double d = hx[n_embd + i] - h2[i]; rel += d * d; na += (double)h2[i] * h2[i]; }
-        double lrel = 0, ln2 = 0;
-        for (int i = 0; i < n_vocab; i++) { double d = L2x[n_vocab + i] - L2s[i]; lrel += d * d; ln2 += (double)L2s[i] * L2s[i]; }
-        double nx = 0; for (int i = 0; i < n_embd; i++) nx += (double)hx[n_embd + i] * hx[n_embd + i];
-        { double nb_norm = 0; for (size_t i = 0; i < sst / 4; i++) nb_norm += (double)((const float *)sb[0].data())[i] * ((const float *)sb[0].data())[i]; fprintf(stderr, "[selftest] |slot1|=%.3f (0 => never written)\n", sqrt(nb_norm)); }
-        {   // where do the slot1 diffs live?
-            std::vector<char> after1(sst);
-            ggml_backend_tensor_get(ssm_state[0], after1.data(), 0, sst);
-            const float * x = (const float *)after1.data(), * y = (const float *)sb[0].data();
-            double mx = 0; int mi = -1, nd = 0;
-            for (size_t i = 0; i < sst / 4; i++) { double d = fabs(x[i] - y[i]); if (d > 1e-4) nd++; if (d > mx) { mx = d; mi = (int)i; } }
-            fprintf(stderr, "[selftest] slot1 diffs: %d/%d elems, max %.4f at %d (head %d row %d col %d)\n",
-                    nd, (int)(sst / 4), mx, mi, mi / (128 * 128), (mi / 128) % 128, mi % 128);
-        }
-        int am1 = (int)(std::max_element(L2x.begin() + n_vocab, L2x.begin() + 2 * n_vocab) - L2x.begin()) - n_vocab;
-        int am2 = (int)(std::max_element(L2s.begin(), L2s.end()) - L2s.begin());
-        fprintf(stderr, "[selftest] hidden rel=%.3e (|hx|=%.1f |h2|=%.1f) logits rel=%.3e argmax %d vs %d | state rel=%.3e\n",
-                sqrt(rel / (na + 1e-12)), sqrt(nx), sqrt(na), sqrt(lrel / (ln2 + 1e-12)), am1, am2, srel);
-        return false;   // probe run: caller output discarded
+        return false;
     }
     while (n_dec < max_new) {
         if (pending == id_eos || pending == id_endoftext) break;
@@ -225,8 +199,6 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
         // decided - only its hidden feeds the chain), step 2 predicts d1
         const int d0 = mtp_draft_step(seed_tok, h.data(), write_base, cur + 1, dlog, dh);
         if (d0 < 0) return false;
-        static long dbg_rounds = 0;
-        if (dbg_rounds < 8) { fprintf(stderr, "[spec-dbg] round %ld: seed=%d d0=%d pending=%d match=%d\n", dbg_rounds, seed_tok, d0, pending, d0 == pending); dbg_rounds++; }
         const int d1 = mtp_draft_step(d0, dh.data(), write_base + 1, cur + 2, dlog, dh);
         if (d1 < 0) return false;
         const int toks[2] = { pending, d1 };
@@ -242,8 +214,6 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
         n_dec++;
         rounds++;
         static const bool force_rej = getenv("QWEN35_SPEC_FORCE_REJ") != nullptr;
-        static long dbg2 = 0;
-        if (dbg2 < 40) { fprintf(stderr, "[spec-r] %ld: pending=%d d1=%d g1=%d acc=%d\n", dbg2, pending, d1, g1, g1 == d1); dbg2++; }
         if (g1 == d1 && !force_rej) {
             if (d1 == id_eos || d1 == id_endoftext || n_dec >= max_new) break;
             const std::string p2 = tok_.decode({d1});

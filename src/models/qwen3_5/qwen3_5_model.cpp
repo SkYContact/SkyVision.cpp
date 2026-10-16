@@ -1376,8 +1376,10 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     std::string raw;
     int next = sample(logits, gp);
     int n_dec = 0;
-    static const bool spec_off = getenv("QWEN35_SPEC") != nullptr && !strcmp(getenv("QWEN35_SPEC"), "0");
-    if (has_mtp && !spec_off && !h_seed.empty()) {
+    // opt-in while the accept-path snapshot semantics are being fixed (dev-notes)
+    const char * spec_env = getenv("QWEN35_SPEC");
+    static const bool spec_on = spec_env != nullptr && strcmp(spec_env, "0") != 0;
+    if (has_mtp && spec_on && !h_seed.empty()) {
         if (!run_speculative(next, ids.back(), logits, h_seed.data(), max_new, gp, raw, n_dec))
             return false;
     } else {
