@@ -28,8 +28,14 @@
 #endif
 #include "tokenizer.hpp"
 #include "ggml_dump.hpp"
+
+#include <map>
 #include "stage_buf.hpp"
 #include "mage_preprocess.hpp"
+#include "mage_gate.hpp"
+#include "ggml_dump.hpp"
+
+#include <map>
 #include "attention.hpp"
 #include "sampler.hpp"
 #include "vqa_util.hpp"
@@ -82,6 +88,23 @@ public:
     const char * name() const override { return "mage-vl-4b"; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
+    // rt streaming: frames-only turns go through the gate (System 1 decides
+    // whether the event is response-worthy); questions bypass it
+    bool ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                     const vqa::GenParams & gp, std::string & out_text) override {
+        if (!prompt.empty() || !gate_ready_) return ask(media, prompt, "", gp, out_text);
+        std::vector<float> scores;
+        if (!gate_scores(media, scores) || scores.empty()) return ask(media, "", "", gp, out_text);
+        const float tau = [] { const char * e = getenv("MAGE_GATE_TAU"); return e ? atof(e) : 0.5f; }();
+        if (scores.back() < tau) {
+            fprintf(stderr, "gate: silence (p=%.3f < %.2f)\n", (double)scores.back(), (double)tau);
+            out_text.clear();
+            return true;   // silent turn: nothing for the stream to emit
+        }
+        fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
+        return ask(media, "Please describe the video content in detail based on the provided information.",
+                   "", gp, out_text);
+    }
 
     // tunables, set before load()
     int n_ctx = 8192;
@@ -148,6 +171,33 @@ private:
 
     void (*stage_cb)(const char *, int, int, void *) = nullptr;
     void * stage_ud = nullptr;
+
+    // ---- StreamMind gate (System 1, proactive streaming) ----
+    bool load_gate(const char * path);
+    bool build_gate_graph();
+    void gate_cleanup();
+    // perception tokens for one segment: per-frame mean-pooled [T, 2560]
+    bool gate_scores(const vqa::MediaInput & media, std::vector<float> & scores);
+    std::string gate_path;                 // discovered *-gate.gguf
+    bool gate_ready_ = false;
+
+    // gate weights (host F32 for the mamba/nets) + cls graph state
+    mage::MambaWeights gm_;
+    mage::ClsWeights cls_;                  // host fallback (MAGE_GATE_HOST=1)
+    std::vector<float> gm_norm_w_, gm_norm_b_, gm_pre_w_, gm_pre_b_, gm_post_w_, gm_post_b_;
+    ggml_backend_t gate_backend_ = nullptr;     // cls graph runs here (CPU or CUDA)
+    ggml_gallocr_t gate_allocr_ = nullptr;
+    ggml_context * gate_wctx_ = nullptr;        // cls tensors (mmap-backed)
+    ggml_backend_buffer_t gate_wbuf_ = nullptr;
+    vqa::MMap gate_mm_;
+    ggml_context * gate_gctx_ = nullptr;
+    ggml_cgraph * gate_gf_ = nullptr;
+    ggml_tensor * gate_tok_in_ = nullptr;       // [2560, 1] perception token
+    ggml_tensor * gate_logits_ = nullptr;       // [2, 1]
+    vqa::AlignedBuf gate_f32_;                  // 1D cls norms as host F32
+    std::vector<float> gate_emb0_;              // cls embed row 0 (target token)
+    std::vector<float> tmp_gate_f32_;
+    bool gate_graph_built_ = false;
 
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 };
@@ -222,7 +272,16 @@ float MageVL::randf() {
     return (float)(((rng_state * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0));
 }
 
+void MageVL::gate_cleanup() {
+    if (gate_gctx_) ggml_free(gate_gctx_);
+    if (gate_allocr_) ggml_gallocr_free(gate_allocr_);
+    if (gate_wbuf_) ggml_backend_buffer_free(gate_wbuf_);
+    if (gate_backend_) ggml_backend_free(gate_backend_);
+    gate_gctx_ = nullptr; gate_allocr_ = nullptr; gate_wbuf_ = nullptr; gate_backend_ = nullptr;
+}
+
 MageVL::~MageVL() {
+    gate_cleanup();
     if (allocr) ggml_gallocr_free(allocr);
     if (dec_ctx) ggml_free(dec_ctx);
     kv.free();
@@ -282,9 +341,122 @@ bool MageVL::load(const std::string & gguf_path, const std::string & tokenizer_p
     caps_.timestamps_prompt = true;
 
     if (const char * e = getenv("MAGE_PACK")) vision_pack = std::max(1, atoi(e));
-    fprintf(stderr, "mage_vl: ready (%d text layers, %d vision layers, ctx %d)\n",
-            n_layer, vc.n_layer, n_ctx);
+    // System 1: auto-discover the StreamMind gate next to the gguf (or $MAGE_GATE)
+    if (const char * e = getenv("MAGE_GATE")) gate_path = e;
+    if (gate_path.empty()) {
+        std::string dir = gguf_path;
+        const size_t slash = dir.find_last_of("/\\");
+        if (slash != std::string::npos) dir = dir.substr(0, slash); else dir = ".";
+        for (const std::string & cand : { dir + "/mage-gate-f16.gguf", dir + "/mage-gate-q8_0.gguf" })
+            if (FILE * f = fopen(cand.c_str(), "rb")) { fclose(f); gate_path = cand; break; }
+    }
+    if (!gate_path.empty()) { fprintf(stderr, "mage_gate: discovering %s\n", gate_path.c_str()); load_gate(gate_path.c_str()); }
+    fprintf(stderr, "mage_vl: ready (%d text layers, %d vision layers, ctx %d%s)\n",
+            n_layer, vc.n_layer, n_ctx, gate_ready_ ? ", StreamMind gate loaded" : "");
     return true;
+}
+
+// ---------------------------------------------------------------- gate
+bool MageVL::load_gate(const char * path) {
+    vqa::MMap mm;
+    if (!mm.load(path)) { fprintf(stderr, "mage_gate: mmap failed: %s\n", path); return false; }
+    ggml_context * wctx = nullptr;
+    struct gguf_init_params p = { /*no_alloc*/ true, /*ctx*/ &wctx };
+    struct gguf_context * gu = gguf_init_from_file(path, p);
+    if (!gu) { fprintf(stderr, "mage_gate: gguf init failed\n"); return false; }
+    const size_t data_off = gguf_get_data_offset(gu);
+    const int64_t nt = gguf_get_n_tensors(gu);
+    for (int64_t i = 0; i < nt; i++) {
+        if (ggml_tensor * t = ggml_get_tensor(wctx, gguf_get_tensor_name(gu, i)))
+            t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
+    }
+    gguf_free(gu);
+
+    gm_.load(nullptr, wctx);       // mamba parts -> host F32
+    cls_.load(wctx);               // cls classifier -> host F32 (fallback path)
+    auto f32n = [&](const char * n, std::vector<float> & out) {
+        if (ggml_tensor * t = ggml_get_tensor(wctx, n)) mage::tensor_to_f32_host(t, out);
+    };
+    f32n("gm.norm_fn.weight", gm_norm_w_);
+    f32n("gm.norm_fn.bias", gm_norm_b_);
+    f32n("gm.pre.fc3.weight", gm_pre_w_);
+    f32n("gm.pre.fc3.bias", gm_pre_b_);
+    f32n("gm.post.fc3.weight", gm_post_w_);
+    f32n("gm.post.fc3.bias", gm_post_b_);
+    if (ggml_tensor * t = ggml_get_tensor(wctx, "cls.token_embd.weight")) {
+        std::vector<float> emb;
+        mage::tensor_to_f32_host(t, emb);
+        gate_emb0_.assign(emb.begin(), emb.begin() + n_embd);
+    }
+
+    // pick the cls backend (CPU by default; CUDA with MAGE_GATE_GPU=1)
+#ifdef GGML_USE_CUDA
+    if (getenv("MAGE_GATE_GPU")) gate_backend_ = ggml_backend_cuda_init(0);
+#endif
+    if (!gate_backend_) gate_backend_ = ggml_backend_cpu_init();
+    if (!gate_backend_) return false;
+    if (n_threads > 0) ggml_backend_cpu_set_n_threads(gate_backend_, std::min(n_threads, 8));
+    gate_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gate_backend_));
+
+    // 1D tensors (norms, biases) become F32 BEFORE allocation: the cls graph
+    // multiplies activations by them and ggml's binary ops reject f32 x f16.
+    // Single pass: convert into a staging pool (indices, so growth is safe),
+    // then materialize the pool and upload everything from it.
+    std::map<ggml_tensor *, size_t> f32_idx;
+    std::vector<std::pair<ggml_tensor *, const void *>> ups;
+    std::vector<float> f32pool;
+    for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
+        ups.push_back({t, t->data});
+        if (!(t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1) || t->type == GGML_TYPE_F32) continue;
+        mage::tensor_to_f32_host(t, tmp_gate_f32_);
+        f32_idx[t] = f32pool.size();
+        f32pool.insert(f32pool.end(), tmp_gate_f32_.begin(), tmp_gate_f32_.end());
+        const int64_t n = ggml_nelements(t);
+        t->type = GGML_TYPE_F32;          // sized as F32 at alloc time
+        t->nb[0] = sizeof(float);
+        t->nb[1] = (size_t)n * sizeof(float);
+        t->nb[2] = t->nb[1];
+        t->nb[3] = t->nb[2];
+    }
+    gate_f32_.resize(f32pool.size() * sizeof(float));
+    memcpy(gate_f32_.data(), f32pool.data(), gate_f32_.size());
+    for (auto & u : ups) u.first->data = nullptr;   // alloc skips non-null data
+    gate_wbuf_ = ggml_backend_alloc_ctx_tensors(wctx, gate_backend_);
+    if (!gate_wbuf_) { fprintf(stderr, "mage_gate: weight alloc failed\n"); return false; }
+    for (auto & u : ups) {
+        auto it = f32_idx.find(u.first);
+        if (it != f32_idx.end())
+            ggml_backend_tensor_set(u.first, gate_f32_.data() + it->second, 0, ggml_nbytes(u.first));
+        else
+            ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
+    }
+    gate_wctx_ = wctx;
+    gate_ready_ = true;
+    fprintf(stderr, "mage_gate: StreamMind gate loaded from %s (System 1 active)\n", path);
+    return true;
+}
+
+void MageVL::dump(const ggml_cgraph * gf, const char * name) {
+    if (dump_dir.empty()) return;
+    ggml_tensor * t = vqa::dump::lookup((ggml_cgraph *)gf, name);   // registry first (sinks)
+    if (!t || !t->data) return;
+    std::string path = dump_dir + "/cpp_" + name + ".bin";
+    std::vector<float> tmp((size_t)ggml_nelements(t));
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, tmp.data(), 0, sizeof(float) * tmp.size());
+    } else {
+        std::vector<ggml_fp16_t> h(ggml_nelements(t));
+        ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
+        for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
+    }
+    FILE * f = fopen(path.c_str(), "wb");
+    if (f) { fwrite(tmp.data(), sizeof(float), tmp.size(), f); fclose(f); }
+    FILE * m = fopen((dump_dir + "/cpp_" + name + ".shape").c_str(), "w");
+    if (m) {
+        fprintf(m, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1],
+                (long long)t->ne[2], (long long)t->ne[3]);
+        fclose(m);
+    }
 }
 
 bool MageVL::load_weights(const char * path) {
@@ -465,28 +637,6 @@ bool MageVL::alloc_kv() {
     return kv.alloc(backend, n_layer, n_kv_head, head_dim, n_ctx);
 }
 
-void MageVL::dump(const ggml_cgraph * gf, const char * name) {
-    if (dump_dir.empty()) return;
-    ggml_tensor * t = ggml_graph_get_tensor((ggml_cgraph *)gf, name);
-    if (!t || !t->data) return;
-    std::string path = dump_dir + "/cpp_" + name + ".bin";
-    std::vector<float> tmp((size_t)ggml_nelements(t));
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, tmp.data(), 0, sizeof(float) * tmp.size());
-    } else {
-        std::vector<ggml_fp16_t> h(ggml_nelements(t));
-        ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
-        for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
-    }
-    FILE * f = fopen(path.c_str(), "wb");
-    if (f) { fwrite(tmp.data(), sizeof(float), tmp.size(), f); fclose(f); }
-    FILE * m = fopen((dump_dir + "/cpp_" + name + ".shape").c_str(), "w");
-    if (m) {
-        fprintf(m, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1],
-                (long long)t->ne[2], (long long)t->ne[3]);
-        fclose(m);
-    }
-}
 
 // ---------------------------------------------------------------- vision
 bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
@@ -804,6 +954,220 @@ bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
     return true;
 }
 
+
+// gate cls graph: inputs = one perception token [2560,1]; the graph embeds
+// target id 0, runs the 2-token pair through the 4-layer vocab-2 Qwen3 and
+// returns the pos-0 logits [2,1]. F16 K/V for flash attention (required).
+bool MageVL::build_gate_graph() {
+    if (gate_graph_built_) return true;
+    struct ggml_init_params ip = { 32ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    gate_gctx_ = ggml_init(ip);
+    if (!gate_gctx_) return false;
+    gate_gf_ = ggml_new_graph_custom(gate_gctx_, 4096, false);
+
+    auto gt = [&](const char * n) { return ggml_get_tensor(gate_wctx_, n); };
+    ggml_tensor * tok_embd = gt("cls.token_embd.weight");
+    ggml_tensor * out_w = gt("cls.output.weight");
+    ggml_tensor * out_norm = gt("cls.output_norm.weight");
+
+    const int T = 2, D = n_embd, HD = head_dim, NH = n_head, NKV = n_kv_head;
+    gate_tok_in_ = ggml_new_tensor_2d(gate_gctx_, GGML_TYPE_F32, D, T);
+    ggml_set_name(gate_tok_in_, "gate_pair_in");
+    // keep the pair input alive for dumps (it is a graph leaf)
+    if (!dump_dir.empty()) {
+        static const char * const pn[] = { "gate_pair_in", nullptr };
+        vqa::dump::mark_sinks(gate_gctx_, gate_gf_, pn);
+    }
+
+    ggml_tensor * x = gate_tok_in_;   // host assembles the full [D, 2] pair
+
+    ggml_tensor * mask = ggml_new_tensor_2d(gate_gctx_, GGML_TYPE_F16, T, T);
+    ggml_set_name(mask, "gate_mask");
+    ggml_tensor * pos = ggml_new_tensor_1d(gate_gctx_, GGML_TYPE_I32, T);
+    ggml_set_name(pos, "gate_pos");
+
+    for (int il = 0; il < 4; il++) {
+        char buf[96];
+        auto g = [&](const char * sfx) {
+            snprintf(buf, sizeof(buf), "cls.blk.%d.%s", il, sfx);
+            return gt(buf);
+        };
+        ggml_tensor * l = ggml_rms_norm(gate_gctx_, x, rms_eps);
+        l = ggml_mul(gate_gctx_, l, g("attn_norm.weight"));
+        if (il == 0) ggml_set_name(l, "gate_l0_l");
+        ggml_tensor * q = ggml_mul_mat(gate_gctx_, g("attn_q.weight"), l);
+        ggml_tensor * k = ggml_mul_mat(gate_gctx_, g("attn_k.weight"), l);
+        ggml_tensor * v = ggml_mul_mat(gate_gctx_, g("attn_v.weight"), l);
+        ggml_tensor * q3 = ggml_reshape_3d(gate_gctx_, q, HD, NH, T);
+        q3 = ggml_rms_norm(gate_gctx_, q3, rms_eps);
+        q3 = ggml_mul(gate_gctx_, q3, g("attn_q_norm.weight"));
+        ggml_tensor * k3 = ggml_reshape_3d(gate_gctx_, k, HD, NKV, T);
+        k3 = ggml_rms_norm(gate_gctx_, k3, rms_eps);
+        k3 = ggml_mul(gate_gctx_, k3, g("attn_k_norm.weight"));
+        if (il == 0) {
+            ggml_set_name(q3, "gate_l0_qraw");
+            ggml_set_name(q3, "gate_l0_q");
+            ggml_set_name(k3, "gate_l0_k");
+            ggml_set_name(v, "gate_l0_v");
+        }
+        q3 = ggml_rope_ext(gate_gctx_, q3, pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, 8192,
+                           1000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k3 = ggml_rope_ext(gate_gctx_, k3, pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, 8192,
+                           1000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * qf = ggml_view_3d(gate_gctx_, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
+        ggml_tensor * kf = ggml_cast(gate_gctx_, ggml_cont(gate_gctx_,
+            ggml_view_3d(gate_gctx_, k3, HD, T, NKV, k3->nb[2], k3->nb[1], 0)), GGML_TYPE_F16);
+        ggml_tensor * vf = ggml_cast(gate_gctx_, ggml_cont(gate_gctx_,
+            ggml_view_3d(gate_gctx_, v, HD, T, NKV, HD * sizeof(float), v->nb[1], 0)), GGML_TYPE_F16);
+        ggml_tensor * fa = ggml_flash_attn_ext(gate_gctx_, qf, kf, vf, mask,
+                                               1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+        if (il == 0) ggml_set_name(fa, "gate_l0_fa");
+        ggml_tensor * attn = ggml_reshape_2d(gate_gctx_, ggml_cont(gate_gctx_, fa), NH * HD, T);
+        attn = ggml_mul_mat(gate_gctx_, g("attn_output.weight"), attn);
+        x = ggml_add(gate_gctx_, x, attn);
+        if (il == 0) ggml_set_name(x, "gate_l0_attn_out");
+        ggml_tensor * m = ggml_rms_norm(gate_gctx_, x, rms_eps);
+        m = ggml_mul(gate_gctx_, m, g("ffn_norm.weight"));
+        ggml_tensor * gate = ggml_mul_mat(gate_gctx_, g("ffn_gate.weight"), m);
+        ggml_tensor * up = ggml_mul_mat(gate_gctx_, g("ffn_up.weight"), m);
+        m = ggml_swiglu_split(gate_gctx_, gate, up);
+        if (il == 0) ggml_set_name(m, "gate_l0_swiglu");
+        m = ggml_mul_mat(gate_gctx_, g("ffn_down.weight"), m);
+        x = ggml_add(gate_gctx_, x, m);
+        if (il == 0) ggml_set_name(x, "gate_l0_out");
+    }
+    x = ggml_rms_norm(gate_gctx_, x, rms_eps);
+    x = ggml_mul(gate_gctx_, x, out_norm);
+    ggml_tensor * first = ggml_view_2d(gate_gctx_, x, D, 1, x->nb[1], 0);
+    gate_logits_ = ggml_mul_mat(gate_gctx_, out_w, first);      // [2, 1]
+    ggml_set_name(gate_logits_, "gate_logits");
+    ggml_build_forward_expand(gate_gf_, gate_logits_);
+    if (!dump_dir.empty()) {
+        static const char * const gn[] = { "gate_x", "gate_l0_l",
+                                           "gate_l0_q", "gate_l0_k", "gate_l0_v",
+                                           "gate_l0_fa", "gate_l0_attn_out",
+                                           "gate_l0_swiglu", "gate_l0_out", nullptr };
+        vqa::dump::mark_sinks(gate_gctx_, gate_gf_, gn);
+    }
+    if (!ggml_gallocr_alloc_graph(gate_allocr_, gate_gf_)) {
+        fprintf(stderr, "mage_gate: cls graph alloc failed\n");
+        return false;
+    }
+    gate_graph_built_ = true;
+    return true;
+}
+
+// Gate scoring over a whole segment: per-frame mean-pooled perception tokens
+// run through pre_net -> mamba (recurrent) -> post_net, the last frame's token
+// goes through the cls pair. Returns per-frame p(speak).
+bool MageVL::gate_scores(const vqa::MediaInput & media, std::vector<float> & scores) {
+    scores.clear();
+    if (!gate_ready_) return false;
+    std::vector<float> feats;
+    int n_tok = 0;
+    if (!encode_vision(media, feats, &n_tok, nullptr, 0)) return false;
+    const int D = n_embd;
+    const int T = n_tok ? std::max(1, n_tok / std::max(1, (int)media.frames.size())) : 0;
+    if (!T) return false;
+    const int nF = n_tok / T;
+
+    mage::GateStream stream;
+    stream.reset(&gm_);
+    std::vector<float> scratch(stream.scratch_size());
+    FILE * gate_dbg = nullptr;
+    if (const char * e = getenv("MAGE_GATE_DUMP")) gate_dbg = fopen(e, "wb");
+    std::vector<float> pooled((size_t)D);
+    std::vector<float> tok(D);
+    int32_t ids1 = 0;
+    std::vector<ggml_fp16_t> mask_v((size_t)4);
+    mask_v[0] = ggml_fp32_to_fp16(0.0f);
+    mask_v[1] = ggml_fp32_to_fp16(-INFINITY);
+    mask_v[2] = ggml_fp32_to_fp16(0.0f);
+    mask_v[3] = ggml_fp32_to_fp16(0.0f);
+    int32_t pos_v[2] = { 0, 1 };
+
+    for (int f = 0; f < nF; f++) {
+        std::fill(pooled.begin(), pooled.end(), 0.0f);
+        for (int t = 0; t < T; t++)
+            for (int d = 0; d < D; d++)
+                pooled[d] += feats[(size_t)(f * T + t) * D + d];
+        for (int d = 0; d < D; d++) pooled[d] /= (float)T;
+        if (gate_dbg) fwrite(pooled.data(), sizeof(float), D, gate_dbg);
+        // pre_net: fc3 + leaky_relu
+        std::vector<float> tok(D);
+        for (int d = 0; d < D; d++) {
+            float v = gm_pre_b_[d];
+            const float * w = gm_pre_w_.data() + (size_t)d * D;
+            for (int c = 0; c < D; c++) v += w[c] * pooled[c];
+            tok[d] = v > 0 ? v : 0.01f * v;
+        }
+        // mamba block (residual semantics per mamba_ssm Block), then norm_fn
+        std::vector<float> mixed(D);
+        stream.step(tok.data(), mixed.data(), scratch);
+        for (int d = 0; d < D; d++) tok[d] = mixed[d] + 2.0f * tok[d];
+        {
+            float mu = 0, var = 0;
+            for (int d = 0; d < D; d++) mu += tok[d];
+            mu /= D;
+            for (int d = 0; d < D; d++) { float e = tok[d] - mu; var += e * e; }
+            var /= D;
+            float is = 1.0f / std::sqrt(var + 1e-5f);
+            for (int d = 0; d < D; d++) tok[d] = (tok[d] - mu) * is * gm_norm_w_[d] + gm_norm_b_[d];
+        }
+        if (gate_dbg) fwrite(tok.data(), sizeof(float), D, gate_dbg);
+        // post_net: fc3(leaky_relu(x)) - leaky on the INPUT (official PostNet)
+        std::vector<float> post(D);
+        for (int d = 0; d < D; d++) {
+            float v = gm_post_b_[d];
+            const float * w = gm_post_w_.data() + (size_t)d * D;
+            for (int c = 0; c < D; c++) {
+                const float xc = tok[c];
+                v += w[c] * (xc > 0 ? xc : 0.01f * xc);
+            }
+            post[d] = v;
+        }
+        fprintf(stderr, "[gv] f%d post done tok[0..3]=%.4f %.4f %.4f %.4f post[0]=%.4f\n", f,
+                tok[0], tok[1], tok[2], tok[3], post[0]);
+        if (gate_dbg) fwrite(post.data(), sizeof(float), D, gate_dbg);
+        float lg[2];
+        // host loop is the default (numerically verified vs the reference);
+        // the ggml-graph variant is behind MAGE_GATE_GRAPH=1 (still NaN)
+        if (!getenv("MAGE_GATE_GRAPH")) {
+            cls_.forward(post.data(), lg, scratch);
+        } else {
+            if (!build_gate_graph()) return false;
+            // host assembles the [D, 2] pair: col0 = perception token, col1 = embed(0)
+            std::vector<float> pairv((size_t)D * 2);
+            memcpy(pairv.data(), post.data(), sizeof(float) * D);
+            memcpy(pairv.data() + D, gate_emb0_.data(), sizeof(float) * D);
+            ggml_backend_tensor_set(gate_tok_in_, pairv.data(), 0, sizeof(float) * D * 2);
+            {
+                std::vector<ggml_fp16_t> mask_v(4);
+                mask_v[0] = ggml_fp32_to_fp16(0.0f);
+                mask_v[1] = ggml_fp32_to_fp16(-INFINITY);
+                mask_v[2] = ggml_fp32_to_fp16(0.0f);
+                mask_v[3] = ggml_fp32_to_fp16(0.0f);
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gate_gf_, "gate_mask"), mask_v.data(), 0, sizeof(ggml_fp16_t) * 4);
+                int32_t pos_v[2] = { 0, 1 };
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gate_gf_, "gate_pos"), pos_v, 0, sizeof(pos_v));
+            }
+            if (ggml_backend_graph_compute(gate_backend_, gate_gf_) != GGML_STATUS_SUCCESS) return false;
+            if (!dump_dir.empty()) {
+                dump(gate_gf_, "gate_x"); dump(gate_gf_, "gate_l0_l"); dump(gate_gf_, "gate_l0_q");
+                dump(gate_gf_, "gate_l0_k"); dump(gate_gf_, "gate_l0_v"); dump(gate_gf_, "gate_l0_fa");
+                dump(gate_gf_, "gate_l0_attn_out"); dump(gate_gf_, "gate_l0_swiglu");
+                dump(gate_gf_, "gate_l0_out"); dump(gate_gf_, "gate_logits");
+            }
+            ggml_backend_tensor_get(gate_logits_, lg, 0, sizeof(lg));
+        }
+        float m = std::max(lg[0], lg[1]);
+        float e0 = std::exp(lg[0] - m), e1 = std::exp(lg[1] - m);
+        scores.push_back(e1 / (e0 + e1));
+    }
+    if (gate_dbg) { fclose(gate_dbg); fprintf(stderr, "gate: perception tokens dumped\n"); }
+    return true;
+}
+
 // ---------------------------------------------------------------- text
 bool MageVL::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all) {
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
@@ -1024,7 +1388,41 @@ int MageVL::sample(const std::vector<float> & logits, const vqa::GenParams & gp)
 }
 
 bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
-                 const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
+                 const std::string & mode, const vqa::GenParams & gp, std::string & out_text) {
+    // ---- System 1 modes ----------------------------------------------------
+    // "gate[:tau]"      score only: per-frame p(speak) report, no generation
+    // "gated[:tau]"     generate only when the last frame crosses tau
+    if (mode.rfind("gate", 0) == 0) {
+        if (!gate_ready_) { out_text = "(StreamMind gate not loaded: drop mage-gate-f16.gguf next to the model)"; return true; }
+        const float tau = mode.size() > 4 && mode[4] == ':' ? atof(mode.c_str() + 5) : 0.5f;
+        std::vector<float> scores;
+        if (!gate_scores(media, scores)) { out_text = "(gate scoring failed)"; return false; }
+        const double fps = media.fps > 0 ? media.fps : 2.0;
+        char line[96];
+        out_text.clear();
+        for (size_t i = 0; i < scores.size(); i++) {
+            snprintf(line, sizeof(line), "[t=%.1fs] p(speak)=%.3f %s\n",
+                     (double)i / fps, (double)scores[i], scores[i] >= tau ? "RESPONSE" : "silence");
+            out_text += line;
+            if (gp.on_token) gp.on_token(line, gp.on_token_ud);
+        }
+        return true;
+    }
+    if (mode.rfind("gated", 0) == 0 && gate_ready_) {
+        const float tau = mode.size() > 5 && mode[5] == ':' ? atof(mode.c_str() + 6) : 0.5f;
+        std::vector<float> scores;
+        if (!gate_scores(media, scores)) return false;
+        if (!scores.empty() && scores.back() < tau) {
+            out_text = "(silence)";
+            if (gp.on_token) gp.on_token(out_text.c_str(), gp.on_token_ud);
+            fprintf(stderr, "gate: silence (p=%.3f < %.2f)\n", (double)scores.back(), (double)tau);
+            return true;
+        }
+        if (!scores.empty())
+            fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
+        // fall through to normal generation
+    }
+
     std::vector<float> feats;
     int n_img = 0;
     stage_cb = gp.on_stage;
