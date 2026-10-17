@@ -51,17 +51,16 @@ std::string resolve_tokenizer_path(const std::string & arg) {
 
 namespace vqa {
 
-// The moondream3 engine still lives in its own binary (moondream-cli); it is wired
-// behind this same interface in a follow-up step. Until then the factory reports it
-// as unavailable instead of failing to link.
-// create_moondream() is defined by the moondream backend adapter
-// (moondream_vqa_adapter.inc) once linked into the same binary.
+// The moondream3 engine lives behind the same interface via its adapter
+// (moondream_vqa_adapter.inc), so every backend is reachable from one binary.
 
 Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
     if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
     if (arch == "moss_vl") return create_moss_vl();
-    if (arch == "videomae") return create_videomae();   // video tower: labels or embedding
+    // video towers: labels or pooled embedding. ViViT is the same graph with a cls
+    // token + learned position table, so it reuses the videomae backend.
+    if (arch == "videomae" || arch == "vivit") return create_videomae();
     if (arch == "moondream3") return create_moondream();
     return nullptr;
 }

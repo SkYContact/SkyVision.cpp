@@ -23,19 +23,21 @@ void sample_frame_indices(int n, int want, std::vector<int> & idx) {
 
 void preprocess_frame(const uint8_t * rgb, int w, int h, const PreConfig & pc, float * dst) {
     const int S = pc.image_size;
-    // shortest edge -> S, the other side scaled by the aspect ratio (HF uses an
+    const int R = pc.resize_shortest > 0 ? pc.resize_shortest : S;
+    // shortest edge -> R, the other side scaled by the aspect ratio (HF uses an
     // int() cast there, so truncation rather than rounding)
     int rw = w, rh = h;
     if (w <= h) {
-        rw = S;
-        rh = std::max(S, (int)((double)S * h / (double)w));
+        rw = R;
+        rh = std::max(R, (int)((double)R * h / (double)w));
     } else {
-        rh = S;
-        rw = std::max(S, (int)((double)S * w / (double)h));
+        rh = R;
+        rw = std::max(R, (int)((double)R * w / (double)h));
     }
 
     std::vector<float> resized;
-    vqa::img::resize_bicubic_antialias(rgb, w, h, rw, rh, resized);   // interleaved RGB, [0,255]
+    // interleaved RGB, [0,255]; HF's `resample` is a PILImageResampling value
+    vqa::img::resize_antialias(rgb, w, h, rw, rh, resized, /*bilinear*/ pc.resample == 2);
 
     const int oy = (rh - S) / 2, ox = (rw - S) / 2;
     for (int y = 0; y < S; y++) {

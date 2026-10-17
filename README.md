@@ -16,6 +16,7 @@
 | **Qwen3.5 系（含 Marlin-2B）** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
+| **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
 
 ## 当前状态
 
@@ -231,6 +232,32 @@ python convert/convert_videomae.py --src models/videomae-base-ft   # → videoma
 本仓库提交前已用另一条独立通道（numpy 从 GGUF 权重复算整条前向，preprocess 用引擎自己的
 `patches` 导出）验证：12 层全长 maxdiff 8e-3（值域 ~13），patch 嵌入 3e-3，block0 注意力
 3e-4，Kinetics-400 分类头 400 个概率与引擎最大差 8.7e-6——都在 F16 权重噪声量级。
+
+### ViViT
+
+`google/vivit-b-16x2` 在 HF 里就是"ViT + tubelet 卷积 + cls token"，所以直接复用 `videomae`
+后端，差别全部走 GGUF 元数据：
+
+```bash
+python convert/convert_vivit.py --src models/vivit-b-16x2      # → vivit-f16.gguf（约 183MB）
+```
+
+- **cls token**：学出来的参数（`v.cls_token.weight`），在 patch 嵌入之后、位置相加之前 concat
+  到序列最前面；位置表本身有 3137 行（含 cls）
+- **位置表是学出来的参数**（`vivit.embeddings.position_embeddings`），与 VideoMAE 的固定
+  sin-cos 不同
+- **激活是 `gelu_fast`**：注意 transformers 的 `FastGELUActivation` 是**tanh 形式**，不是
+  `x·sigmoid(1.702x)`（后者叫 `quick_gelu`）——一开始按 sigmoid 理解导致 block0 就对不上，
+  用 numpy 复算三种激活才定位到
+- LN eps **1e-6**；q/k/v **三路都有 bias**（VideoMAE 的 key 没有）
+- 预处理：短边 256 → center crop 224，**双线性**重采样（`preprocessor_config.json` 里
+  `resample: 2` 是 PIL 的 BILINEAR，不是 BICUBIC），零中心化（等价 mean=std=0.5）
+- 32 帧 → 3136 patch token + 1 cls；CPU（19 核）单 clip 约 2.2 s
+
+对拍：`python scripts/ref_vivit.py --model models/vivit-b-16x2 --image photo.jpg --out ref_vivit`，
+引擎 `--dump-dir ref_vivit` 跑同一张图，实测 `v_patch_out` mean|d| 3.5e-3、block0 1.0e-2、
+12 层全长 1.4e-2（值域 22，corr 0.99977）、400 类概率最大差 **6.0e-3**（top-5 标签顺序一致），
+残差全部来自重采样舍入（像素级差 ~1.8 灰阶）。
 
 模型权重遵循各自的许可证（moondream 为
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。

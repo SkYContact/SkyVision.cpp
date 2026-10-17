@@ -139,8 +139,8 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "architecture: %s\n", arch.c_str());
 
-    // a pure video tower (videomae) has no text side at all: no tokenizer needed
-    const bool needs_tokenizer = arch != "videomae";
+    // pure video towers (videomae / vivit) have no text side at all: no tokenizer
+    const bool needs_tokenizer = arch != "videomae" && arch != "vivit";
     std::string tok_path = vqa::resolve_tokenizer_path(tokenizer_arg);
     if (!tok_path.empty()) {
         // keep the explicit argument as given

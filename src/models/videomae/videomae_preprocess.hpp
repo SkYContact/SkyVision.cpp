@@ -19,7 +19,10 @@
 namespace videomae {
 
 struct PreConfig {
-    int image_size = 224;
+    int image_size = 224;        // center crop size
+    int resize_shortest = 0;     // shortest edge before the crop (0 = image_size;
+                                 // ViViT resizes to 256 and then crops 224)
+    int resample = 3;            // PILImageResampling: 2 = bilinear, 3 = bicubic
     int patch = 16;
     int tubelet = 2;
     int num_frames = 16;

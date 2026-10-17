@@ -23,6 +23,11 @@ bool smart_resize(int height, int width, int factor, int min_pixels, int max_pix
 void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                               std::vector<float>& out);
 
+// Same, with a selectable kernel. HF stores `resample` as a PILImageResampling
+// value: 2 = BILINEAR, 3 = BICUBIC - so a checkpoint can ask for either.
+void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
+                      std::vector<float>& out, bool bilinear = false);
+
 // Bilinear interpolation of a learned (side, side, dim) position table onto a
 // (gh, gw) grid: torch.linspace(0, side-1, g) endpoints, floor/ceil clipping.
 // Writes (gh*gw, dim) row-major. Qwen2-VL / MOSS-VL semantic (VideoChat3 uses the

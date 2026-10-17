@@ -36,6 +36,7 @@ needed to run it.
 | Marlin-2B image/video VQA | ✅ end to end with **stage-by-stage parity verified** against the official transformers 5.20 reference (pixel values bitwise-identical, tower drift beats official bf16, logits 1.5e-2 vs f32); `--mode caption` / `--mode find` wired to the canonical trained prompts |
 | VideoChat3-4B video input | 🔜 frame decoding and timestamped prompts are designed but not wired up yet |
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
+| ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 
 ## Quick start
 
@@ -205,6 +206,30 @@ dumps the official `v_patch_out / v_blk0_out / v_final / v_pooled / v_logits / v
 engine with `--dump-dir ref_videomae` on the same clip and diff the `cpp_*.bin` files stage by stage
 (the engine also exports `v_blk0_qkv` and `v_blk0_attn_out`, plus `VIDEOMAE_MAX_LAYERS=N` for
 per-layer drift).
+
+### ViViT
+
+`google/vivit-b-16x2` is, in the transformers implementation, a ViT over tubelet tokens with a
+cls token - so it reuses the videomae backend and everything else is GGUF metadata:
+
+```bash
+python convert/convert_vivit.py --src models/vivit-b-16x2      # -> vivit-f16.gguf (~183MB)
+```
+
+- learned **cls token** (`v.cls_token.weight`), concatenated after the patch embedding and
+  before the position add; the position table has 3137 rows (cls included);
+- the position table is a **learned parameter**, unlike VideoMAE's generated sin-cos table;
+- `hidden_act = gelu_fast` is transformers' `FastGELUActivation`, i.e. the **tanh** form, not
+  `x*sigmoid(1.702x)` (that one is `quick_gelu`) - assuming the sigmoid form is what made block 0
+  diverge at first;
+- LN eps **1e-6** and a bias on all of q/k/v;
+- preprocessing: shortest edge 256 -> center crop 224 with **bilinear** resampling
+  (`resample: 2` is PIL's BILINEAR) and zero centering (mean = std = 0.5).
+
+Parity: `python scripts/ref_vivit.py --model models/vivit-b-16x2 --image photo.jpg --out ref_vivit`,
+engine with `--dump-dir ref_vivit` - patch tokens mean|d| 3.5e-3, block 0 1.0e-2, 12 layers
+1.4e-2 (values up to 22, corr 0.99977), all 400 Kinetics probabilities within **6e-3** with the
+same top-5 order. The residual comes from resampling rounding (~1.8 grey levels per pixel).
 
 Model weights follow their own licenses (moondream: the
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)) and are **not**

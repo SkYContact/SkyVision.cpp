@@ -71,17 +71,20 @@ public:
     bool load(const std::string & gguf_path, const std::string & tokenizer_path,
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override;
     const vqa::Capabilities & caps() const override { return caps_; }
-    const char * name() const override { return "videomae"; }
+    const char * name() const override { return arch_name.c_str(); }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp,
              std::string & out_text) override;
 
     // hyper-parameters (metadata of the converted checkpoint)
+    std::string arch_name = "videomae";
     int n_layer = 12, n_embd = 768, n_head = 12, n_ff = 3072;
     int patch = 16, tubelet = 2, image_size = 224, num_frames = 16;
-    int n_patches = 0, n_labels = 0;
+    int resize_shortest = 0, resample = 3, n_patches = 0, n_labels = 0;
+    int hidden_act = 0;   // 0 = gelu (erf, nn.GELU) | 1 = gelu_fast (sigmoid) | 2 = gelu (tanh)
     float ln_eps = 1e-12f;
     bool use_mean_pooling = true, has_classifier = false, has_final_norm = true;
+    bool has_cls_token = false;
     float mean[3] = {0.485f, 0.456f, 0.406f}, std[3] = {0.229f, 0.224f, 0.225f};
     std::vector<std::string> labels;
 
@@ -114,6 +117,7 @@ private:
     ggml_tensor *t_pooled = nullptr, *t_probs = nullptr;
 
     ggml_tensor *patch_w = nullptr, *patch_b = nullptr, *pos_emb = nullptr;
+    ggml_tensor *cls_tok = nullptr;   // learned cls token (ViViT); VideoMAE has none
     ggml_tensor *norm_w = nullptr, *norm_b = nullptr;
     ggml_tensor *fc_norm_w = nullptr, *fc_norm_b = nullptr;
     ggml_tensor *cls_w = nullptr, *cls_b = nullptr;
@@ -147,12 +151,13 @@ bool VideoMAE::load(const std::string & gguf_path, const std::string & tokenizer
     caps_ = {};
     caps_.image = true;    // a still image becomes a clip of identical frames
     caps_.video = true;
-    fprintf(stderr, "videomae: ready (%d layers, %d tokens/clip, %s)\n", n_layer, n_patches,
+    fprintf(stderr, "%s: ready (%d layers, %d patch tokens%s, %s)\n", arch_name.c_str(),
+            n_layer, n_patches, has_cls_token ? " + cls" : "",
             has_classifier ? "classifier head" : "pooled embedding only");
     if (!has_classifier)
-        fprintf(stderr, "videomae: this checkpoint has no classification head "
-                        "(MCG-NJU/videomae-base is the pretraining release); use "
-                        "MCG-NJU/videomae-base-finetuned-kinetics for labels\n");
+        fprintf(stderr, "%s: this checkpoint has no classification head "
+                        "(pretraining release); use a *-finetuned-* checkpoint for labels\n",
+                arch_name.c_str());
     return true;
 }
 
@@ -164,31 +169,54 @@ bool VideoMAE::load_weights(const char * path) {
     struct gguf_context * gu = gguf_init_from_file(path, p);
     if (!gu) { fprintf(stderr, "gguf init failed\n"); return false; }
 
-    n_layer      = vqa::gguf::u32(gu, "videomae.block_count", n_layer);
-    n_embd       = vqa::gguf::u32(gu, "videomae.embedding_length", n_embd);
-    n_head       = vqa::gguf::u32(gu, "videomae.attention.head_count", n_head);
-    n_ff         = vqa::gguf::u32(gu, "videomae.feed_forward_length", n_ff);
-    patch        = vqa::gguf::u32(gu, "videomae.patch_size", patch);
-    tubelet      = vqa::gguf::u32(gu, "videomae.tubelet_size", tubelet);
-    image_size   = vqa::gguf::u32(gu, "videomae.image_size", image_size);
-    num_frames   = vqa::gguf::u32(gu, "videomae.num_frames", num_frames);
-    ln_eps       = vqa::gguf::f32(gu, "videomae.layer_norm_epsilon", ln_eps);
-    use_mean_pooling = vqa::gguf::boolean(gu, "videomae.use_mean_pooling", use_mean_pooling);
-    has_final_norm = vqa::gguf::boolean(gu, "videomae.has_final_norm", true);
-    has_classifier = vqa::gguf::boolean(gu, "videomae.has_classifier", false);
-    n_labels     = vqa::gguf::u32(gu, "videomae.num_labels", 0);
+    // metadata is namespaced by the checkpoint's architecture: videomae.* or vivit.*
+    arch_name = vqa::architecture_of(path);
+    if (arch_name.empty()) arch_name = "videomae";
+    const std::string pre = arch_name + ".";
+    auto k = [&](const char * s) { return pre + s; };
+
+    n_layer      = vqa::gguf::u32(gu, k("block_count").c_str(), n_layer);
+    n_embd       = vqa::gguf::u32(gu, k("embedding_length").c_str(), n_embd);
+    n_head       = vqa::gguf::u32(gu, k("attention.head_count").c_str(), n_head);
+    n_ff         = vqa::gguf::u32(gu, k("feed_forward_length").c_str(), n_ff);
+    patch        = vqa::gguf::u32(gu, k("patch_size").c_str(), patch);
+    tubelet      = vqa::gguf::u32(gu, k("tubelet_size").c_str(), tubelet);
+    image_size   = vqa::gguf::u32(gu, k("image_size").c_str(), image_size);
+    num_frames   = vqa::gguf::u32(gu, k("num_frames").c_str(), num_frames);
+    resize_shortest = vqa::gguf::u32(gu, k("resize_shortest").c_str(), 0);
+    resample     = vqa::gguf::u32(gu, k("resize_resample").c_str(), 3);   // PIL: 2 bilinear, 3 bicubic
+    ln_eps       = vqa::gguf::f32(gu, k("layer_norm_epsilon").c_str(), ln_eps);
+    use_mean_pooling = vqa::gguf::boolean(gu, k("use_mean_pooling").c_str(), use_mean_pooling);
+    has_final_norm = vqa::gguf::boolean(gu, k("has_final_norm").c_str(), true);
+    has_classifier = vqa::gguf::boolean(gu, k("has_classifier").c_str(), false);
+    has_cls_token = vqa::gguf::boolean(gu, k("has_cls_token").c_str(), false);
+    n_labels     = vqa::gguf::u32(gu, k("num_labels").c_str(), 0);
+    {
+        // transformers names: gelu = exact erf, gelu_fast/gelu_new/gelu_tanh = the tanh
+        // form (FastGELUActivation is tanh, NOT x*sigmoid(1.702x)), quick_gelu = sigmoid
+        const std::string act = vqa::gguf::str(gu, k("hidden_act").c_str(), "gelu");
+        if (act == "gelu" || act == "gelu_python" || act == "gelu_accurate") hidden_act = 0;
+        else if (act == "gelu_fast" || act == "gelu_new" || act == "gelu_tanh" ||
+                 act == "gelu_pytorch_tanh") hidden_act = 2;
+        else if (act == "gelu_quick" || act == "quick_gelu") hidden_act = 1;
+        else {
+            hidden_act = 0;
+            fprintf(stderr, "note: hidden_act '%s' is not implemented, using gelu(erf)\n",
+                    act.c_str());
+        }
+    }
     if (n_embd % n_head) {
         fprintf(stderr, "embedding_length %d is not divisible by head_count %d\n", n_embd, n_head);
         gguf_free(gu);
         return false;
     }
     {
-        int64_t id = gguf_find_key(gu, "videomae.image_mean");
+        int64_t id = gguf_find_key(gu, k("image_mean").c_str());
         if (id >= 0 && gguf_get_arr_n(gu, id) == 3) {
             const float * a = (const float *)gguf_get_arr_data(gu, id);
             for (int c = 0; c < 3; c++) mean[c] = a[c];
         }
-        id = gguf_find_key(gu, "videomae.image_std");
+        id = gguf_find_key(gu, k("image_std").c_str());
         if (id >= 0 && gguf_get_arr_n(gu, id) == 3) {
             const float * a = (const float *)gguf_get_arr_data(gu, id);
             for (int c = 0; c < 3; c++) std[c] = a[c];
@@ -196,7 +224,7 @@ bool VideoMAE::load_weights(const char * path) {
     }
     labels.clear();
     {
-        int64_t id = gguf_find_key(gu, "videomae.labels");
+        int64_t id = gguf_find_key(gu, k("labels").c_str());
         if (id >= 0) {
             const int64_t n = gguf_get_arr_n(gu, id);
             for (int64_t i = 0; i < n; i++) labels.push_back(gguf_get_arr_str(gu, id, (int)i));
@@ -236,6 +264,7 @@ bool VideoMAE::load_weights(const char * path) {
     patch_w = gt("v.patch_embd.weight");
     patch_b = gt("v.patch_embd.bias");
     pos_emb = gt("v.pos_emb.weight");
+    if (has_cls_token) cls_tok = ggml_get_tensor(wctx, "v.cls_token.weight");
     if (has_final_norm) {
         norm_w = gt("v.norm.weight");
         norm_b = gt("v.norm.bias");
@@ -263,6 +292,7 @@ bool VideoMAE::load_weights(const char * path) {
         L.fc0_w = g("fc1.weight");   L.fc0_b = g("fc1.bias");
         L.fc1_w = g("fc2.weight");   L.fc1_b = g("fc2.bias");
     }
+    if (has_cls_token && !cls_tok) { fprintf(stderr, "missing tensor: v.cls_token.weight\n"); return false; }
     return patch_w && patch_b && pos_emb && (!has_final_norm || (norm_w && norm_b));
 }
 
@@ -278,6 +308,7 @@ namespace {
 struct BuildCtx {
     ggml_context * ctx = nullptr;
     int n_embd = 0, n_head = 0, hd = 0, N = 0;
+    int act = 0;          // 0 gelu(erf) | 1 gelu_fast(sigmoid) | 2 gelu(tanh)
     bool names = false;   // name the layer-0 parity tensors (dump_dir set)
 };
 
@@ -297,7 +328,12 @@ ggml_tensor * attn_hook(void * ud, ggml_tensor * qkv) {
 }
 
 ggml_tensor * gelu_hook(void * ud, ggml_tensor * t) {
-    return ggml_gelu_erf(((BuildCtx *)ud)->ctx, t);   // nn.GELU() == exact erf
+    BuildCtx * b = (BuildCtx *)ud;
+    switch (b->act) {
+        case 1:  return ggml_gelu_quick(b->ctx, t);   // gelu_fast: x*sigmoid(1.702x)
+        case 2:  return ggml_gelu(b->ctx, t);         // tanh approximation
+        default: return ggml_gelu_erf(b->ctx, t);     // nn.GELU() == exact erf (VideoMAE)
+    }
 }
 
 // layer-0 parity sinks: name only (the graph is permanent, nothing to truncate)
@@ -315,7 +351,8 @@ bool probe_layer0(void * ud, const char * stage, ggml_tensor * t) {
 
 bool VideoMAE::build_graph() {
     if (n_patches <= 0 || !patch_w || !patch_b || !pos_emb) return false;
-    const int N = n_patches;
+    const int Np = n_patches;                                   // patch tokens
+    const int N = Np + (has_cls_token ? 1 : 0);                  // sequence seen by the encoder
     const int C3 = (int)patch_w->ne[0];
     const int hd = n_embd / n_head;
     // ggml ne = [in, out] for the matmul weights, [dim, tokens] for the position table
@@ -339,13 +376,19 @@ bool VideoMAE::build_graph() {
     b.n_head = n_head;
     b.hd = hd;
     b.N = N;
+    b.act = hidden_act;
     b.names = !dump_dir.empty();
 
-    in_patches = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, C3, N);
+    in_patches = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, C3, Np);
     ggml_set_name(in_patches, "patches");
 
     ggml_tensor * x = ggml_mul_mat(gctx, patch_w, in_patches);
     x = ggml_add(gctx, x, patch_b);
+    if (has_cls_token) {
+        // ViViT prepends a learned cls token; the position table already has a row
+        // for it, so the concat has to happen before the position add
+        x = ggml_concat(gctx, ggml_reshape_2d(gctx, cls_tok, n_embd, 1), x, 1);
+    }
     x = ggml_add(gctx, x, ggml_view_2d(gctx, pos_emb, n_embd, N, pos_emb->nb[1], 0));
     ggml_set_name(x, "v_patch_out");
 
@@ -410,7 +453,7 @@ bool VideoMAE::build_graph() {
         return false;
     }
     // build+alloc happens once; a per-clip rebuild would add this to every clip
-    fprintf(stderr, "[perf] videomae: graph build+alloc %.0f ms\n",
+    fprintf(stderr, "[perf] %s: graph build+alloc %.0f ms\n", arch_name.c_str(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb0).count());
     t_pooled = ggml_graph_get_tensor(gf, "v_pooled");
     t_probs = probs_t ? ggml_graph_get_tensor(gf, "v_probs") : nullptr;
@@ -427,10 +470,12 @@ bool VideoMAE::encode(const vqa::MediaInput & media, std::vector<float> & pooled
     pooled.clear();
     probs.clear();
     *n_tokens = 0;
-    if (!gf) { fprintf(stderr, "videomae: graph not built\n"); return false; }
+    if (!gf) { fprintf(stderr, "%s: graph not built\n", arch_name.c_str()); return false; }
 
     PreConfig pc;
     pc.image_size = image_size;
+    pc.resize_shortest = resize_shortest;
+    pc.resample = resample;
     pc.patch = patch;
     pc.tubelet = tubelet;
     pc.num_frames = num_frames;
@@ -452,7 +497,8 @@ bool VideoMAE::encode(const vqa::MediaInput & media, std::vector<float> & pooled
     }
     auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    fprintf(stderr, "[perf] videomae: clip %d tokens x %d layers in %.0f ms\n", n_patches, n_layer, ms);
+    fprintf(stderr, "[perf] %s: clip %d tokens x %d layers in %.0f ms\n", arch_name.c_str(),
+            n_patches + (has_cls_token ? 1 : 0), n_layer, ms);
 
     pooled.resize((size_t)n_embd);
     ggml_backend_tensor_get(t_pooled, pooled.data(), 0, sizeof(float) * (size_t)n_embd);
@@ -483,11 +529,12 @@ bool VideoMAE::ask(const vqa::MediaInput & media, const std::string & prompt,
     (void)gp;
     out_text.clear();
     if (media.empty()) {
-        fprintf(stderr, "videomae: no frames (pass --video/--frames, or --image)\n");
+        fprintf(stderr, "%s: no frames (pass --video/--frames, or --image)\n",
+                arch_name.c_str());
         return false;
     }
     if ((int)media.frames.size() != num_frames)
-        fprintf(stderr, "videomae: %zu frame%s in, using %d uniform samples\n",
+        fprintf(stderr, "%s: %zu frame%s in, using %d uniform samples\n", arch_name.c_str(),
                 media.frames.size(), media.frames.size() == 1 ? "" : "s", num_frames);
 
     if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
