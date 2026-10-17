@@ -33,6 +33,7 @@
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
 #include "stage_buf.hpp"
+#include "load_util.hpp"     // LoadOptions plumbing + token id resolution
 #include "resample.hpp"      // vqa::img::smart_resize / resize_bicubic_antialias
 #include "weight_load.hpp"   // mmap bind / 1D->f32 / zero-copy vs upload
 #include "qwen3_5_preprocess.hpp"
@@ -247,26 +248,21 @@ bool Qwen3_5::init_backend() {
 // ---------------------------------------------------------------- load
 bool Qwen3_5::load(const std::string & gguf_path, const std::string & tokenizer_path,
                   const vqa::LoadOptions & opt) {
-    n_ctx = opt.n_ctx > 0 ? opt.n_ctx : n_ctx;
-    n_threads = opt.n_threads;
-    use_gpu = opt.use_gpu;
-    dump_dir = opt.dump_dir;
-    if (const char * d = getenv("QWEN35_DUMP_DIR")) dump_dir = d;
+    n_ctx = vqa::resolve_n_ctx(opt, n_ctx);
+    vqa::apply_load_options(opt, "QWEN35", n_threads, use_gpu, dump_dir);
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::Qwen2Regex)) return false;
     if (!alloc_state()) return false;
 
-    auto pick = [&](const char * s, int def) {
-        int v = tok_.id_of(s);
-        return v >= 0 ? v : def;
-    };
-    id_image_pad = pick("<|image_pad|>", id_image_pad);
-    id_video_pad = pick("<|video_pad|>", id_video_pad);
-    id_vision_start = pick("<|vision_start|>", id_vision_start);
-    id_vision_end = pick("<|vision_end|>", id_vision_end);
-    id_eos = pick("<|im_end|>", 248046);
-    id_endoftext = pick("<|endoftext|>", id_endoftext);
+    vqa::assign_token_ids(tok_, {
+        { "<|image_pad|>",    &id_image_pad },
+        { "<|video_pad|>",    &id_video_pad },
+        { "<|vision_start|>", &id_vision_start },
+        { "<|vision_end|>",   &id_vision_end },
+        { "<|endoftext|>",    &id_endoftext },
+    });
+    id_eos = vqa::pick_token(tok_, "<|im_end|>", 248046);
 
     caps_ = {};
     caps_.image = true;

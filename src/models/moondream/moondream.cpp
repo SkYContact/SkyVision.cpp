@@ -706,11 +706,8 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
     if (logits && logits->data) {
         std::vector<float> lv(model.n_vocab);
         ggml_backend_tensor_get(logits, lv.data(), 0, sizeof(float) * model.n_vocab);
-        float best = -INFINITY;
-        for (int i = 0; i < model.n_vocab; i++) {
-            if (i >= 1 && i <= 9) continue;   // reserved control tokens never sampled
-            if (lv[i] > best) { best = lv[i]; argmax = i; }
-        }
+        // ids 1..9 are reserved control tokens and never sampled
+        argmax = vqa::greedy_argmax(lv.data(), model.n_vocab, 1, 9);
         if (last_logits_out) memcpy(last_logits_out, lv.data(), sizeof(float) * model.n_vocab);
     }
     n_past += n_seq;
@@ -894,7 +891,7 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
             if (detect_obj) {
                 float sl[2048];
                 rm.decode_size(hidden.data(), sl);
-                int bins[2] = { md_argmax(sl, 1024), md_argmax(sl + 1024, 1024) };
+                int bins[2] = { vqa::greedy_argmax(sl, 1024), vqa::greedy_argmax(sl + 1024, 1024) };
                 float sizes[2];
                 RegionModel::bins_to_size(bins, sizes);
                 w = sizes[0]; h = sizes[1];

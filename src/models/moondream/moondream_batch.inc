@@ -125,9 +125,7 @@ static int run_batch(Engine & e, const char * batch_path, int n_ctx, int n_gen) 
     std::vector<float> lv((size_t)e.model.n_vocab * B);
     const int V = e.model.n_vocab;
     auto col_argmax = [&](const float * col) {
-        int best = 0; float bv = -INFINITY;
-        for (int i = 0; i < V; i++) { if (i >= 1 && i <= 9) continue; if (col[i] > bv) { bv = col[i]; best = i; } }
-        return best;
+        return vqa::greedy_argmax(col, V, 1, 9);   // 1..9 are reserved control tokens
     };
 
     // prefill each sequence in its own KV slot range

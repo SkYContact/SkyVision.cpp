@@ -118,9 +118,7 @@ int VideoChat3::run_batch(const std::string & path, int n_gen) {
     std::vector<BatchSeq> seqs(B);
     std::vector<float> lv((size_t)n_vocab * B);
     auto col_argmax = [&](const float * col) {
-        int best = 0; float bv = -INFINITY;
-        for (int i = 0; i < n_vocab; i++) { if (col[i] > bv) { bv = col[i]; best = i; } }
-        return best;
+        return vqa::greedy_argmax(col, n_vocab);
     };
 
     // prefill: one sequence per call, attention windowed to the prompt length

@@ -207,7 +207,7 @@ static std::vector<std::array<float,4>> md_detect(Engine & e, VisionModel & vm, 
         e.step({}, nullptr, emb.data(), 1, hidden.data(), false);
         float sl[2048];
         rm.decode_size(hidden.data(), sl);
-        int bins[2] = { md_argmax(sl, 1024), md_argmax(sl + 1024, 1024) };
+        int bins[2] = { vqa::greedy_argmax(sl, 1024), vqa::greedy_argmax(sl + 1024, 1024) };
         float sizes[2];
         RegionModel::bins_to_size(bins, sizes);
         rm.encode_size(sizes, 1, emb.data());

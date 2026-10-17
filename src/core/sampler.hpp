@@ -20,15 +20,24 @@ inline float sampler_rand(uint64_t & state) {
     return (float)(((state * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0));
 }
 
+// Greedy argmax over [0, n). `skip_lo..skip_hi` is never selected when
+// skip_hi > skip_lo: moondream reserves ids 1..9 as control tokens and its
+// decode/batch paths must never emit them.
+inline int greedy_argmax(const float * v, int n, int skip_lo = 0, int skip_hi = 0) {
+    const bool skip = skip_hi > skip_lo;
+    int best = 0;
+    float bv = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        if (skip && i >= skip_lo && i <= skip_hi) continue;
+        if (v[i] > bv) { bv = v[i]; best = i; }
+    }
+    return best;
+}
+
 // returns the sampled token id from `logits`
 inline int sample_logits(const std::vector<float> & logits, const GenParams & gp, uint64_t & rng) {
-    if (gp.temperature <= 0.0f && gp.top_k <= 0) {
-        int best = 0;
-        float bv = -INFINITY;
-        for (int i = 0; i < (int)logits.size(); i++)
-            if (logits[i] > bv) { bv = logits[i]; best = i; }
-        return best;
-    }
+    if (gp.temperature <= 0.0f && gp.top_k <= 0)
+        return greedy_argmax(logits.data(), (int)logits.size());
     std::vector<std::pair<float, int>> cand(logits.size());
     for (int i = 0; i < (int)logits.size(); i++) cand[i] = {logits[i], i};
     std::sort(cand.begin(), cand.end(),

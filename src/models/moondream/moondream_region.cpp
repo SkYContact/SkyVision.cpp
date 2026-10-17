@@ -3,6 +3,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "sampler.hpp"    // vqa::greedy_argmax
 #include "vqa_util.hpp"   // vqa::MMap
 
 #include <algorithm>
@@ -23,15 +24,8 @@ static const double MD_PI = 3.14159265358979323846;
 #   include <unistd.h>
 #endif
 
-int md_argmax(const float * v, int n) {
-    int best = 0;
-    for (int i = 1; i < n; i++)
-        if (v[i] > v[best]) best = i;
-    return best;
-}
-
 float RegionModel::logits_to_center(const float * logits, int n_logits) {
-    return (float)md_argmax(logits, n_logits) / n_logits;
+    return (float)vqa::greedy_argmax(logits, n_logits) / n_logits;
 }
 
 void RegionModel::bins_to_size(const int * bins, float * sizes) {

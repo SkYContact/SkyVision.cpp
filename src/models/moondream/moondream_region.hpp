@@ -65,5 +65,4 @@ struct RegionModel {
     static void bins_to_size(const int * bins /*2*/, float * sizes /*2*/);
 };
 
-// argmax helper
-int md_argmax(const float * v, int n);
+// argmax: vqa::greedy_argmax in core/sampler.hpp (shared with the decode paths)

@@ -36,6 +36,7 @@
 #include "backend.hpp"
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
+#include "load_util.hpp"
 #include "weight_load.hpp"
 #include "attention.hpp"
 #include "sampler.hpp"
@@ -320,28 +321,23 @@ bool MossVL::init_backend() {
 // ---------------------------------------------------------------- load
 bool MossVL::load(const std::string & gguf_path, const std::string & tokenizer_path,
                   const vqa::LoadOptions & opt) {
-    n_ctx = opt.n_ctx > 0 ? opt.n_ctx : n_ctx;
-    n_threads = opt.n_threads;
-    use_gpu = opt.use_gpu;
-    dump_dir = opt.dump_dir;
-    if (const char * d = getenv("MOSS_DUMP_DIR")) dump_dir = d;
+    n_ctx = vqa::resolve_n_ctx(opt, n_ctx);
+    vqa::apply_load_options(opt, "MOSS", n_threads, use_gpu, dump_dir);
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::Qwen2Regex)) return false;
     if (!alloc_kv()) return false;
 
-    auto pick = [&](const char * s, int def) {
-        int v = tok_.id_of(s);
-        return v >= 0 ? v : def;
-    };
-    id_image_pad = pick("<|image_pad|>", id_image_pad);
-    id_vision_start = pick("<|vision_start|>", id_vision_start);
-    id_vision_end = pick("<|vision_end|>", id_vision_end);
-    id_im_start = pick("<|im_start|>", id_im_start);
-    id_im_end = pick("<|im_end|>", id_im_end);
+    vqa::assign_token_ids(tok_, {
+        { "<|image_pad|>",    &id_image_pad },
+        { "<|vision_start|>", &id_vision_start },
+        { "<|vision_end|>",   &id_vision_end },
+        { "<|im_start|>",     &id_im_start },
+        { "<|im_end|>",       &id_im_end },
+        { "<|time_start|>",   &id_time_start },
+        { "<|time_end|>",     &id_time_end },
+    });
     id_silence = tok_.id_of("<|silence|>");
-    id_time_start = pick("<|time_start|>", id_time_start);
-    id_time_end = pick("<|time_end|>", id_time_end);
     id_eos = id_im_end;
 
     caps_ = {};

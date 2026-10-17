@@ -43,6 +43,7 @@
 #include "backend.hpp"
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
+#include "load_util.hpp"
 #include "weight_load.hpp"
 #include "videomae_preprocess.hpp"
 #include "vit_block.hpp"
@@ -138,10 +139,7 @@ bool VideoMAE::init_backend() {
 bool VideoMAE::load(const std::string & gguf_path, const std::string & tokenizer_path,
                     const vqa::LoadOptions & opt) {
     (void)tokenizer_path;   // a pure video tower needs no tokenizer
-    n_threads = opt.n_threads;
-    use_gpu = opt.use_gpu;
-    dump_dir = opt.dump_dir;
-    if (const char * d = getenv("VIDEOMAE_DUMP_DIR")) dump_dir = d;
+    vqa::apply_load_options(opt, "VIDEOMAE", n_threads, use_gpu, dump_dir);
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!build_graph()) return false;
