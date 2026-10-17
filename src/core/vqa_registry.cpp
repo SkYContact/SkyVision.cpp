@@ -72,11 +72,30 @@ Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
     if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
     if (arch == "moss_vl") return create_moss_vl();
+    if (arch == "qwen2vl" || arch == "qwen2_5_vl") return create_qwen2vl();
     // video towers: labels or pooled embedding. ViViT is the same graph with a cls
     // token + learned position table, so it reuses the videomae backend.
     if (arch == "videomae" || arch == "vivit") return create_videomae();
     if (arch == "moondream3") return create_moondream();
     return nullptr;
+}
+
+ArchInfo arch_info(const std::string & arch) {
+    ArchInfo a;
+    // "supported" is answered by the factory itself: constructing a backend only
+    // allocates its own metadata (no weights are read), so wiring a new
+    // architecture into vqa_create_model is enough to make discovery list it.
+    Model * probe = vqa_create_model(arch);
+    if (!probe) return a;
+    delete probe;
+    a.supported = true;
+    if (arch == "moondream3") {
+        a.needs_vision_gguf = true;   // SigLIP tower ships as a separate gguf
+    } else if (arch == "videomae" || arch == "vivit") {
+        a.pure_vision = true;         // classification/embedding only
+        a.needs_tokenizer = false;
+    }
+    return a;
 }
 
 }  // namespace vqa

@@ -12,6 +12,7 @@
 #include "vqa.hpp"
 
 #include "media_io.hpp"
+#include "model_registry.hpp"
 #include "tokenizer.hpp"
 #include "vqa_util.hpp"
 
@@ -37,6 +38,8 @@ void usage() {
         "               [--image <file>] [--video <file> | --frames <dir>] [--fps <f>] [--max-frames <n>]\n"
         "               --ask <question> [--mode <skill>] [options]\n"
         "               --batch <prompts.txt>   text-only batched decode (one prompt per line)\n"
+        "               --serve [port]          Web UI (default 8899)\n"
+        "               --mcp                   MCP server on stdio (agent tools: see README)\n"
         "\n"
         "options:\n"
         "  --max-tokens N   max new tokens (default 256)\n"
@@ -89,6 +92,8 @@ int main(int argc, char ** argv) {
     int max_frames = 32;
     int serve_port = 0;
     std::string serve_host = "127.0.0.1";
+    std::string models_dir;          // --models-dir (Web UI / MCP discovery root)
+    bool mcp_mode = false;
     bool use_gpu = true, quiet = false, dump_ids = false;   // CUDA preferred, CPU fallback
 
     for (int i = 1; i < argc; i++) {
@@ -107,6 +112,8 @@ int main(int argc, char ** argv) {
         else if (a == "--max-frames") max_frames = atoi(next("--max-frames"));
         else if (a == "--serve") { serve_port = atoi(next("--serve")); if (serve_port <= 0) serve_port = 8899; }
         else if (a == "--host") serve_host = next("--host");
+        else if (a == "--models-dir") models_dir = next("--models-dir");
+        else if (a == "--mcp") mcp_mode = true;
         else if (a == "--batch") batch_path = next("--batch");
         else if (a == "--ask" || a == "-p") ask_text = next("--ask");
         else if (a == "--mode") mode = next("--mode");
@@ -126,8 +133,16 @@ int main(int argc, char ** argv) {
         else if (a == "--quiet") quiet = true;
         else { fprintf(stderr, "unknown argument: %s\n", a.c_str()); usage(); return 2; }
     }
+    // --- long-running front ends (no inference flags needed) ---
+    if (mcp_mode) {
+        // default to ./models when it exists: that is where the weights live
+        std::string dir = models_dir;
+        if (dir.empty()) dir = vqa::path_exists("models") ? "models" : ".";
+        return vqa::run_mcp_server(dir, tokenizer_arg.empty() ? "" : tokenizer_arg, model_path);
+    }
     if (serve_port > 0) {
-        return vqa::run_web_ui(serve_port, ".", "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
+        const std::string dir = models_dir.empty() ? "." : models_dir;
+        return vqa::run_web_ui(serve_port, dir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
     }
 
     if (model_path.empty()) { usage(); return 2; }

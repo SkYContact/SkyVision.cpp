@@ -42,6 +42,7 @@ set(VM_INC   ${CMAKE_SOURCE_DIR}/src/models/videomae)
 set(VQA_CORE_SRC
     src/core/vqa_util.cpp
     src/core/vqa_registry.cpp
+    src/core/model_registry.cpp
     src/core/media_io.cpp
     src/core/video_pipe.cpp
     src/core/backend.cpp
@@ -68,21 +69,27 @@ set(MOSS_VL_SRC
     src/models/moss_vl/moss_vl_preprocess.cpp
     src/models/moss_vl/moss_vl_model.cpp)
 
-#   src/models/videomae/     VideoMAE video tower (label distribution or embedding)
+#   src/models/videomae/     VideoMAE / ViViT video tower (labels or embedding)
 set(VIDEOMAE_SRC
     src/models/videomae/videomae_preprocess.cpp
     src/models/videomae/videomae_model.cpp)
+
+#   src/models/qwen2vl/      Qwen2.5-VL backend (Qwen2 trunk + windowed ViT)
+set(QWEN2VL_SRC
+    src/models/qwen2vl/qwen2vl_model.cpp)
 
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
     src/cli/vqa_server.cpp
+    src/cli/mcp_server.cpp
     ${VQA_CORE_SRC}
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC}
     ${QWEN35_SRC}
     ${MOSS_VL_SRC}
-    ${VIDEOMAE_SRC})
+    ${VIDEOMAE_SRC}
+    ${QWEN2VL_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
 

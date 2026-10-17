@@ -37,6 +37,7 @@ needed to run it.
 | VideoChat3-4B video input | 🔜 frame decoding and timestamped prompts are designed but not wired up yet |
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
+| Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
 
 ## Quick start
 
@@ -116,6 +117,72 @@ detect (green boxes), point (yellow crosshairs) and gaze prediction (click a sou
 predict the fixation point). Repeated queries on the same image reuse the vision encode and
 KV prefix (~1.2 s → ~66 ms). HTTP API: `POST /api/vision` with `mode=ask|caption|detect|point|gaze`
 (`caption` takes `len=short|normal|long`, `gaze` takes source `x=&y=`), image bytes as body.
+
+### 4. MCP server (for agents)
+
+`vqa-cli --mcp` wraps the same engine as a **Model Context Protocol** server over stdio
+(newline-delimited JSON-RPC), so any MCP client (CodeBuddy, Claude Desktop, a custom agent)
+can point the local models at images and videos without glue code:
+
+```bash
+# from the repo root; --models-dir defaults to ./models when it exists
+vqa-cli --mcp --models-dir models
+vqa-cli --mcp --models-dir models --model moondream3.1-q6k.gguf   # optional default model
+```
+
+Client entry (`mcpServers`) — the bundled launcher is the easy path: it cd's to the repo root,
+picks a build whose `vqa-cli` really knows `--mcp`, puts the `ggml*.dll` directory on `PATH`,
+then hands stdio to the server:
+
+```json
+{
+  "mcpServers": {
+    "skyvision": {
+      "command": "cmd",
+      "args": ["/c", "C:\\moondream\\scripts\\mcp-server.bat"],
+      "env": { "FFMPEG": "ffmpeg" }
+    }
+  }
+}
+```
+
+Pointing straight at the binary works too (then the DLLs are your responsibility):
+
+```json
+{
+  "mcpServers": {
+    "skyvision": {
+      "command": "C:/moondream/build-ninja/vqa-cli.exe",
+      "args": ["--mcp", "--models-dir", "C:/moondream/models"],
+      "env": { "PATH": "C:/moondream/build-ninja/bin;%PATH%" }
+    }
+  }
+}
+```
+
+> Shared-library builds keep `ggml*.dll` in `<build>/bin/`, which is not on a client's `PATH`
+> and not next to the exe, so use the launcher or fix `PATH` / copy the DLLs. Both
+> `scripts/mcp-server.bat` (Windows) and `scripts/mcp-server.sh` (Linux/macOS/WSL) honour
+> `SKYVISION_BUILD` and `SKYVISION_MODELS`. Video tools need `ffmpeg` (`FFMPEG` overrides the
+> path); image tools do not.
+
+| Tool | What it does |
+|---|---|
+| `list_models` | Runnable GGUFs (arch / quant / size / resident) plus the loaded model's skill bits |
+| `load_model` | Load explicitly (one resident model; loading another unloads it), `n_ctx` / `threads` / `gpu` |
+| `describe_image` | Caption, `length=short\|normal\|long` |
+| `ask_image` | Free-form VQA (`mode=ask-think` for moondream grounded reasoning), `session` for multi-turn |
+| `detect_objects` | Bounding boxes as JSON (normalised 0..1 + pixels); needs moondream3 + `*-region.gguf` |
+| `point_objects` | Target centre point, same requirement |
+| `gaze_point` | Fixation point from a start point, same requirement |
+| `analyze_video` | Video VQA (ffmpeg sampling, `fps` / `max_frames`); Marlin adds `mode=caption\|find` |
+| `classify_video` | Pure video tower (VideoMAE / ViViT) → top-k labels or the 768-d embedding |
+
+Conventions: media arguments accept a local path or inline bytes (`data:image/...;base64,<data>`,
+`base64:<data>`); a still image works for `classify_video` / `analyze_video` as a one-frame clip
+(no ffmpeg needed); coordinate tools return both normalised and pixel values. Tool failures come
+back as `isError: true` with a readable reason (not a JSON-RPC error code) — only protocol
+violations use JSON-RPC errors.
 
 ## Model conversion
 
@@ -231,6 +298,38 @@ engine with `--dump-dir ref_vivit` - patch tokens mean|d| 3.5e-3, block 0 1.0e-2
 1.4e-2 (values up to 22, corr 0.99977), all 400 Kinetics probabilities within **6e-3** with the
 same top-5 order. The residual comes from resampling rounding (~1.8 grey levels per pixel).
 
+### Qwen2.5-VL
+
+```bash
+python convert/convert_qwen2vl.py --src models/qwen2.5-vl-3b     # -> qwen2vl-f16.gguf (7.5GB)
+vqa-cli --model qwen2vl-f16.gguf --tokenizer models/qwen2.5-vl-3b \
+        --image photo.jpg --ask "How many people are in the image?"
+```
+
+Three bugs cost most of the debugging time here; all of them are the "numbers look plausible,
+answer is wrong" kind:
+
+1. **patches arrive in 2x2 group order**. `Qwen2VLImageProcessor` reshapes to
+   `(grid_t, gh/2, 2, gw/2, 2, C, T, P, P)` and transposes to
+   `(t, gh/2, gw/2, 2, 2)`, so packing them raster-order silently ruins the features.
+2. **the merger RMS-normalizes per token over 1280** and only then folds the 2x2 group into a
+   5120 row; normalizing after the fold destroys the features (this one hid behind "tower corr
+   0.98 but the answer is wrong").
+3. **the KV cache slot is not the MRoPE `t` axis**: every image token shares `t = st`, so using
+   that array as the `ggml_set_rows` index writes all 612 tokens into one slot.
+
+Also: preprocessing uses **CLIP mean/std** (not 0.5) with bicubic resizing and `smart_resize` to
+multiples of 28; text is section MRoPE (16/24/24), image tokens get `(st, st+h, st+w)` and `st`
+advances by `max(gh, gw)` afterwards; the next decode position is `max(pos)+1`, not `T`.
+
+Parity: `python scripts/ref_qwen2vl.py --model models/qwen2.5-vl-3b --image photo.jpg --out ref_q2v`
+plus the engine with `--dump-dir ref_q2v`. Measured: patches identical, block 0 maxdiff 0.16
+(values up to 15), tower output corr 0.982 (values up to 2.3e4), merged features corr **0.9935**,
+first token matches the official argmax and the answer matches too
+("There are five people in the image."). Debug knobs: `Q2V_MAX_VLAYERS=N` truncates the tower,
+`Q2V_FEATS=<file>` feeds features from disk (isolates tower vs text), `Q2V_DEBUG=1` prints tokens
+and the first-token top-5.
+
 Model weights follow their own licenses (moondream: the
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)) and are **not**
 distributed from this repository. The license explicitly allows quantization, conversion,
@@ -305,13 +404,14 @@ setup. moondream3.1 numbers are in [Status](#status).
 src/
   core/                shared layer: vqa::Model interface, mmap/UTF-8/JSON helpers, byte-level
                        BPE tokenizer, image & video-frame decoding (the single stb_image
-                       implementation lives here), architecture discovery
+                       implementation lives here), architecture discovery, model discovery +
+                       the single-resident slot (model_registry, shared by Web UI and MCP)
   models/moondream/    moondream3.1 backend (engine + vision tower + multi-crop preprocessing
                        + region head + server/batch)
   models/videochat3/   VideoChat3-4B backend (vision preprocessing + graphs)
   models/videomae/     VideoMAE video tower backend (clip preprocessing + space-time attention
                        + classifier / embedding)
-  cli/                 unified front end (vqa-cli)
+  cli/                 unified front end (vqa-cli: inference / --serve Web UI / --mcp server)
 convert/               HF checkpoint → GGUF converters
 scripts/               build scripts, parity and self-test tooling
 vendor/stb/            vendored single-header image decoder

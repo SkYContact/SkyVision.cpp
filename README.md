@@ -17,6 +17,7 @@
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 | **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
+| **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
 
 ## 当前状态
 
@@ -146,6 +147,71 @@ moondream Web UI 覆盖官方全部五个技能：图像描述（简短/标准/�
 HTTP API：`POST /api/vision`，`mode=ask|caption|detect|point|gaze`
 （caption 带 `len=short|normal|long`，gaze 带 `x=&y=` 起点坐标），body 为图片二进制。
 
+### 4. MCP 服务器（给 agent 用）
+
+`vqa-cli --mcp` 把同一个引擎包装成 **MCP（Model Context Protocol）** 服务器，走标准
+stdio + JSON-RPC（换行分隔），任何支持 MCP 的客户端（CodeBuddy / Claude Desktop / 自研 agent）
+都能直接让模型"看图/看视频"，不需要写粘合代码：
+
+```bash
+# 从仓库根目录启动；--models-dir 省略时用 ./models（不存在则用 .）
+vqa-cli --mcp --models-dir models
+# 也可以固定一个默认模型（工具调用里不写 model 时用它）
+vqa-cli --mcp --models-dir models --model moondream3.1-q6k.gguf
+```
+
+客户端配置示例（`mcpServers` 条目）——用仓库自带的启动脚本最省事，它会切到仓库根目录、
+挑一个真正支持 `--mcp` 的构建目录、把 `ggml*.dll` 所在目录加进 `PATH` 再启动：
+
+```json
+{
+  "mcpServers": {
+    "skyvision": {
+      "command": "cmd",
+      "args": ["/c", "C:\\moondream\\scripts\\mcp-server.bat"],
+      "env": { "FFMPEG": "ffmpeg" }
+    }
+  }
+}
+```
+
+也可以直接指向二进制（这时要自己保证 DLL 能找到）：
+
+```json
+{
+  "mcpServers": {
+    "skyvision": {
+      "command": "C:/moondream/build-ninja/vqa-cli.exe",
+      "args": ["--mcp", "--models-dir", "C:/moondream/models"],
+      "env": { "PATH": "C:/moondream/build-ninja/bin;%PATH%" }
+    }
+  }
+}
+```
+
+> 共享库版构建把 `ggml*.dll` 放在 `<build>/bin/`，客户端从任意工作目录启动时不会自动找到，
+> 所以要么走启动脚本，要么把该目录加进 `PATH`／把三个 DLL 拷到 `vqa-cli.exe` 旁边。
+> `scripts/mcp-server.bat`（Windows）与 `scripts/mcp-server.sh`（Linux/macOS/WSL）都支持
+> `SKYVISION_BUILD` / `SKYVISION_MODELS` 覆盖。视频工具另外需要 `ffmpeg`（`FFMPEG` 可指定
+> 路径），纯图片工具不需要。
+
+| 工具 | 说明 |
+|---|---|
+| `list_models` | 列出可运行的 GGUF（架构/量化/体积/是否常驻）+ 已加载模型的能力位 |
+| `load_model` | 显式加载（同一时刻只常驻一个模型；换模型会卸载旧的），可设 `n_ctx` / `threads` / `gpu` |
+| `describe_image` | 图像描述，`length=short\|normal\|long` |
+| `ask_image` | 自由提问（`mode=ask-think` 可开 moondream 的 grounded 推理），支持 `session` 多轮 |
+| `detect_objects` | 目标检测，返回 JSON（归一化 0..1 + 像素坐标），需 moondream3 + `*-region.gguf` |
+| `point_objects` | 目标中心点，同上 |
+| `gaze_point` | 由起点预测注视点，同上 |
+| `analyze_video` | 视频问答（ffmpeg 抽帧，`fps` / `max_frames`），Marlin 支持 `mode=caption\|find` |
+| `classify_video` | 纯视频塔（VideoMAE / ViViT）→ top-k 标签或 768 维嵌入 |
+
+约定：媒体参数既可以是本地路径，也可以是 `data:image/...;base64,<data>` / `base64:<data>`；
+静止图片可以直接喂给 `classify_video` / `analyze_video`（当作单帧 clip，不需要 ffmpeg）；
+坐标类工具返回两层坐标（`x1/y1…` 归一化、`x1_px/…` 像素），方便直接画框。
+工具失败以 `isError: true` + 可读原因返回（不占用 JSON-RPC 错误码），协议层错误才用 JSON-RPC error。
+
 ## 模型转换
 
 所有转换器都在 `convert/`，共用 `hf_source.py` 定位检查点、`_lib.py` 提供 GGUF/量化工具，
@@ -259,6 +325,37 @@ python convert/convert_vivit.py --src models/vivit-b-16x2      # → vivit-f16.g
 12 层全长 1.4e-2（值域 22，corr 0.99977）、400 类概率最大差 **6.0e-3**（top-5 标签顺序一致），
 残差全部来自重采样舍入（像素级差 ~1.8 灰阶）。
 
+### Qwen2.5-VL
+
+```bash
+python convert/convert_qwen2vl.py --src models/qwen2.5-vl-3b     # → qwen2vl-f16.gguf（7.5GB）
+vqa-cli --model qwen2vl-f16.gguf --tokenizer models/qwen2.5-vl-3b \
+        --image photo.jpg --ask "How many people are in the image?"
+```
+
+视觉塔（Qwen2.5 ViT）和文本主干（Qwen2）各自的图都照 llama.cpp / HF 的结构实现，踩到并修掉的
+三个坑值得记下来，它们都属于"数值看着像、结果全错"的类型：
+
+1. **patch 排布是 2×2 分组优先**。HF 的 `Qwen2VLImageProcessor` 会
+   `reshape(grid_t, gh/2, 2, gw/2, 2, C, T, P, P)` 再 `transpose(0,3,6,4,7,2,1,5,8)`，
+   所以 `pixel_values` 的行序是 `(t, gh/2, gw/2, 2, 2)`，不是光栅序。按光栅序打包会让
+   图像"看起来还在"，但特征全错。
+2. **merger 的 RMSNorm 是逐 token 1280 维**，归一化完才 reshape 成 5120 喂 fc1。先 reshape
+   再 norm（5200 维上归一化）会静默毁掉特征——这一条让我在"塔输出 corr 0.98 但答案错"上卡了很久。
+3. **KV cache 的槽位 ≠ MRoPE 的 t 轴**。图像 token 的 t 坐标全是同一个值（`st`），拿它当
+   `ggml_set_rows` 的索引会把 612 个 token 全写进同一格。槽位必须单独用 0..T-1。
+
+另外：预处理用 **CLIP mean/std**（不是 0.5）、bicubic 缩放、`smart_resize` 到 28 的倍数；
+文本是 section MRoPE（16/24/24），图像 token 位置 `(st, st+h, st+w)`，图像结束后 st += max(gh, gw)，
+解码时下一个位置取 `max(pos)+1` 而不是 `T`。
+
+对拍：`python scripts/ref_qwen2vl.py --model models/qwen2.5-vl-3b --image photo.jpg --out ref_q2v`，
+引擎 `--dump-dir ref_q2v` 跑同一输入。实测：patch 逐元素一致、block0 maxdiff 0.16（值域 15）、
+塔输出 corr 0.982（值域 2.3e4）、merged 特征 corr **0.9935**、首 token 命中官方 argmax；
+问答结果与官方一致（"There are five people in the image."）。调试开关：`Q2V_MAX_VLAYERS=N`
+截断视觉层数、`Q2V_FEATS=<file>` 直接用磁盘上的特征（隔离塔与文本侧）、`Q2V_DEBUG=1` 打印
+token 与首 token top5。
+
 模型权重遵循各自的许可证（moondream 为
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。
 该许可明确允许量化、转换、再分发、自托管与商用集成；仅对公众开放的通用 moondream API
@@ -328,11 +425,12 @@ moondream3.1 的数字见[当前状态](#当前状态)（官方标注来自 5070
 ```
 src/
   core/                共享层：vqa::Model 接口、mmap/UTF-8/JSON 工具、字节级 BPE 分词器、
-                       图像与视频帧解码（stb_image 实现所在）、按架构发现后端
+                       图像与视频帧解码（stb_image 实现所在）、按架构发现后端、
+                       模型发现与单实例驻留（model_registry，Web UI 与 MCP 共用）
   models/moondream/    moondream3.1 后端（引擎 + 视觉塔 + 多 crop 预处理 + region 头 + 服务端/批量）
   models/videochat3/   VideoChat3-4B 后端（视觉预处理 + 计算图）
   models/videomae/     VideoMAE 视频塔后端（clip 预处理 + 全时空注意力前向 + 分类/嵌入）
-  cli/                 统一前端 vqa-cli
+  cli/                 统一前端 vqa-cli（推理 / --serve Web UI / --mcp MCP 服务器）
 convert/               HF 检查点 → GGUF 转换器
 scripts/               构建脚本、parity 与自检脚本
 vendor/stb/            自带的单头图像解码器

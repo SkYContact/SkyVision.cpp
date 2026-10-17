@@ -114,13 +114,32 @@ Model * create_videochat3();
 Model * create_qwen3_5();
 Model * create_moss_vl();
 Model * create_videomae();
+Model * create_qwen2vl();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);
 
+// What a front end needs to know about an architecture before loading it: can
+// this build run it, and which files must sit next to the GGUF. Discovery uses
+// this instead of keeping its own copy of the backend list.
+struct ArchInfo {
+    bool supported = false;
+    bool needs_tokenizer = true;      // tokenizer.json (or an HF checkpoint dir)
+    bool needs_vision_gguf = false;   // moondream3: a *-vision.gguf sibling
+    bool pure_vision = false;         // video tower: no tokenizer, no text side
+};
+
+ArchInfo arch_info(const std::string & arch);
+
 // unified Web UI (vqa-cli --serve); returns process exit code
 int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
                const std::string & tokenizer, const char * bind_host);
+
+// MCP (Model Context Protocol) server over stdio (vqa-cli --mcp): exposes the
+// engine as agent-facing tools. `preset_model` is an optional id / gguf path
+// used when a tool call omits its "model" argument. Returns process exit code.
+int run_mcp_server(const std::string & models_dir, const std::string & tokenizer,
+                   const std::string & preset_model);
 
 // Peek "general.architecture" in a GGUF file without loading tensors.
 // Returns "" when the file cannot be read.

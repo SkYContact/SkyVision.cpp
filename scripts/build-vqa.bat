@@ -22,6 +22,7 @@ cmake -S . -B build-ninja -G Ninja ^
   %*
 if errorlevel 1 exit /b 1
 
-rem vqa-cli: unified front end   moondream-cli: moondream3.1 standalone binary
-rem add more targets on the command line, e.g.:  scripts\build-vqa.bat --target all
-cmake --build build-ninja --target vqa-cli moondream-cli %*
+rem vqa-cli: the single unified front end (inference / --serve Web UI / --mcp server);
+rem there is no separate moondream binary any more. Extra targets can be appended,
+rem e.g.:  scripts\build-vqa.bat --target all
+cmake --build build-ninja --target vqa-cli %*
