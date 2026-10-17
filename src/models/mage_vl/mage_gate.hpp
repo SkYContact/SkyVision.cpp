@@ -16,6 +16,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "gguf_util.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -43,24 +44,11 @@ struct MambaWeights {
     void load(struct gguf_context * gu, struct ggml_context * ctx);
 };
 
-// F32 read helper for any ggml tensor type (small host tensors only).
+// F32 read helper for any ggml tensor type (small host tensors only);
+// the conversion itself lives in core/gguf_util.hpp.
 static inline void tensor_to_f32_host(ggml_tensor * t, std::vector<float> & out) {
-    const int64_t n = ggml_nelements(t);
-    out.resize((size_t)n);
-    if (t->type == GGML_TYPE_F32) {
-        memcpy(out.data(), t->data, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * s = (const ggml_fp16_t *)t->data;
-        for (int64_t i = 0; i < n; i++) out[(size_t)i] = ggml_fp16_to_fp32(s[i]);
-    } else {
-        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-        tt->to_float(t->data, out.data(), n);
-    }
-}
-
-// [out, in] row-major numpy/GGUF-style F32 reader: ggml ne = [in, out].
-static inline void tensor_to_f32_mat(ggml_tensor * t, std::vector<float> & out) {
-    mage::tensor_to_f32_host(t, out);
+    out.resize((size_t)ggml_nelements(t));
+    vqa::gguf::tensor_to_f32(t, out.data());
 }
 
 inline void MambaWeights::load(struct gguf_context * /*gu*/, struct ggml_context * ctx) {

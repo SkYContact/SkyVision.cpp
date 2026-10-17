@@ -31,6 +31,7 @@
 
 #include <map>
 #include "stage_buf.hpp"
+#include "weight_load.hpp"
 #include "vit_block.hpp"
 #include "mage_preprocess.hpp"
 #include "mage_gate.hpp"
@@ -206,6 +207,7 @@ private:
     ggml_gallocr_t gate_allocr_ = nullptr;
     ggml_context * gate_wctx_ = nullptr;        // gate tensors (uploaded once)
     ggml_backend_buffer_t gate_wbuf_ = nullptr;
+    std::vector<ggml_backend_buffer_t> gate_host_bufs_;   // promoted-F32 host blocks (CPU backend)
     vqa::MMap gate_mm_;
     ggml_context * gate_gctx_ = nullptr;
     ggml_cgraph * gate_gf_ = nullptr;
@@ -221,7 +223,6 @@ private:
     ggml_tensor * gate_h_out_ = nullptr;        // [n_state, d_inner]
     vqa::AlignedBuf gate_f32_;                  // small gate tensors as host F32
     std::vector<float> gate_emb0_;              // cls embed row 0 (target token)
-    std::vector<float> tmp_gate_f32_;
     bool gate_graph_built_ = false;
 
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
@@ -241,19 +242,6 @@ static int gguf_u32(struct gguf_context * g, const char * key, int def) {
         case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(g, id);
         case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(g, id);
         default: return def;
-    }
-}
-
-static void tensor_to_f32(ggml_tensor * t, float * dst) {
-    const int64_t n = ggml_nelements(t);
-    if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, t->data, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * s = (const ggml_fp16_t *)t->data;
-        for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
-    } else {
-        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-        tt->to_float(t->data, dst, n);
     }
 }
 
@@ -386,6 +374,8 @@ void MageVL::gate_cleanup() {
     if (gate_gctx_) ggml_free(gate_gctx_);
     if (gate_allocr_) ggml_gallocr_free(gate_allocr_);
     if (gate_wbuf_) ggml_backend_buffer_free(gate_wbuf_);
+    for (auto & b : gate_host_bufs_) ggml_backend_buffer_free(b);
+    gate_host_bufs_.clear();
     if (gate_backend_) ggml_backend_free(gate_backend_);
     gate_gctx_ = nullptr; gate_allocr_ = nullptr; gate_wbuf_ = nullptr; gate_backend_ = nullptr;
 }
@@ -474,12 +464,7 @@ bool MageVL::load_gate(const char * path) {
     struct gguf_init_params p = { /*no_alloc*/ true, /*ctx*/ &wctx };
     struct gguf_context * gu = gguf_init_from_file(path, p);
     if (!gu) { fprintf(stderr, "mage_gate: gguf init failed\n"); return false; }
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; i++) {
-        if (ggml_tensor * t = ggml_get_tensor(wctx, gguf_get_tensor_name(gu, i)))
-            t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     gm_.load(nullptr, wctx);       // mamba parts -> host F32
@@ -520,37 +505,20 @@ bool MageVL::load_gate(const char * path) {
     if (n_threads > 0) ggml_backend_cpu_set_n_threads(gate_backend_, std::min(n_threads, 8));
     gate_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gate_backend_));
 
-    // 1D tensors (norms, biases) plus the elementwise-activated 2D mamba
-    // tensors (conv kernel) become F32 BEFORE allocation: the gate graph
-    // multiplies activations by them and ggml's binary ops reject f32 x f16.
-    // Single pass: convert into a staging pool (indices, so growth is safe),
-    // then materialize the pool and upload everything from it.
-    std::map<ggml_tensor *, size_t> f32_idx;
-    std::vector<std::pair<ggml_tensor *, const void *>> ups;
-    std::vector<float> f32pool;
-    for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-        ups.push_back({t, t->data});
-        const bool is_1d = t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
-        const bool is_ew2d = !strcmp(t->name, "gm.mamba.conv1d.weight");
-        if ((!is_1d && !is_ew2d) || t->type == GGML_TYPE_F32) continue;
-        mage::tensor_to_f32_host(t, tmp_gate_f32_);
-        f32_idx[t] = f32pool.size();
-        f32pool.insert(f32pool.end(), tmp_gate_f32_.begin(), tmp_gate_f32_.end());
-        t->type = GGML_TYPE_F32;          // sized as F32 at alloc time
-        t->nb[0] = sizeof(float);
-        for (int i = 1; i < 4; i++) t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
-    }
-    gate_f32_.resize(f32pool.size() * sizeof(float));
-    memcpy(gate_f32_.data(), f32pool.data(), gate_f32_.size());
-    for (auto & u : ups) u.first->data = nullptr;   // alloc skips non-null data
-    gate_wbuf_ = ggml_backend_alloc_ctx_tensors(wctx, gate_backend_);
-    if (!gate_wbuf_) { fprintf(stderr, "mage_gate: weight alloc failed\n"); return false; }
-    for (auto & u : ups) {
-        auto it = f32_idx.find(u.first);
-        if (it != f32_idx.end())
-            ggml_backend_tensor_set(u.first, gate_f32_.data() + it->second * sizeof(float), 0, ggml_nbytes(u.first));
-        else
-            ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
+    // 1D tensors plus the elementwise-activated 2D mamba conv kernel become
+    // host F32 (ggml binary ops reject f32 x f16); the shared loader then
+    // binds/exports the rest straight from the mmap.
+    static const char * const gate_ew2d[] = { "gm.mamba.conv1d.weight", nullptr };
+    vqa::weights::promote_1d_to_f32(wctx, gate_f32_, gate_ew2d);
+    {
+        std::vector<vqa::weights::HostBlock> hosts;
+        if (!gate_f32_.empty()) hosts.push_back({gate_f32_.data(), gate_f32_.size()});
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(wctx, gate_backend_, mm, hosts);
+        if (!bound.ok) { fprintf(stderr, "mage_gate: weight bind failed\n"); return false; }
+        gate_wbuf_ = bound.main_buf;
+        gate_host_bufs_ = bound.host_bufs;
+        if (ggml_backend_is_cpu(gate_backend_)) gate_mm_ = std::move(mm);  // zero-copy keeps the mapping
+        else mm.release();                                                 // uploaded to the device
     }
     gate_wctx_ = wctx;
     gate_ready_ = true;
@@ -619,76 +587,24 @@ bool MageVL::load_weights(const char * path) {
         vc.stdv[i] = gguf_f32(gu, kbuf, vc.stdv[i]);
     }
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; i++) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        ggml_tensor * t = ggml_get_tensor(wctx, name);
-        if (!t) continue;
-        t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     // 1D tensors (norms, biases) -> host F32: ggml elementwise ops need matching types
     vqa::AlignedBuf host_f32;
-    {
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            total += (size_t)ggml_nelements(t) * sizeof(float);
-        }
-        host_f32.resize(total);
-        size_t off = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            const int64_t n = ggml_nelements(t);
-            float * dst = (float *)(host_f32.data() + off);
-            tensor_to_f32(t, dst);
-            t->data = dst;
-            t->type = GGML_TYPE_F32;
-            t->nb[0] = sizeof(float);
-            t->nb[1] = (size_t)n * sizeof(float);
-            t->nb[2] = t->nb[1];
-            t->nb[3] = t->nb[2];
-            off += (size_t)n * sizeof(float);
-        }
-        fprintf(stderr, "f32-converted 1D tensors: %.1f MB\n", total / 1e6);
-    }
+    vqa::weights::promote_1d_to_f32(wctx, host_f32);
 
     {
-        std::vector<std::pair<ggml_tensor *, const void *>> uploads;
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            uploads.push_back({t, t->data});
-            total += ggml_nbytes(t);
-        }
-
-        if (ggml_backend_is_cpu(backend)) {
-            wbuf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
-            const char * f32_begin = host_f32.empty() ? nullptr : host_f32.data();
-            const char * f32_end = f32_begin ? f32_begin + host_f32.size() : nullptr;
-            if (f32_begin) wbuf_plain = ggml_backend_cpu_buffer_from_ptr(host_f32.data(), host_f32.size());
-            for (auto & u : uploads) {
-                ggml_tensor * t = u.first;
-                const char * q = (const char *)t->data;
-                t->buffer = (f32_begin && q >= f32_begin && q < f32_end) ? wbuf_plain : wbuf;
-            }
-            fprintf(stderr, "weights: %.2f GB zero-copy from mmap\n", total / 1e9);
-        } else {
-            for (auto & u : uploads) u.first->data = nullptr;
-            wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
-            if (!wbuf) { fprintf(stderr, "weight allocation failed (need %.2f GB)\n", total / 1e9); return false; }
-            for (auto & u : uploads) ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
-            fprintf(stderr, "uploaded %.2f GB of weights\n", total / 1e9);
-        }
+        std::vector<vqa::weights::HostBlock> hosts;
+        if (!host_f32.empty()) hosts.push_back({host_f32.data(), host_f32.size()});
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(wctx, backend, mm, hosts);
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
+        if (!bound.host_bufs.empty()) wbuf_plain = bound.host_bufs[0];
     }
     if (ggml_backend_is_cpu(backend)) {
         host_f32_storage = std::move(host_f32);
     } else {
-        host_f32.clear();
-        host_f32.shrink_to_fit();
         mm.release();
     }
 
@@ -797,7 +713,7 @@ bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
         }
     }
     int H = 0, W = 0;
-    if (!vc3::smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
+    if (!vqa::img::smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
     }
@@ -809,7 +725,7 @@ bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
             const double scale = (double)n_max / (double)n_patches;
             max_pixels = std::min(max_pixels, (long long)(max_pixels * scale));
             int H2, W2;
-            if (!vc3::smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H2, &W2)) {
+            if (!vqa::img::smart_resize(src_h, src_w, factor, 3136, (int)std::min(max_pixels, (long long)INT_MAX), &H2, &W2)) {
                 fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
                 return false;
             }
@@ -827,7 +743,7 @@ bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
     std::vector<float> rgb, patches;
     int gh = 0, gw = 0;
     for (int ti = 0; ti < T; ti++) {
-        vc3::resize_bicubic_antialias(media.frames[ti].rgb.data(), src_w, src_h, W, H, rgb);
+        vqa::img::resize_bicubic_antialias(media.frames[ti].rgb.data(), src_w, src_h, W, H, rgb);
         mage::patchify_block(rgb.data(), H, W, vc.patch, vc.mean, vc.stdv, patches, &gh, &gw);
     }
     const int hw = gh * gw;

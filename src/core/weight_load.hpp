@@ -40,28 +40,38 @@ inline void bind_from_mmap(struct gguf_context * gu, ggml_context * wctx, const 
 // (2) every 1D tensor that is not already F32 is expanded into `storage`, and the
 // tensor is rewritten in place (type/nb included) so kernels see plain f32 rows.
 // Quantized 1D tensors otherwise read as garbage in norm/bias positions.
-inline void promote_1d_to_f32(ggml_context * wctx, AlignedBuf & storage) {
+// `extra_names` promotes additional named tensors of any shape (null-
+// terminated list, may be null): backends whose graphs use a multi-dim
+// weight in elementwise ops need those as plain F32 too (mage_vl's mamba
+// conv kernel). Strides are recomputed per dim, which is correct for any
+// promoted shape.
+inline void promote_1d_to_f32(ggml_context * wctx, AlignedBuf & storage,
+                              const char * const * extra_names = nullptr) {
+    auto wants = [&](ggml_tensor * t) {
+        if (t->type == GGML_TYPE_F32) return false;
+        if (t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1) return true;
+        if (!extra_names) return false;
+        for (const char * const * n = extra_names; *n; ++n)
+            if (!strcmp(t->name, *n)) return true;
+        return false;
+    };
     size_t total = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-        if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-        if (t->type == GGML_TYPE_F32) continue;
+        if (!wants(t)) continue;
         total += (size_t)ggml_nelements(t) * sizeof(float);
     }
     if (total == 0) return;
     storage.resize(total);
     size_t off = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-        if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-        if (t->type == GGML_TYPE_F32) continue;
+        if (!wants(t)) continue;
         const int64_t n = ggml_nelements(t);
         float * dst = (float *)(storage.data() + off);
         gguf::tensor_to_f32(t, dst);
         t->data = dst;
         t->type = GGML_TYPE_F32;
         t->nb[0] = sizeof(float);
-        t->nb[1] = (size_t)n * sizeof(float);
-        t->nb[2] = t->nb[1];
-        t->nb[3] = t->nb[2];
+        for (int i = 1; i < 4; i++) t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
         off += (size_t)n * sizeof(float);
     }
     fprintf(stderr, "f32-converted 1D tensors: %.1f MB\n", storage.size() / 1e6);

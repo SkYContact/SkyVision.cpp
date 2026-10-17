@@ -14,7 +14,7 @@
 //      frequency - NOT the standard one-frequency-per-pair RoPE).
 #pragma once
 
-#include "vc3_preprocess.hpp"   // smart_resize + resize_bicubic_antialias
+#include "resample.hpp"          // shared smart_resize + resize_bicubic_antialias
 
 #include <cmath>
 #include <cstdint>
