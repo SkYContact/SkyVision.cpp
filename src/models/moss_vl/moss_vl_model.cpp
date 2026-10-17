@@ -1627,7 +1627,13 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
     std::string text;
     if (!prompt.empty()) {
         text += "<|im_end|>\n<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-        if (T_new > 0 && getenv("MOSS_RT_SILENCE")) text += "<|silence|>";   // SFT alignment (optional)
+        // official realtime loop inserts <|silence|> when a prompt drains
+        // alongside frames: every assistant turn in the SFT data starts with
+        // it ("confirmed with project team" in modeling_moss_vl.py). Without
+        // it turn 2+ goes off-distribution and answers with a bare special.
+        // MOSS_RT_SILENCE=0 opts out.
+        if (T_new > 0 && !(getenv("MOSS_RT_SILENCE") && atoi(getenv("MOSS_RT_SILENCE")) == 0))
+            text += "<|silence|>";
     }
     if (T_new > 0) {
         text += "<|vision_start|>";
@@ -1696,31 +1702,33 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
 
     out_text.clear();
     int next = sample(logits, gp);
-    int n_dec = 0;
+    int n_dec = 0, n_special = 0;
     const int max_new = gp.max_tokens;
     for (int step = 0; step < max_new; step++) {
         if (next == id_eos || next == id_endoftext) break;
-        // specials decode to the empty string; a flood of them means the turn
-        // is over in spirit (silence/turn markers etc.) — stop instead of
-        // burning max_tokens on invisible output. The official realtime loop
-        // feeds EVERY generated token (incl. <|silence|>) back into the
-        // context, so the closing token must enter the KV before we break —
-        // otherwise follow-up prompts land off-distribution.
-        if (next >= 151643 && tok_.decode({next}).empty()) {
+        const bool special = next >= 151643 && tok_.decode({next}).empty();
+        if (special && next != id_silence) {
+            // protocol markers (<|response|>, turn bookkeeping, ...) are part
+            // of the stream: the official realtime loop feeds EVERY generated
+            // token back and keeps decoding - breaking here would cut off the
+            // answer the model is about to speak (turn 2+ opens with
+            // <|response|>). A long run of specials with no content ends the
+            // turn in spirit; stop instead of burning the token budget.
             if (getenv("MOSS_RT_DEBUG")) {
                 std::vector<std::pair<float, int>> top(logits.size());
                 for (int i = 0; i < (int)logits.size(); i++) top[i] = {logits[i], i};
                 std::partial_sort(top.begin(), top.begin() + 5, top.end(),
                                   [](auto & a, auto & b) { return a.first > b.first; });
-                fprintf(stderr, "[rt-dbg] stop token %d; top5:", next);
+                fprintf(stderr, "[rt-dbg] special %d; top5:", next);
                 for (int i = 0; i < 5; i++)
                     fprintf(stderr, " %d(%.2f)", top[i].second, top[i].first);
                 fprintf(stderr, "\n");
             }
-            run_text(g, seg, {next}, n_past, logits);   // closing token enters the KV
-            break;
+            if (++n_special > 8 || !run_text(g, seg, {next}, n_past, logits)) break;
+            next = sample(logits, gp);
+            continue;
         }
-        if (next == id_silence) {
+        if (special /* <|silence|>: the idle signal */) {
             run_text(g, seg, {next}, n_past, logits);
             break;
         }
