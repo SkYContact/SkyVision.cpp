@@ -11,6 +11,7 @@
 // richer argument surface) is driven through moondream_main().
 #include "vqa.hpp"
 
+#include "json.hpp"
 #include "media_io.hpp"
 #include "model_registry.hpp"
 #include "tokenizer.hpp"
@@ -38,6 +39,9 @@ void usage() {
         "               [--image <file>] [--video <file> | --frames <dir>] [--fps <f>] [--max-frames <n>]\n"
         "               --ask <question> [--mode <skill>] [options]\n"
         "               --batch <prompts.txt>   text-only batched decode (one prompt per line)\n"
+        "               --score <qs.json>       candidate scoring (VideoJev):\n"
+        "                                       {\"questions\":[{\"id\",\"task\":\"grounding|choice\",\"query\",\"options\"}]}\n"
+        "               [--threshold T]         grounding probability threshold (default: model)\n"
         "               --serve [port]          Web UI (default 8899)\n"
         "               --mcp                   MCP server on stdio (agent tools: see README)\n"
         "\n"
@@ -86,9 +90,9 @@ int main(int argc, char ** argv) {
 #endif
 
     std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, ask_text, mode, arch_override, batch_path,
-                dump_dir, vision_path, region_path;
+                dump_dir, vision_path, region_path, score_path;
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
-    float temp = 0.0f, top_p = 1.0f, fps = 0.0f;
+    float temp = 0.0f, top_p = 1.0f, fps = 0.0f, threshold = 0.0f;
     int max_frames = 32;
     int serve_port = 0;
     std::string serve_host = "127.0.0.1";
@@ -130,6 +134,8 @@ int main(int argc, char ** argv) {
         else if (a == "--dump-dir") dump_dir = next("--dump-dir");
         else if (a == "--dump-ids") dump_ids = true;
         else if (a == "--arch") arch_override = next("--arch");
+        else if (a == "--score") score_path = next("--score");
+        else if (a == "--threshold") threshold = (float)atof(next("--threshold"));
         else if (a == "--quiet") quiet = true;
         else { fprintf(stderr, "unknown argument: %s\n", a.c_str()); usage(); return 2; }
     }
@@ -217,7 +223,7 @@ int main(int argc, char ** argv) {
     } else if (!frames_dir.empty()) {
         if (!vqa::load_frame_dir(frames_dir, fps, media)) return 4;
     }
-    if (media.empty() && ask_text.empty() && batch_path.empty()) { usage(); return 2; }
+    if (media.empty() && ask_text.empty() && batch_path.empty() && score_path.empty()) { usage(); return 2; }
 
     vqa::GenParams gp;
     gp.max_tokens = max_tokens;
@@ -243,6 +249,70 @@ int main(int argc, char ** argv) {
         if (rc < 0) { fprintf(stderr, "this backend does not support --batch\n"); return 4; }
         delete model;
         return rc;
+    }
+
+    if (!score_path.empty()) {
+        // {"questions": [{"id","task":"grounding"|"choice","query","options":[]}]}
+        std::string doc_text, err;
+        if (!vqa::read_file(score_path.c_str(), doc_text)) {
+            fprintf(stderr, "cannot read %s\n", score_path.c_str());
+            delete model;
+            return 2;
+        }
+        vqa::json::Value doc;
+        if (!vqa::json::parse(doc_text, doc, err)) {
+            fprintf(stderr, "%s: %s\n", score_path.c_str(), err.c_str());
+            delete model;
+            return 2;
+        }
+        const vqa::json::Value * rows = doc.get("questions");
+        if (!rows || !rows->is_array() || rows->items.empty()) {
+            fprintf(stderr, "%s: expected {\"questions\":[...]}\n", score_path.c_str());
+            delete model;
+            return 2;
+        }
+        std::vector<vqa::ScoreQuery> queries;
+        for (size_t i = 0; i < rows->items.size(); i++) {
+            const vqa::json::Value & item = rows->items[i];
+            vqa::ScoreQuery q;
+            q.id = item.str("id", std::to_string(i));
+            q.task = item.str("task", "grounding");
+            q.query = item.str("query");
+            if (const vqa::json::Value * opts = item.get("options")) {
+                for (const auto & o : opts->items)
+                    if (o.is_string()) q.options.push_back(o.text);
+            }
+            queries.push_back(std::move(q));
+        }
+        std::vector<vqa::ScoreResult> results;
+        if (!model->score(media, queries, threshold, results, gp)) {
+            fprintf(stderr, "scoring failed (this backend/checkpoint has no decision head?)\n");
+            delete model;
+            return 5;
+        }
+        vqa::json::Value arr = vqa::json::Value::make_array();
+        for (const auto & r : results) {
+            vqa::json::Value o = vqa::json::Value::make_object();
+            o.set("id", vqa::json::Value::make_string(r.id));
+            o.set("task", vqa::json::Value::make_string(r.task));
+            vqa::json::Value probs = vqa::json::Value::make_array();
+            for (float p : r.probabilities) probs.push(vqa::json::Value::make_number((double)p));
+            o.set("probabilities", probs);
+            if (r.task == "choice") {
+                o.set("answer_index", vqa::json::Value::make_number((double)r.answer_index));
+                o.set("answer", vqa::json::Value::make_string(r.answer));
+            } else {
+                vqa::json::Value times = vqa::json::Value::make_array();
+                for (double t : r.times) times.push(vqa::json::Value::make_number(t));
+                o.set("times", times);
+                o.set("start", vqa::json::Value::make_number(r.start));
+                o.set("end", vqa::json::Value::make_number(r.end));
+            }
+            arr.push(o);
+        }
+        printf("%s\n", vqa::json::dump(arr).c_str());
+        delete model;
+        return 0;
     }
 
 

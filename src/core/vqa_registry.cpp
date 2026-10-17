@@ -56,6 +56,7 @@ std::string default_tokenizer_dir(const std::string & arch) {
     if (arch == "videochat3") return "models/VideoChat3-4B";
     if (arch == "marlin")     return "models/Marlin-2B";
     if (arch == "qwen3_5")    return "models/Qwen3.5-2B";
+    if (arch == "videojev")   return "models/VideoJev-4B";
     if (arch == "moss_vl")    return "models/Moss-VL-Realtime-q4k";
     if (arch == "moondream3") return "models/moondream3.1";
     return std::string();   // videomae/vivit need no tokenizer; unknown: no hint
@@ -71,6 +72,8 @@ namespace vqa {
 Model * vqa_create_model(const std::string & arch) {
     if (arch == "videochat3") return create_videochat3();
     if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
+    // VideoJev = Qwen3.5 backbone + a cosine decision head (score-only inference)
+    if (arch == "videojev") return create_qwen3_5();
     if (arch == "moss_vl") return create_moss_vl();
     if (arch == "qwen2vl" || arch == "qwen2_5_vl") return create_qwen2vl();
     // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk

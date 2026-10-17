@@ -49,6 +49,26 @@ struct GenParams {
     std::string history;
 };
 
+// Candidate scoring: a "System One" video model does not decode an answer, it
+// scores a fixed candidate list in one forward pass (temporal grounding: one
+// candidate per video segment; multiple choice: one candidate per option).
+// Backends without a decision head return false from Model::score().
+struct ScoreQuery {
+    std::string id;
+    std::string task = "grounding";   // "grounding" | "choice"
+    std::string query;
+    std::vector<std::string> options; // choice only
+};
+
+struct ScoreResult {
+    std::string id, task;
+    std::vector<float> probabilities;   // one per candidate
+    std::vector<double> times;          // grounding: candidate timestamps (seconds)
+    int answer_index = -1;              // choice only (0-based)
+    std::string answer;                 // choice only
+    double start = -1.0, end = -1.0;    // grounding: decoded interval (seconds)
+};
+
 // Load-time configuration shared by every backend.
 struct LoadOptions {
     int n_ctx = 8192;      // KV context window
@@ -103,6 +123,16 @@ public:
         return ask(media, prompt, "", gp, out_text);
     }
     virtual void session_reset() {}
+
+    // Candidate scoring (VideoJev style decision head). `threshold` is the
+    // grounding decoder's probability threshold (<= 0 keeps the model default).
+    // Backends without a decision head leave this returning false.
+    virtual bool score(const MediaInput & media, const std::vector<ScoreQuery> & queries,
+                       float threshold, std::vector<ScoreResult> & out,
+                       const GenParams & gp = GenParams()) {
+        (void)media; (void)queries; (void)threshold; (void)out; (void)gp;
+        return false;
+    }
 
     // batched text-only decode driver (one prompt per line); -1 = unsupported
     virtual int run_batch(const std::string & batch_path, int n_gen) { (void)batch_path; (void)n_gen; return -1; }

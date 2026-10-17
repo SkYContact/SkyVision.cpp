@@ -21,6 +21,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
 | **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
 | **Qwen3.5 系（含 Marlin-2B）** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
+| **VideoJev-4B（打分式）** | `videojev` | 视频 | Qwen3.5-4B 主干（32 层：24 线性 + 8 full，**线性注意力 16 键 / 32 值头 GQA**）+ 同款视觉塔，但**末层被裁成 attention-only**（无 MLP/post-norm），并用训练好的 cosine 决策头替代 lm head：一次前向对候选列表打分（时序定位=逐时间片 sigmoid，单选=VQA softmax），**不生成文本**。走 `--score <qs.json>`，见"候选打分" |
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 | **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
@@ -47,6 +48,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | VideoChat3-4B 图像问答 | ✅ 端到端 + **逐级 parity 已验证**：patch 嵌入 rel 4e-4、27 层 ViT + merger + projector rel 0.026（F16 权重噪声级），贪心输出与官方 bf16 逐字一致 |
 | VideoChat3-4B 视频输入 | ✅ 内置 `--video`（ffmpeg 管道，`FFMPEG=<path>` 可指定）：抽帧 + 时间戳提示词 + 4 帧时序 clip 联合注意力；视觉塔逐 clip 分批执行（激活峰值降至单 clip），同上下文预算内自动钳制超大图/视频 |
 | Marlin-2B 图像/视频问答 | ✅ 端到端 + **逐级 parity 已验证**（官方 transformers 5.20 做 oracle）：pixel_values 与引擎 patchify 逐位一致、pos 表 2.7e-8、patch 卷积 2.6e-3、block0 5.3e-3；整塔漂移 6.6e-2 **优于官方 bf16 自身的 1.1e-1**；末 token logits 1.5e-2 < 官方 bf16 2.8e-2；文本纯输入 gated-delta 层 1.4e-2 |
+| VideoJev-4B 候选打分 | ✅ 全链路打通 + **对拍官方 transformers 5.14**（`scripts/parity_videojev.py`，prompt token 序列逐位一致）。以 CPU float32 参考为真值：引擎 f16 的最大概率偏差 **6.8e-3**（q8_0 5.9e-3），而官方仓库默认的 bf16 跑法偏差 5.7e-2 —— 引擎比官方参考更贴近 fp32。choice 端偏差 6.6e-6（官方 bf16 为 5.1e-5）。见 `scripts/parity_videojev.py` / `scripts/gen_fake_videojev.py` |
 | Marlin-2B 视频结构化技能 | ✅ `--mode caption`（Scene + 带秒级时间戳的 Events 列表）/ `--mode find`（自然语言事件 → `From X.X to Y.X.`），训练对齐的官方提示词 |
 | 视觉预处理 token 预算 | ✅ 图片/视频的视觉 token 上限 = n_ctx − max_tokens − 文本开销，编码前钳制分辨率或提前报错（不再白等几秒后 context overflow） |
 
@@ -106,6 +108,10 @@ modelscope download NemoStation/Marlin-2B --local_dir models/Marlin-2B
 # Qwen3.5-2B（官方，通用图文/视频问答）
 modelscope download Qwen/Qwen3.5-2B --local_dir models/Qwen3.5-2B
 
+# VideoJev-4B（打分式，不生成文本；用 --score 驱动）
+hf download ZhuYuhan/VideoJev-4B --local-dir models/VideoJev-4B
+python convert/convert_videojev.py --src models/VideoJev-4B -o videojev-4b-q8_0.gguf
+
 # VideoMAE：预训练版（只有嵌入）或带 Kinetics-400 分类头的 fine-tune
 hf download MCG-NJU/videomae-base --local-dir models/videomae-base
 hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae-base-ft
@@ -130,6 +136,15 @@ vqa-cli --model marlin-2b-q8_0.gguf --tokenizer models/Marlin-2B         --video
 vqa-cli --model moondream3.1-q6k.gguf --tokenizer tokenizer.json \
         --vision moondream3.1-vision.gguf --region moondream3.1-region.gguf \
         --image photo.jpg --ask "What is in this image?" --n-ctx 1024
+
+# VideoJev-4B：候选打分（不生成文本）。grounding 逐时间片 sigmoid → 区间；
+# choice 对选项 softmax → answer_index。--threshold 覆盖模型自带阈值（默认 0.25）
+cat > qs.json <<'JSON'
+{"questions": [{"id": "q1", "task": "grounding", "query": "when does the person sit down"},
+               {"id": "q2", "task": "choice", "query": "where does it happen",
+                "options": ["A. indoors", "B. outdoors"]}]}
+JSON
+vqa-cli --model videojev-4b-q8_0.gguf --video clip.mp4 --fps 2 --score qs.json
 
 # VideoMAE：视频 → 动作标签（分类头版）/ 768 维嵌入（预训练版）
 vqa-cli --model videomae-base-ft.gguf --video clip.mp4 --ask x --mode 5

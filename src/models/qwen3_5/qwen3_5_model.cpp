@@ -93,10 +93,14 @@ public:
     bool load(const std::string & gguf_path, const std::string & tokenizer_path,
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override;
     const vqa::Capabilities & caps() const override { return caps_; }
-    const char * name() const override { return "qwen3.5"; }
+    const char * name() const override { return has_head ? "videojev" : "qwen3.5"; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp,
              std::string & out_text) override;
+    // VideoJev: candidate scoring instead of decoding (see vqa::ScoreQuery)
+    bool score(const vqa::MediaInput & media, const std::vector<vqa::ScoreQuery> & queries,
+               float threshold, std::vector<vqa::ScoreResult> & out,
+               const vqa::GenParams & gp) override;
 
     int n_ctx = 8192;
     bool use_gpu = false;
@@ -109,7 +113,19 @@ private:
     bool alloc_state();
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                        int * n_tokens, int * grid /* t, h, w (merged) */, int token_budget = 0);
-    bool build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot = 0, bool logits_all = false);
+    // VideoJev decision graph tap: gather hidden rows by index and score them
+    // with the cosine head, replacing the lm head as the graph output.
+    struct ScoreTap {
+        int n_max_cand = 0;   // candidates per query (padded)
+        int n_query = 0;
+    };
+    bool build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot = 0,
+                          bool logits_all = false, const ScoreTap * tap = nullptr);
+    bool run_score_text(TextGraph & g, const std::vector<int> & toks,
+                        const std::vector<float> & feats, const std::vector<int> & img_pos,
+                        const std::vector<int> & mpos, const std::vector<int> & pair_idx,
+                        const std::vector<int> & query_idx, const ScoreTap & tap,
+                        std::vector<float> & logits_out);
     // qwen3_5_mtp.inc
     int mtp_draft_step(int tok, const float * h, int slot, int axis,
                        std::vector<float> & logits_out, std::vector<float> & h_out, int win_lo = -1);
@@ -142,6 +158,15 @@ private:
     int id_image_pad = 248056, id_video_pad = 248057;
     int id_vision_start = 248053, id_vision_end = 248054;
     int id_eos = 0, id_endoftext = 248044;
+    // VideoJev: the last text layer keeps attention only (reference deletes the
+    // MLP + post-norm) and a cosine decision head replaces the lm head
+    bool last_attn_only = false;
+    bool has_head = false;
+    int jev_head_dim = 512;
+    float jev_head_scale = 10.0f, jev_threshold = 0.25f;
+    int jev_smooth = 1, id_decide = 248077, id_option_end = 248078;
+    ggml_tensor *jev_q_w = nullptr, *jev_q_b = nullptr;
+    ggml_tensor *jev_k_w = nullptr, *jev_k_b = nullptr, *jev_b = nullptr;
 
     ggml_backend_t backend = nullptr;
     ggml_context * wctx = nullptr;
@@ -319,6 +344,14 @@ bool Qwen3_5::load_weights(const char * path) {
     id_vision_start = vqa::gguf::u32(gu, "marlin.vision_start_token_id", id_vision_start);
     id_vision_end = vqa::gguf::u32(gu, "marlin.vision_end_token_id", id_vision_end);
     id_endoftext = vqa::gguf::u32(gu, "marlin.pad_token_id", id_endoftext);
+    last_attn_only = vqa::gguf::u32(gu, "marlin.last_layer_attn_only", 0) != 0;
+    // VideoJev decision head (absent on plain Qwen3.5 / Marlin checkpoints)
+    jev_head_dim    = vqa::gguf::u32(gu, "videojev.head_dim", jev_head_dim);
+    jev_head_scale  = vqa::gguf::f32(gu, "videojev.head_scale", jev_head_scale);
+    jev_threshold   = vqa::gguf::f32(gu, "videojev.threshold", jev_threshold);
+    jev_smooth      = vqa::gguf::u32(gu, "videojev.smooth", jev_smooth);
+    id_decide       = vqa::gguf::u32(gu, "videojev.decide_token_id", id_decide);
+    id_option_end   = vqa::gguf::u32(gu, "videojev.option_end_token_id", id_option_end);
 
     vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
@@ -397,7 +430,8 @@ bool Qwen3_5::load_weights(const char * path) {
         L.full = !recurrent[i];
         if (L.full) n_full_layers++;
         L.norm = g("attn_norm.weight");
-        L.post_norm = g("attn_post_norm.weight");
+        const bool attn_only = last_attn_only && i == n_layer - 1;
+        L.post_norm = attn_only ? nullptr : g("attn_post_norm.weight");
         if (L.full) {
             L.q = g("attn_q.weight");
             L.k = g("attn_k.weight");
@@ -416,10 +450,14 @@ bool Qwen3_5::load_weights(const char * path) {
             L.la_norm = g("la_norm.weight");
             L.la_out = g("la_out.weight");
         }
-        L.gate = g("ffn_gate.weight");
-        L.up = g("ffn_up.weight");
-        L.down = g("ffn_down.weight");
+        if (L.post_norm) {
+            L.gate = g("ffn_gate.weight");
+            L.up = g("ffn_up.weight");
+            L.down = g("ffn_down.weight");
+        }
     }
+    if (last_attn_only)
+        fprintf(stderr, "last layer %d is attention-only (VideoJev trim)\n", n_layer - 1);
     if (has_mtp) {
         mtp_fc = gt("mtp.fc");          mtp_e_norm = gt("mtp.e_norm");
         mtp_h_norm = gt("mtp.h_norm");  mtp_head_norm = gt("mtp.head_norm");
@@ -451,6 +489,23 @@ bool Qwen3_5::load_weights(const char * path) {
         L.fc1_w = g("mlp.fc1.weight");
         L.fc1_b = g("mlp.fc1.bias");
     }
+    // VideoJev decision head (optional): fp32 CosineDecisionHead q/k projections
+    jev_q_w = ggml_get_tensor(wctx, "jev_head_q.weight");
+    jev_q_b = ggml_get_tensor(wctx, "jev_head_q.bias");
+    jev_k_w = ggml_get_tensor(wctx, "jev_head_k.weight");
+    jev_k_b = ggml_get_tensor(wctx, "jev_head_k.bias");
+    jev_b = ggml_get_tensor(wctx, "jev_head_b");
+    has_head = jev_q_w && jev_q_b && jev_k_w && jev_k_b && jev_b;
+    if (has_head) {
+        if ((int)jev_q_w->ne[0] != n_embd || (int)jev_q_w->ne[1] != jev_head_dim) {
+            fprintf(stderr, "decision head q_proj is [%lld, %lld], expected [%d, %d]\n",
+                    (long long)jev_q_w->ne[0], (long long)jev_q_w->ne[1], n_embd, jev_head_dim);
+            return false;
+        }
+        fprintf(stderr, "decision head: cosine %d-d, scale %g, threshold %g (score-only model)\n",
+                jev_head_dim, (double)jev_head_scale, (double)jev_threshold);
+    }
+
     if (!tok_embd || !out_norm || !v_patch_w) return false;
     if ((int)tok_embd->ne[0] != n_embd) {
         fprintf(stderr, "token_embd row length %lld != n_embd %d (tied head expected)\n",
@@ -816,7 +871,8 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
 }
 
 // ---------------------------------------------------------------- text
-bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot, bool logits_all) {
+bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot,
+                               bool logits_all, const ScoreTap * tap) {
     // new graph -> previous dump registry/sink buffers are stale
     if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
@@ -1055,6 +1111,11 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
         ggml_tensor * ffn_inp = x;
         if (il == 0) ggml_set_name(x, "t_l0_resid");
 
+        // attention-only layer (VideoJev trims the final MLP + post-norm)
+        if (!L.post_norm) {
+            if (il == 0) ggml_set_name(x, "t_l0_out");
+            continue;
+        }
         // attn_post_norm doubles as the FFN norm (no separate ffn_norm)
         ggml_tensor * m = ggml_rms_norm(g.ctx, x, rms_eps);
         m = ggml_mul(g.ctx, m, L.post_norm);
@@ -1070,6 +1131,42 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
     x = ggml_rms_norm(g.ctx, x, rms_eps);
     x = ggml_mul(g.ctx, x, out_norm);
     ggml_set_name(x, "t_final_norm");
+
+    if (tap) {
+        // VideoJev CosineDecisionHead: gather the readout rows (candidate and
+        // query positions) out of the final hidden state and score every
+        // (query, candidate) pair with a scaled cosine in FP32
+        const int nq = tap->n_query, nk = tap->n_max_cand;
+        if (!has_head) { fprintf(stderr, "score requested but the GGUF has no decision head\n"); return false; }
+        ggml_tensor * pair_idx = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, (int64_t)nq * nk);
+        ggml_set_name(pair_idx, "jev_pair_in");
+        ggml_tensor * query_idx = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, nq);
+        ggml_set_name(query_idx, "jev_query_in");
+
+        ggml_tensor * hp = ggml_get_rows(g.ctx, x, pair_idx);       // [D, nq*nk]
+        ggml_tensor * hq = ggml_get_rows(g.ctx, x, query_idx);      // [D, nq]
+        auto l2n = [&](ggml_tensor * t) {
+            const float n = (float)t->ne[0];
+            return ggml_scale(g.ctx, ggml_rms_norm(g.ctx, t, 1e-6f / n), 1.0f / sqrtf(n));
+        };
+        ggml_tensor * keys = ggml_add(g.ctx, ggml_mul_mat(g.ctx, jev_k_w, hp), jev_k_b);  // [hd, nq*nk]
+        keys = l2n(keys);
+        ggml_tensor * qs = ggml_add(g.ctx, ggml_mul_mat(g.ctx, jev_q_w, hq), jev_q_b);    // [hd, nq]
+        qs = l2n(qs);
+        ggml_set_name(keys, "jev_keys");
+        ggml_set_name(qs, "jev_queries");
+        // per-query candidate sets are contiguous columns of `keys`
+        ggml_tensor * keys3 = ggml_reshape_3d(g.ctx, keys, jev_head_dim, nk, nq);
+        ggml_tensor * qs3 = ggml_reshape_3d(g.ctx, qs, jev_head_dim, 1, nq);
+        ggml_tensor * logits = ggml_mul_mat(g.ctx, qs3, keys3);     // [1, nk, nq]
+        logits = ggml_reshape_2d(g.ctx, logits, nk, nq);            // [nk, nq] (k fastest)
+        logits = ggml_scale(g.ctx, logits, jev_head_scale);
+        logits = ggml_add(g.ctx, logits, jev_b);
+        ggml_set_name(logits, "jev_logits");
+        g.logits = logits;
+        ggml_build_forward_expand(g.gf, g.logits);
+        return true;
+    }
 
     if (logits_all) {
         g.logits = ggml_mul_mat(g.ctx, tok_embd, x);       // [vocab, T] speculative verify
@@ -1412,6 +1509,373 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     return true;
 }
 
+
+// ---------------------------------------------------------------- scoring
+// VideoJev ("System One") does not decode: the whole query group goes through
+// one causal forward pass and the decision head scores a fixed candidate list
+// per question. Everything below mirrors the reference inference scripts
+// (processing_videojev.prepare_query_groups / format_predictions).
+
+bool Qwen3_5::run_score_text(TextGraph & g, const std::vector<int> & toks,
+                             const std::vector<float> & feats, const std::vector<int> & img_pos,
+                             const std::vector<int> & mpos, const std::vector<int> & pair_idx,
+                             const std::vector<int> & query_idx, const ScoreTap & tap,
+                             std::vector<float> & logits_out) {
+    const int T = (int)toks.size();
+    if (T > n_ctx) { fprintf(stderr, "context overflow (%d > %d)\n", T, n_ctx); return false; }
+    const int n_img = (int)(feats.size() / n_embd);
+    if (!build_text_graph(g, T, T, n_img, 0, false, &tap)) return false;
+    if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
+        fprintf(stderr, "score graph allocation failed\n");
+        ggml_free(g.ctx);
+        g.ctx = nullptr;
+        return false;
+    }
+    ggml_backend_tensor_set(g.tok_in, toks.data(), 0, sizeof(int) * T);
+    ggml_backend_tensor_set(g.mpos_in, mpos.data(), 0, sizeof(int) * 4 * T);
+    if (n_img > 0) {
+        ggml_backend_tensor_set(g.img_in, feats.data(), 0, sizeof(float) * feats.size());
+        ggml_backend_tensor_set(g.img_pos_in, img_pos.data(), 0, sizeof(int) * n_img);
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(g.gf, "jev_pair_in"),
+                            pair_idx.data(), 0, sizeof(int) * pair_idx.size());
+    ggml_backend_tensor_set(ggml_graph_get_tensor(g.gf, "jev_query_in"),
+                            query_idx.data(), 0, sizeof(int) * query_idx.size());
+    vqa::set_causal_mask(g.mask_in, 0, T);
+    if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "score compute failed\n");
+        ggml_free(g.ctx);
+        g.ctx = nullptr;
+        return false;
+    }
+    const size_t n = (size_t)tap.n_max_cand * tap.n_query;
+    logits_out.resize(n);
+    ggml_backend_tensor_get(g.logits, logits_out.data(), 0, sizeof(float) * n);
+    ggml_free(g.ctx);
+    g.ctx = nullptr;
+    return true;
+}
+
+namespace {
+
+// pair_timeline(): one score per temporal patch, cell bounds halfway between
+// adjacent patch centres; outer cells extend to the video endpoints
+static void pair_bounds(double fps, int n_frames, double duration,
+                        std::vector<double> & centers, std::vector<double> & lo,
+                        std::vector<double> & hi) {
+    const int gt = (n_frames + 1) / 2;
+    std::vector<double> t((size_t)n_frames);
+    for (int i = 0; i < n_frames; i++) t[(size_t)i] = i / fps;
+    centers.resize(gt);
+    for (int j = 0; j < gt; j++) {
+        const double a = t[(size_t)std::min(2 * j, n_frames - 1)];
+        const double b = t[(size_t)std::min(2 * j + 1, n_frames - 1)];
+        centers[(size_t)j] = (a + b) / 2;
+    }
+    std::vector<double> edges;
+    edges.push_back(0.0);
+    for (int i = 1; i + 1 <= n_frames - 1; i += 2)
+        edges.push_back((t[(size_t)i] + t[(size_t)(i + 1)]) / 2);
+    edges.push_back(duration);
+    // edges.size() == gt + 1 (last cell may be degenerate for tiny clips)
+    lo.resize(gt);
+    hi.resize(gt);
+    for (int j = 0; j < gt; j++) {
+        lo[(size_t)j] = edges[(size_t)std::min(j, (int)edges.size() - 1)];
+        hi[(size_t)j] = j + 1 < (int)edges.size() ? edges[(size_t)j + 1] : duration;
+        if (hi[(size_t)j] <= lo[(size_t)j]) hi[(size_t)j] = lo[(size_t)j] + 1.0 / fps;
+    }
+}
+
+// videojev_temporal.decode(): smoothed, threshold-shifted Kadane over the
+// Bernoulli logits, then round / repair / clamp
+static void decode_interval(const std::vector<float> & logits, double threshold, int smooth,
+                            const std::vector<double> & lo, const std::vector<double> & hi,
+                            double duration, double & start, double & end) {
+    const int n = (int)logits.size();
+    std::vector<double> z((size_t)n);
+    for (int i = 0; i < n; i++) z[(size_t)i] = (double)logits[(size_t)i];
+    if (smooth > 1) {
+        const int h = smooth / 2;
+        std::vector<double> pad((size_t)(n + 2 * h));
+        for (int i = 0; i < n + 2 * h; i++)
+            pad[(size_t)i] = z[(size_t)std::min(std::max(i - h, 0), n - 1)];
+        for (int i = 0; i < n; i++) {
+            double acc = 0;
+            for (int k = 0; k < smooth; k++) acc += pad[(size_t)(i + k)];
+            z[(size_t)i] = acc / smooth;
+        }
+    }
+    const double shift = std::log(threshold / (1.0 - threshold));
+    for (int i = 0; i < n; i++) z[(size_t)i] -= shift;
+    double best = z[0], cur = z[0];
+    int best_s = 0, best_e = 0, s = 0;
+    for (int i = 1; i < n; i++) {
+        if (cur <= 0) { s = i; cur = z[(size_t)i]; }
+        else cur += z[(size_t)i];
+        if (cur > best) { best = cur; best_s = s; best_e = i; }
+    }
+    const double raw_s = lo[(size_t)best_s], raw_e = hi[(size_t)best_e];
+    // round_repair_clamp_v1: round half to even, repair a collapsed interval
+    // using the evidence overlap, then clamp into [0, duration]
+    double rs = std::nearbyint(raw_s), re = std::nearbyint(raw_e);
+    if (re <= rs) {
+        const double cands[2][2] = {{rs - 1.0, rs}, {rs, rs + 1.0}};
+        const double mid = (raw_s + raw_e) / 2;
+        double best_lo = rs, best_hi = re;
+        bool found = false;
+        // max over (evidence overlap, -|midpoint distance|, -start), lexicographic
+        double best_dot = 0, best_mid = 0, best_start = 0;
+        for (auto & c : cands) {
+            if (!(c[0] >= 0 && c[0] < hi.back() && c[1] > lo.front())) continue;
+            double dot = 0;
+            for (int i = 0; i < n; i++)
+                dot += z[(size_t)i] * std::max(0.0, std::min(hi[(size_t)i], c[1]) -
+                                                    std::max(lo[(size_t)i], c[0]));
+            const double mid_pen = -std::fabs((c[0] + c[1]) / 2 - mid);
+            const bool better = !found
+                || dot > best_dot
+                || (dot == best_dot && (mid_pen > best_mid
+                    || (mid_pen == best_mid && c[0] < best_start)));
+            if (!better) continue;
+            found = true;
+            best_dot = dot;
+            best_mid = mid_pen;
+            best_start = c[0];
+            best_lo = c[0];
+            best_hi = c[1];
+        }
+        if (found) { rs = best_lo; re = best_hi; }
+    }
+    start = std::min(duration, std::max(0.0, rs));
+    end = std::min(duration, std::max(0.0, re));
+}
+
+}  // namespace
+
+bool Qwen3_5::score(const vqa::MediaInput & media, const std::vector<vqa::ScoreQuery> & queries,
+                    float threshold_in, std::vector<vqa::ScoreResult> & out,
+                    const vqa::GenParams & gp) {
+    (void)gp;
+    out.clear();
+    if (!has_head) {
+        fprintf(stderr, "this checkpoint has no decision head; --score needs a VideoJev GGUF\n");
+        return false;
+    }
+    if (queries.empty() || media.empty()) {
+        fprintf(stderr, "score needs a video and at least one question\n");
+        return false;
+    }
+    const double fps = media.fps > 0 ? media.fps : 2.0;
+    const int n_frames = (int)media.frames.size();
+    const double duration = n_frames / fps;
+    const double threshold = threshold_in > 0 ? threshold_in : jev_threshold;
+
+    std::vector<float> feats;
+    int n_img = 0, grid[3] = {0, 0, 0};
+    if (!encode_vision(media, feats, &n_img, grid, (int)((double)n_ctx * 0.8))) return false;
+    const int gt = grid[0], mh = grid[1], mw = grid[2];
+    const int spatial = mh * mw;
+    if (gt * spatial != n_img) {
+        fprintf(stderr, "vision tokens %d != %d*%d\n", n_img, gt, spatial);
+        return false;
+    }
+    std::vector<double> centers, cell_lo, cell_hi;
+    pair_bounds(fps, n_frames, duration, centers, cell_lo, cell_hi);
+    if ((int)centers.size() != gt) {
+        fprintf(stderr, "temporal patches %d != %d score slots\n", gt, (int)centers.size());
+        return false;
+    }
+
+    // candidate text: the timestamps the vision block itself carries (":.1f")
+    std::vector<std::string> stamps((size_t)gt);
+    for (int j = 0; j < gt; j++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "<%.1f seconds>", centers[(size_t)j]);
+        stamps[(size_t)j] = buf;
+    }
+
+    // ---- packed token ids: one user turn per question, video only in the first
+    bool bad = false;
+    for (const auto & q : queries) {
+        if (q.task != "grounding" && q.task != "choice") {
+            fprintf(stderr, "unknown task '%s' (grounding|choice)\n", q.task.c_str());
+            return false;
+        }
+        if (q.query.find("<|") != std::string::npos) { bad = true; }
+        for (const auto & o : q.options) if (o.find("<|") != std::string::npos) bad = true;
+        if (q.task == "choice" && q.options.size() < 2) {
+            fprintf(stderr, "choice question '%s' needs at least two options\n", q.id.c_str());
+            return false;
+        }
+    }
+    if (bad) { fprintf(stderr, "questions/options must not contain control tokens\n"); return false; }
+
+    // the chat template's video placeholder (<|vision_start|><|video_pad|><|vision_end|>)
+    // is replaced by the per-frame expansion, so its own brackets stay: one
+    // <|vision_start|> before the first frame and one <|vision_end|> after the last
+    std::string vblock = "<|vision_start|>";
+    for (int j = 0; j < gt; j++) {
+        vblock += stamps[(size_t)j];
+        vblock += "<|vision_start|>";
+        for (int k = 0; k < spatial; k++) vblock += "<|video_pad|>";
+        vblock += "<|vision_end|>";
+    }
+    vblock += "<|vision_end|>";
+
+    auto suffix = [&](const vqa::ScoreQuery & q, bool leading_newline) {
+        const bool choice = q.task == "choice";
+        std::string s;
+        if (leading_newline) s += "\n";
+        s += choice ? "Task: single-choice video question answering" : "Task: temporal grounding";
+        s += "\nQuestion: " + q.query + "\nOptions:\n";
+        if (choice) for (const auto & o : q.options) s += o + "<|option_end|>\n";
+        else        for (const auto & st : stamps)  s += st + "<|option_end|>\n";
+        s += "<|decide|>";
+        return s;
+    };
+
+    std::vector<int> ids, pair_idx, query_idx;
+    std::vector<int> counts;
+    int n_max_cand = 0;
+    for (size_t i = 0; i < queries.size(); i++) {
+        std::string text = "<|im_start|>user\n";
+        if (i == 0) text += vblock;
+        text += suffix(queries[i], true);
+        text += "<|im_end|>\n";
+        const std::vector<int> row = tok_.encode(text);
+        const int base = (int)ids.size();
+        ids.insert(ids.end(), row.begin(), row.end());
+        std::vector<int> opts, dec;
+        for (int k = 0; k < (int)row.size(); k++) {
+            if (row[(size_t)k] == id_option_end) opts.push_back(base + k);
+            else if (row[(size_t)k] == id_decide) dec.push_back(base + k);
+        }
+        const int expect = queries[i].task == "choice" ? (int)queries[i].options.size() : gt;
+        if ((int)opts.size() != expect || dec.size() != 1) {
+            fprintf(stderr, "question %zu: %d candidates (expected %d) / %zu decide tokens\n",
+                    i, (int)opts.size(), expect, dec.size());
+            return false;
+        }
+        pair_idx.insert(pair_idx.end(), opts.begin(), opts.end());
+        query_idx.push_back(dec[0]);
+        counts.push_back(expect);
+        n_max_cand = std::max(n_max_cand, expect);
+    }
+    // pad the candidate matrix per query (extra columns are masked out)
+    {
+        std::vector<int> padded;
+        padded.reserve((size_t)n_max_cand * queries.size());
+        size_t src = 0;
+        for (size_t i = 0; i < queries.size(); i++) {
+            for (int k = 0; k < n_max_cand; k++)
+                padded.push_back(k < counts[i] ? pair_idx[src + (size_t)k] : pair_idx[src]);
+            src += (size_t)counts[i];
+        }
+        pair_idx.swap(padded);
+    }
+
+    std::vector<int> img_pos;
+    for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == id_video_pad) img_pos.push_back(i);
+    if ((int)img_pos.size() != n_img) {
+        fprintf(stderr, "placeholder mismatch: %d pad tokens vs %d vision tokens\n",
+                (int)img_pos.size(), n_img);
+        return false;
+    }
+
+    // ---- 3-axis positions: text runs advance one slot each, a temporal patch
+    // block contributes max(h, w) slots (Qwen3-VL timestamp layout: no t axis
+    // advancement inside a frame, the timestamp text carries the time)
+    std::vector<int> mpos;
+    {
+        std::vector<int> axis[3];
+        axis[0].reserve(ids.size());
+        axis[1].reserve(ids.size());
+        axis[2].reserve(ids.size());
+        int cur = 0;
+        for (size_t i = 0; i < ids.size();) {
+            if (ids[i] == id_video_pad) {
+                const size_t end = std::min(ids.size(), i + (size_t)spatial);
+                if (end - i != (size_t)spatial || (end < ids.size() && ids[end] == id_video_pad)) {
+                    fprintf(stderr, "vision block is not %d tokens\n", spatial);
+                    return false;
+                }
+                for (int l = 0; l < spatial; l++) {
+                    axis[0].push_back(cur);
+                    axis[1].push_back(cur + l / mw);
+                    axis[2].push_back(cur + l % mw);
+                }
+                cur += std::max(mh, mw);
+                i = end;
+                continue;
+            }
+            axis[0].push_back(cur);
+            axis[1].push_back(cur);
+            axis[2].push_back(cur);
+            cur++;
+            i++;
+        }
+        mpos.reserve((size_t)4 * ids.size());
+        for (int a = 0; a < 3; a++) mpos.insert(mpos.end(), axis[a].begin(), axis[a].end());
+        for (int i = 0; i < (int)ids.size(); i++) mpos.push_back(i);
+    }
+
+    fprintf(stderr, "score: %d tokens (%d vision), %zu question%s, max %d candidates\n",
+            (int)ids.size(), n_img, queries.size(), queries.size() == 1 ? "" : "s", n_max_cand);
+    if ((int)ids.size() > n_ctx) {
+        fprintf(stderr, "query group is %d tokens, n_ctx is %d -- raise --n-ctx or fewer questions\n",
+                (int)ids.size(), n_ctx);
+        return false;
+    }
+
+    n_past = 0;
+    if (sbuf) ggml_backend_buffer_clear(sbuf, 0);
+    kv.clear();
+    ScoreTap tap;
+    tap.n_max_cand = n_max_cand;
+    tap.n_query = (int)queries.size();
+    TextGraph g;
+    std::vector<float> logits;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!run_score_text(g, ids, feats, img_pos, mpos, pair_idx, query_idx, tap, logits)) return false;
+    fprintf(stderr, "[perf] score forward: %.0f ms\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+
+    out.resize(queries.size());
+    for (size_t i = 0; i < queries.size(); i++) {
+        vqa::ScoreResult & r = out[i];
+        r.id = queries[i].id.empty() ? std::to_string(i) : queries[i].id;
+        r.task = queries[i].task;
+        const int cnt = counts[i];
+        std::vector<double> raw((size_t)cnt);
+        for (int k = 0; k < cnt; k++) raw[(size_t)k] = (double)logits[i * (size_t)n_max_cand + (size_t)k];
+        r.probabilities.resize((size_t)cnt);
+        if (r.task == "choice") {
+            double mx = raw[0];
+            for (double v : raw) mx = std::max(mx, v);
+            double sum = 0;
+            for (int k = 0; k < cnt; k++) sum += std::exp(raw[(size_t)k] - mx);
+            int best = 0;
+            for (int k = 0; k < cnt; k++) {
+                const double p = std::exp(raw[(size_t)k] - mx) / sum;
+                r.probabilities[(size_t)k] = (float)p;
+                if (p > r.probabilities[(size_t)best]) best = k;
+            }
+            r.answer_index = best;
+            if (best < (int)queries[i].options.size()) r.answer = queries[i].options[(size_t)best];
+        } else {
+            for (int k = 0; k < cnt; k++) {
+                const float p = (float)(1.0 / (1.0 + std::exp(-raw[(size_t)k])));
+                r.probabilities[(size_t)k] = p;
+                r.times.push_back(centers[(size_t)k]);
+            }
+            std::vector<float> z((size_t)cnt);
+            for (int k = 0; k < cnt; k++) z[(size_t)k] = (float)raw[(size_t)k];
+            decode_interval(z, threshold, jev_smooth, cell_lo, cell_hi, duration, r.start, r.end);
+        }
+    }
+    return true;
+}
 
 #include "qwen3_5_mtp.inc"
 

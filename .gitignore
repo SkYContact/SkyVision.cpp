@@ -36,6 +36,10 @@ Thumbs.db
 __pycache__/
 *.pyc
 .venv/
+# isolated env for the official VideoJev oracle (transformers 5.14), shares .venv's torch
+.venv-vj/
+tmp_frames/
+tmp_q*.json
 
 # local environment setup logs (pip install output, etc.)
 install*.log
