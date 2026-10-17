@@ -26,12 +26,10 @@ enum class TokenizerMode {
     Gpt2Regex,    // SmolLM2 (SmolVLM): Digits + ByteLevel/GPT-2 regex + added tokens
 };
 
-// which pre-tokenizer / added-token handling a backend's checkpoint needs
-inline TokenizerMode tokenizer_mode_for_arch(const std::string & arch) {
-    if (arch == "moondream3" || arch == "moondream") return TokenizerMode::PlainGpt2;
-    if (arch == "smolvlm") return TokenizerMode::Gpt2Regex;   // SmolLM2: Digits + ByteLevel
-    return TokenizerMode::Qwen2Regex;
-}
+// which pre-tokenizer / added-token handling a backend's checkpoint needs.
+// Defined in vqa_registry.cpp next to the arch table, so the mapping lives in
+// the same single dispatch point as the factories.
+TokenizerMode tokenizer_mode_for_arch(const std::string & arch);
 
 struct Tokenizer {
     std::unordered_map<std::string, int> vocab;

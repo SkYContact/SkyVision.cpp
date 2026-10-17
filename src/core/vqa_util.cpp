@@ -1,6 +1,7 @@
 #include "vqa_util.hpp"
 
 #include <cstdlib>
+#include <mutex>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -139,21 +140,25 @@ std::vector<int> g_byte_to_cp;
 std::vector<int> g_cp_to_byte;
 
 void init_byte_table() {
-    if (!g_byte_to_cp.empty()) return;
-    g_byte_to_cp.assign(256, 0);
-    std::vector<int> cs;
-    for (int b = 0; b < 256; b++) {
-        if ((b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
-            { g_byte_to_cp[b] = b; cs.push_back(b); }
-    }
-    std::vector<bool> used(256, false);
-    for (int b : cs) used[b] = true;
-    int n = 0;
-    for (int b = 0; b < 256; b++) {
-        if (!used[b]) { g_byte_to_cp[b] = 256 + n; cs.push_back(b); n++; }
-    }
-    g_cp_to_byte.assign(256 + n, -1);
-    for (int b = 0; b < 256; b++) g_cp_to_byte[g_byte_to_cp[b]] = b;
+    // multiple backends may load tokenizers concurrently on first use; the
+    // once-flag closes the check/init race the old empty() guard had
+    static std::once_flag once;
+    std::call_once(once, [] {
+        g_byte_to_cp.assign(256, 0);
+        std::vector<int> cs;
+        for (int b = 0; b < 256; b++) {
+            if ((b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF))
+                { g_byte_to_cp[b] = b; cs.push_back(b); }
+        }
+        std::vector<bool> used(256, false);
+        for (int b : cs) used[b] = true;
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if (!used[b]) { g_byte_to_cp[b] = 256 + n; cs.push_back(b); n++; }
+        }
+        g_cp_to_byte.assign(256 + n, -1);
+        for (int b = 0; b < 256; b++) g_cp_to_byte[g_byte_to_cp[b]] = b;
+    });
 }
 
 }  // namespace vqa

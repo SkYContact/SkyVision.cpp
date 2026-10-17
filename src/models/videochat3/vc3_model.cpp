@@ -540,109 +540,12 @@ void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
 }
 
 // ---- shared ViT block plumbing (vqa::vit::block) --------------------------
-// everything the attention hook and the layer-0 parity probes need from
-// encode_vision's scope; state = 1 after a successful truncated run
-namespace {
-struct Vc3VitEnv {
-    ggml_context *gctx;
-    ggml_cgraph *gf;
-    VisConfig *vc = nullptr;
-    ggml_tensor *t_vpos;
-    int N = 0, vhd = 0, vhd_f = 0, hw = 0, n_ctx = 0, layer = 0;
-    bool pad80 = false, wo_padded = false;
-    const std::vector<int> *clip_t = nullptr;
-    const char *stop_after = nullptr;
-    std::function<bool(const char *)> run;
-    int state = 0;
-};
-
-static ggml_tensor * vc3_vit_attention(void * ud_, ggml_tensor * qkv) {
-    Vc3VitEnv & e = *(Vc3VitEnv *)ud_;
-    ggml_context * gctx = e.gctx;
-    const VisConfig & vc = *e.vc;
-    const int il = e.layer, N = e.N, vhd = e.vhd, vhd_f = e.vhd_f;
-
-    // qkv packs the three padded projections along ne0; the converter pads and
-    // permutes the rows so each [80]-wide head slice works as-is - feed strided
-    // views straight into rope/FA, no cont(), no runtime padding copies
-    const size_t off = (size_t)vc.n_head * vhd_f * qkv->nb[0];
-    auto qkv_head_view = [&](int block) {
-        return ggml_view_3d(gctx, qkv, vhd_f, vc.n_head, N,
-                            (size_t)vhd_f * qkv->nb[0], qkv->nb[1], (size_t)block * off);
-    };
-    ggml_tensor * q = qkv_head_view(0);
-    ggml_tensor * k = qkv_head_view(1);
-    ggml_tensor * v = qkv_head_view(2);
-
-    // rope: the converter's 72->80 pad makes n_dims 40; rescale freq_base so
-    // each real pair keeps its exact frequency (theta**(-p/18) == (theta**(20/18))**(-2p/40))
-    int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
-    const float rope_base = e.pad80 ? powf(vc.rope_theta, (float)vhd_f / vhd) : vc.rope_theta;
-    q = ggml_rope_multi(gctx, q, e.t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
-                        e.n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_multi(gctx, k, e.t_vpos, nullptr, vhd_f / 2, sections, GGML_ROPE_TYPE_VISION,
-                        e.n_ctx, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    if (il == 0) {
-        ggml_set_name(q, "v_blk0_q_rope"); ggml_set_name(k, "v_blk0_k_rope");
-        if (e.stop_after && !strcmp(e.stop_after, "v_blk0_q_rope")) {
-            ggml_build_forward_expand(e.gf, q);
-            if (!e.run("v_blk0_q_rope")) e.state = 2; else e.state = 1;
-            return nullptr;
-        }
-    }
-
-    // attention runs clip-locally with NO mask: a masked flash-attn falls off
-    // the fast path, and clip tokens are contiguous, so per-clip unmasked FA
-    // (same trick as the SigLIP tower's multi-crop) is both exact and fast.
-    auto fa_in = [&](ggml_tensor * t, int n_tok, size_t tok_off) {
-        return ggml_view_3d(gctx, t, vhd_f, n_tok, vc.n_head, t->nb[2], t->nb[1], tok_off * t->nb[2]);
-    };
-    ggml_tensor * fa = nullptr;
-    if (e.clip_t->size() == 1) {
-        ggml_tensor * qf = fa_in(q, N, 0);
-        ggml_tensor * kf = fa_in(k, N, 0);
-        ggml_tensor * vf = fa_in(v, N, 0);
-        fa = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-    } else {
-        size_t coff = 0;
-        for (int t : *e.clip_t) {
-            const int cn = t * e.hw;
-            ggml_tensor * qf = fa_in(q, cn, coff);
-            ggml_tensor * kf = fa_in(k, cn, coff);
-            ggml_tensor * vf = fa_in(v, cn, coff);
-            ggml_tensor * fc = ggml_flash_attn_ext(gctx, qf, kf, vf, nullptr, 1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-            fc = ggml_cont(gctx, fc);
-            fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;   // fa out is [hd, heads, tokens]: concat tokens (dim2)
-            coff += (size_t)cn;
-        }
-    }
-    // wo expects rows (head, d). FA's contiguous output is already laid out
-    // (d fastest, head second, token outermost) — globally so even across the
-    // per-clip concat — so with the load-time wo fold (8 zero input rows per
-    // head appended, exact since FA pad columns are zero) a plain reshape
-    // feeds it to the matmul with no de-padding view+cont pair.
-    if (e.wo_padded)
-        return ggml_reshape_2d(gctx, fa, (int64_t)vc.n_head * vhd_f, N);
-    ggml_tensor * attn_src = fa;
-    if (e.pad80)
-        attn_src = ggml_view_3d(gctx, fa, vhd, vc.n_head, N,
-                                (size_t)vhd_f * sizeof(float), (size_t)vhd_f * vc.n_head * sizeof(float), 0);
-    return ggml_reshape_2d(gctx, ggml_cont(gctx, attn_src), vc.n_embd, N);
-}
-
-static bool vc3_vit_probe(void * ud_, const char * stage, ggml_tensor * t) {
-    Vc3VitEnv & e = *(Vc3VitEnv *)ud_;
-    char nm[40];
-    snprintf(nm, sizeof(nm), "v_blk0_%s", stage);
-    ggml_set_name(t, nm);
-    if (e.stop_after && !strcmp(e.stop_after, nm)) {
-        ggml_build_forward_expand(e.gf, t);
-        if (!e.run(nm)) e.state = 2; else e.state = 1;
-        return true;   // truncated: encode_vision returns after freeing gctx
-    }
-    return false;
-}
-}  // namespace
+// The attention hook (strided padded head views, ggml GGML_ROPE_TYPE_VISION
+// rope with the pad-rescaled freq base, clip-local unmasked FA, wo_padded /
+// de-pad output paths, layer-0 parity truncation) lives once in
+// vqa::vit::vit_attention_hook (core/vit_block.hpp); this backend only
+// supplies its parameters in encode_vision. state = 1 after a successful
+// truncated run.
 
 // ---------------------------------------------------------------- vision
 bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens,
@@ -874,10 +777,13 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         int vl_max = vc.n_layer;
         { const char * e = getenv("VC3_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
         std::vector<int> clip_one = { t };
-        Vc3VitEnv env;
-        env.gctx = gctx; env.gf = gf; env.vc = &vc; env.t_vpos = t_vpos;
+        vqa::vit::VitHookEnv env;
+        env.gctx = gctx; env.gf = gf; env.t_vpos = t_vpos;
+        env.n_head = vc.n_head; env.n_embd = vc.n_embd;
         env.N = Nc; env.vhd = vhd; env.vhd_f = pad80 ? 80 : vhd; env.hw = hw; env.n_ctx = n_ctx;
-        env.pad80 = pad80; env.wo_padded = wo_padded; env.clip_t = &clip_one;
+        env.rope_theta = vc.rope_theta; env.rope_pad_rescale = pad80;
+        env.wo_padded = wo_padded; env.clips = &clip_one;
+        env.dbg_names = true;   // layer-0 rope/attn tensor names
         env.stop_after = stop_c;
         env.state = 0;
         env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, &sink); };
@@ -886,8 +792,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
             vqa::vit::BlockWeights bw{L.norm0_w, L.norm0_b, L.wqkv_w, L.wqkv_b, L.wo_w, L.wo_b,
                                       L.norm1_w, L.norm1_b, L.fc0_w, L.fc0_b, L.fc1_w, L.fc1_b};
             vqa::vit::BlockHooks bh;
-            bh.attention = vc3_vit_attention;
-            bh.probe_layer0 = vc3_vit_probe;
+            bh.attention = vqa::vit::vit_attention_hook;
+            bh.probe_layer0 = vqa::vit::vit_probe_layer0_hook;
             bh.drop_ln_mul = fold_scale;
             bh.drop_ln_add = fold_bias;
             bh.ud = &env;

@@ -1,6 +1,14 @@
 // vqa_registry.cpp - architecture discovery + model factory.
+//
+// The single place in core that knows the backend list. Everything arch-
+// specific that other layers used to hardcode (tokenizer pre-tokenizer mode,
+// canonical checkpoint dir, fallback vocab) is a column of the table below.
+// Wiring a new backend = one factory declaration in backend_factories.hpp,
+// one `create_xxx()` definition in the backend, one row here.
 #include "vqa.hpp"
 
+#include "backend_factories.hpp"
+#include "tokenizer.hpp"
 #include "vqa_util.hpp"
 
 #include "ggml.h"
@@ -47,61 +55,94 @@ std::string resolve_tokenizer_path(const std::string & arg) {
     return std::string();
 }
 
-// Canonical models/<checkpoint> dir per arch, matching the README's model table
-// layout. Without this a GGUF parked in the repo root has no sibling
-// tokenizer.json, and the CLI used to fall back to whatever tokenizer.json sat
-// in the working directory - the moondream one, which silently breaks every
-// Qwen-family backend (no <|image_pad|>).
-std::string default_tokenizer_dir(const std::string & arch) {
-    if (arch == "videochat3") return "models/VideoChat3-4B";
-    if (arch == "marlin")     return "models/Marlin-2B";
-    if (arch == "qwen3_5")    return "models/Qwen3.5-2B";
-    if (arch == "videojev")   return "models/VideoJev-4B";
-    if (arch == "moss_vl")    return "models/Moss-VL-Realtime-q4k";
-    if (arch == "moondream3") return "models/moondream3.1";
-    return std::string();   // videomae/vivit need no tokenizer; unknown: no hint
+// ---------------------------------------------------------------------------
+// The arch table: one row per backend. `names` are the GGUF architecture
+// labels (first = canonical, rest = aliases/legacy labels).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ArchEntry {
+    const char * names[4];         // zero-terminated list, canonical first
+    Model * (*factory)();
+    TokenizerMode tokenizer_mode;
+    const char * default_dir;      // canonical models/<checkpoint> dir ("" = none)
+    size_t vocab_target;           // fallback when the GGUF has no vocab_size
+    bool needs_vision_gguf;        // moondream3: a *-vision.gguf sibling
+    bool pure_vision;              // video tower: no tokenizer, no text side
+};
+
+const ArchEntry kArchs[] = {
+    // The moondream3 engine lives behind the same interface via its adapter
+    // (moondream_vqa_adapter.inc), so every backend is reachable from one binary.
+    { { "moondream3", "moondream", nullptr }, create_moondream,
+      TokenizerMode::PlainGpt2, "models/moondream3.1", 51200, /*vision_gguf*/ true, false },
+    { { "videochat3", nullptr }, create_videochat3,
+      TokenizerMode::Qwen2Regex, "models/VideoChat3-4B", 151936, false, false },
+    // marlin = legacy GGUF label for the same qwen3.5 backbone; videojev =
+    // qwen3.5 + a cosine decision head (score-only inference)
+    { { "qwen3_5", "marlin", "videojev" }, create_qwen3_5,
+      TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 151936, false, false },
+    { { "moss_vl", nullptr }, create_moss_vl,
+      TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false },
+    // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk
+    { { "smolvlm", "idefics3", nullptr }, create_smolvlm,
+      TokenizerMode::Gpt2Regex, "", 151936, false, false },
+    { { "qwen2vl", "qwen2_5_vl", nullptr }, create_qwen2vl,
+      TokenizerMode::Qwen2Regex, "", 151936, false, false },
+    // video towers: labels or pooled embedding. ViViT is the same graph with a
+    // cls token + learned position table, so it reuses the videomae backend.
+    { { "videomae", "vivit", nullptr }, create_videomae,
+      TokenizerMode::Qwen2Regex, "", 0, false, true },
+    // Mage-VL-4B: Mage-ViT codec ViT + Qwen3-4B trunk; realtime gate gguf
+    // (mage-gate-f16.gguf) sits next to the model gguf and loads when present
+    { { "mage_vl", nullptr }, create_mage_vl,
+      TokenizerMode::Qwen2Regex, "models/Mage-VL", 151936, false, false },
+};
+
+const ArchEntry * find_arch(const std::string & arch) {
+    for (const auto & e : kArchs)
+        for (const char * const * n = e.names; *n; ++n)
+            if (arch == *n) return &e;
+    return nullptr;
 }
 
-}  // namespace vqa
-
-namespace vqa {
-
-// The moondream3 engine lives behind the same interface via its adapter
-// (moondream_vqa_adapter.inc), so every backend is reachable from one binary.
+}  // namespace
 
 Model * vqa_create_model(const std::string & arch) {
-    if (arch == "videochat3") return create_videochat3();
-    if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
-    // VideoJev = Qwen3.5 backbone + a cosine decision head (score-only inference)
-    if (arch == "videojev") return create_qwen3_5();
-    if (arch == "moss_vl") return create_moss_vl();
-    if (arch == "qwen2vl" || arch == "qwen2_5_vl") return create_qwen2vl();
-    // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk
-    if (arch == "smolvlm" || arch == "idefics3") return create_smolvlm();
-    // video towers: labels or pooled embedding. ViViT is the same graph with a cls
-    // token + learned position table, so it reuses the videomae backend.
-    if (arch == "videomae" || arch == "vivit") return create_videomae();
-    if (arch == "mage_vl") return create_mage_vl();
-    if (arch == "moondream3") return create_moondream();
-    return nullptr;
+    const ArchEntry * e = find_arch(arch);
+    return e ? e->factory() : nullptr;
 }
 
 ArchInfo arch_info(const std::string & arch) {
     ArchInfo a;
     // "supported" is answered by the factory itself: constructing a backend only
     // allocates its own metadata (no weights are read), so wiring a new
-    // architecture into vqa_create_model is enough to make discovery list it.
-    Model * probe = vqa_create_model(arch);
-    if (!probe) return a;
-    delete probe;
+    // architecture into the arch table is enough to make discovery list it.
+    const ArchEntry * e = find_arch(arch);
+    if (!e) return a;
     a.supported = true;
-    if (arch == "moondream3") {
-        a.needs_vision_gguf = true;   // SigLIP tower ships as a separate gguf
-    } else if (arch == "videomae" || arch == "vivit") {
-        a.pure_vision = true;         // classification/embedding only
-        a.needs_tokenizer = false;
-    }
+    a.needs_vision_gguf = e->needs_vision_gguf;
+    a.pure_vision = e->pure_vision;
+    a.needs_tokenizer = !e->pure_vision;
     return a;
+}
+
+std::string default_tokenizer_dir(const std::string & arch) {
+    // qwen3.5 aliases that ship as their own checkpoints get their own dir
+    if (arch == "marlin")   return "models/Marlin-2B";
+    if (arch == "videojev") return "models/VideoJev-4B";
+    const ArchEntry * e = find_arch(arch);
+    return (e && e->default_dir[0]) ? std::string(e->default_dir) : std::string();
+}
+
+TokenizerMode tokenizer_mode_for_arch(const std::string & arch) {
+    const ArchEntry * e = find_arch(arch);
+    return e ? e->tokenizer_mode : TokenizerMode::Qwen2Regex;
+}
+
+size_t fallback_vocab_target(const std::string & arch) {
+    const ArchEntry * e = find_arch(arch);
+    return e ? e->vocab_target : 151936;
 }
 
 }  // namespace vqa

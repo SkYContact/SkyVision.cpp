@@ -552,69 +552,10 @@ void Qwen3_5::dump(const ggml_cgraph * gf, const char * name) {
 }
 
 // ---------------------------------------------------------------- vision
-namespace {
-struct MarlinVitEnv {
-    ggml_context *gctx;
-    ggml_cgraph *gf;
-    VisConfig *vc = nullptr;
-    ggml_tensor *t_vpos = nullptr;
-    int N = 0, vhd = 0;
-    const char *stop_after = nullptr;
-    std::function<bool(const char *)> run;
-    int state = 0;
-};
-
-static ggml_tensor * marlin_vit_attention(void * ud_, ggml_tensor * qkv) {
-    MarlinVitEnv & e = *(MarlinVitEnv *)ud_;
-    ggml_context * gctx = e.gctx;
-    const VisConfig & vc = *e.vc;
-    const int N = e.N, vhd = e.vhd;
-
-    const size_t off = (size_t)vc.n_head * vhd * qkv->nb[0];
-    auto qkv_head_view = [&](int block) {
-        return ggml_view_3d(gctx, qkv, vhd, vc.n_head, N,
-                            (size_t)vhd * qkv->nb[0], qkv->nb[1], (size_t)block * off);
-    };
-    ggml_tensor * q = qkv_head_view(0);
-    ggml_tensor * k = qkv_head_view(1);
-    ggml_tensor * v = qkv_head_view(2);
-
-    // native pair layout (h-block | w-block, NEOX halves) is already the
-    // ggml GGML_ROPE_TYPE_VISION layout; sections 16|16 over 32 pairs
-    int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
-    q = ggml_rope_multi(gctx, q, e.t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
-                        32768, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_multi(gctx, k, e.t_vpos, nullptr, vhd / 2, sections, GGML_ROPE_TYPE_VISION,
-                        32768, vc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    if (e.stop_after && !strcmp(e.stop_after, "v_blk0_q_rope")) {
-        ggml_set_name(q, "v_blk0_q_rope");
-        ggml_build_forward_expand(e.gf, q);
-        if (!e.run("v_blk0_q_rope")) e.state = 2; else e.state = 1;
-        return nullptr;
-    }
-
-    // one temporal step per graph -> one unmasked FA over the whole stream
-    auto fa_in = [&](ggml_tensor * t) {
-        return ggml_view_3d(gctx, t, vhd, N, vc.n_head, t->nb[2], t->nb[1], 0);
-    };
-    ggml_tensor * fa = ggml_flash_attn_ext(gctx, fa_in(q), fa_in(k), fa_in(v), nullptr,
-                                           1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-    return ggml_reshape_2d(gctx, ggml_cont(gctx, fa), (int64_t)vc.n_embd, N);
-}
-
-static bool marlin_vit_probe(void * ud_, const char * stage, ggml_tensor * t) {
-    MarlinVitEnv & e = *(MarlinVitEnv *)ud_;
-    char nm[40];
-    snprintf(nm, sizeof(nm), "v_blk0_%s", stage);
-    ggml_set_name(t, nm);
-    if (e.stop_after && !strcmp(e.stop_after, nm)) {
-        ggml_build_forward_expand(e.gf, t);
-        if (!e.run(nm)) e.state = 2; else e.state = 1;
-        return true;
-    }
-    return false;
-}
-}  // namespace
+// The attention hook (strided head views, ggml GGML_ROPE_TYPE_VISION rope
+// with sections 16|16 over 32 pairs, one unmasked FA over the whole stream,
+// layer-0 parity truncation) lives once in vqa::vit::vit_attention_hook
+// (core/vit_block.hpp); this backend only supplies its parameters below.
 
 bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                            int * n_tokens, int * grid, int token_budget) {
@@ -770,17 +711,21 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
 
         int vl_max = vc.n_layer;
         { const char * e = getenv("QWEN35_VL"); if (e) vl_max = std::min(vl_max, atoi(e)); }
-        MarlinVitEnv env;
-        env.gctx = gctx; env.gf = gf; env.vc = &vc; env.t_vpos = t_vpos;
-        env.N = Nc; env.vhd = vhd; env.stop_after = stop_s; env.state = 0;
+        vqa::vit::VitHookEnv env;
+        env.gctx = gctx; env.gf = gf; env.t_vpos = t_vpos;
+        env.n_head = vc.n_head; env.n_embd = vc.n_embd;
+        env.N = Nc; env.vhd = vhd; env.vhd_f = vhd;
+        env.n_ctx = 32768; env.rope_theta = vc.rope_theta;
+        env.rope_stop_all_layers = true;
+        env.stop_after = stop_s; env.state = 0;
         env.run = [&run_chunk](const char * name) -> bool { std::vector<float> sink; return run_chunk(name, &sink); };
         for (int il = 0; il < vl_max; il++) {
             VisLayer & L = vl[il];
             vqa::vit::BlockWeights bw{L.norm0_w, L.norm0_b, L.wqkv_w, L.wqkv_b, L.wo_w, L.wo_b,
                                       L.norm1_w, L.norm1_b, L.fc0_w, L.fc0_b, L.fc1_w, L.fc1_b};
             vqa::vit::BlockHooks bh;
-            bh.attention = marlin_vit_attention;
-            bh.probe_layer0 = marlin_vit_probe;
+            bh.attention = vqa::vit::vit_attention_hook;
+            bh.probe_layer0 = vqa::vit::vit_probe_layer0_hook;
             bh.ud = &env;
             x = vqa::vit::block(gctx, x, bw, vc.layernorm_eps, bh, il);
             if (!x) { ggml_free(gctx); return env.state == 1; }
