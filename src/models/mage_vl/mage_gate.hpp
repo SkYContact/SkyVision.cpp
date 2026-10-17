@@ -326,7 +326,7 @@ inline void ClsWeights::forward(const float * tok, float * logits, std::vector<f
                 }
                 const float * v0 = &V[0 * NKV * HD + khh * HD];
                 const float * v1 = &V[1 * NKV * HD + khh * HD];
-                float * oh = &att[t * D + hh * HD];
+                float * oh = &att[t * (NH * HD) + hh * HD];
                 for (int d = 0; d < HD; d++) oh[d] = w0 * v0[d] + w1 * v1[d];
             }
         // o proj + residual
