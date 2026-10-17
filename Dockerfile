@@ -28,8 +28,12 @@ RUN test -d ggml || git clone --depth 1 https://github.com/ggml-org/ggml ggml
 
 # MSVC-style GGML_NATIVE does not exist here, but the x86 flags are what make the
 # difference: the CPU backend vectorises the fp32 matmuls through them.
+# BUILD_SHARED_LIBS=OFF matters for the runtime stage: ggml defaults to shared
+# libraries on Linux, and a dynamically linked vqa-cli dies with "cannot open shared
+# object file libggml.so" (exit 127) inside an image that only copies the binary.
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF \
         -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_OPENMP=OFF \
         -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
     && cmake --build build --target vqa-cli
@@ -42,6 +46,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/SkyVision/build/vqa-cli /usr/local/bin/vqa-cli
+
+# fail the build here, not at the first MCP request, if the binary is not runnable
+# (missing shared libs used to surface as an exit-127 from docker run). `grep -q` is
+# last in the pipeline, so a non-runnable binary fails the step too.
+RUN vqa-cli --help 2>&1 | grep -q "usage:"
 
 # bundled demo model (override the repo/rev to pin or to use a mirror).
 # Hugging Face is the default because build machines outside China reach it fastest;
