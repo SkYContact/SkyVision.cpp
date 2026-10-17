@@ -107,17 +107,6 @@ struct TextGraph {
     ggml_tensor *logits = nullptr;
 };
 
-// shared state for the vision attention hook
-struct VitEnv {
-    ggml_context * gctx = nullptr;
-    VisConfig * vc = nullptr;
-    ggml_tensor * t_rope = nullptr;   // [2, vhd_f/2, N] F32: cos plane then sin plane
-    int N = 0, n_ctx = 0;
-    int vhd = 72, vhd_f = 80;
-    int layer = 0;
-    float rope_base = 10000.0f;
-};
-
 // qkv rows: q (16x80) | k (16x80) | v (16x80), converter-permuted into the
 // rope_layout=2 head layout ([x-re 18 | y-re 18 | pad4 | x-im 18 | y-im 18 |
 // pad4]); strided head views feed rope/FA with no runtime padding copies.
@@ -126,57 +115,8 @@ struct VitEnv {
 // >= sections[0] on the CPU backend at this size (convert/rope_probe2.cpp).
 // Full (non-causal) attention over the whole media: every frame's patches
 // attend each other (the reference's cu_seqlens semantics).
-static ggml_tensor * mvit_attention(void * ud_, ggml_tensor * qkv) {
-    VitEnv & e = *(VitEnv *)ud_;
-    ggml_context * c = e.gctx;
-    const int vhd = e.vhd, vhd_f = e.vhd_f;
-    const size_t off = (size_t)e.vc->n_head * vhd_f * ggml_element_size(qkv);
-    auto head_view = [&](int block) {
-        return ggml_view_3d(c, qkv, vhd_f, e.vc->n_head, e.N,
-                            (size_t)vhd_f * ggml_element_size(qkv), qkv->nb[1],
-                            (size_t)block * off);
-    };
-    ggml_tensor * q = head_view(0);
-    ggml_tensor * k = head_view(1);
-    ggml_tensor * v = head_view(2);
-    if (e.layer == 0) ggml_set_name(qkv, "v_blk0_qkv");
-
-    // in-graph rotation: pair (j, j+40) by angle tables broadcast per head;
-    // t_rope layout: cos plane [40, N] then sin plane, 40 floats per token
-    const size_t es = ggml_element_size(e.t_rope);
-    ggml_tensor * cos_t = ggml_view_3d(c, e.t_rope, vhd_f / 2, 1, e.N, es, (size_t)(vhd_f / 2) * es, 0);
-    ggml_tensor * sin_t = ggml_view_3d(c, e.t_rope, vhd_f / 2, 1, e.N, es, (size_t)(vhd_f / 2) * es,
-                                       (size_t)e.N * (vhd_f / 2) * es);
-    auto rope_pair = [&](ggml_tensor * x) {
-        ggml_tensor * re = ggml_view_3d(c, x, vhd_f / 2, e.vc->n_head, e.N,
-                                        x->nb[1], x->nb[2], 0);
-        ggml_tensor * im = ggml_view_3d(c, x, vhd_f / 2, e.vc->n_head, e.N,
-                                        x->nb[1], x->nb[2],
-                                        (size_t)(vhd_f / 2) * ggml_element_size(x));
-        ggml_tensor * ore = ggml_sub(c, ggml_mul(c, re, cos_t), ggml_mul(c, im, sin_t));
-        ggml_tensor * oim = ggml_add(c, ggml_mul(c, re, sin_t), ggml_mul(c, im, cos_t));
-        return ggml_concat(c, ore, oim, 0);
-    };
-    q = rope_pair(q);
-    k = rope_pair(k);
-
-    auto fa_in = [&](ggml_tensor * t) {
-        return ggml_view_3d(c, t, vhd_f, e.N, e.vc->n_head, t->nb[2], t->nb[1], 0);
-    };
-    ggml_tensor * fa = ggml_flash_attn_ext(c, fa_in(q), fa_in(k), fa_in(v), nullptr,
-                                           1.0f / sqrtf((float)vhd), 0.0f, 0.0f);
-    if (e.layer == 0) {
-        ggml_set_name(q, "v_blk0_q_rope");
-        ggml_set_name(fa, "v_blk0_attn");
-    }
-    // de-pad 80 -> 72 rows per head, then (d, h) rows per token for wo
-    ggml_tensor * attn_src = ggml_view_3d(c, fa, vhd, e.vc->n_head, e.N,
-                                          (size_t)vhd_f * ggml_element_size(fa),
-                                          (size_t)vhd_f * e.vc->n_head * ggml_element_size(fa), 0);
-    ggml_tensor * attnout = ggml_reshape_2d(c, ggml_cont(c, attn_src), e.vc->n_embd, e.N);
-    if (e.layer == 0) ggml_set_name(attnout, "v_blk0_attnout");
-    return attnout;
-}
+// All of that lives once in vqa::vit::vit_attention_hook (core/vit_block.hpp);
+// moss_vl only supplies the manual-rope tables and the padded head layout.
 
 class MossVL : public vqa::Model {
 public:
@@ -191,6 +131,18 @@ public:
     void session_reset() override { sess_active = false; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
+
+    // ChatML template + realtime silence token, exposed so front ends stay
+    // template-agnostic (see build_prompt: history turns are prepended verbatim)
+    std::string format_history_turn(const std::string & user,
+                                    const std::string & assistant) const override {
+        return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
+             + assistant + "<|im_end|>\n";
+    }
+    std::string format_system(const std::string & sys) const override {
+        return "<|im_start|>system\n" + sys + "<|im_end|>\n";
+    }
+    const char * silence_piece() const override { return "<|silence|>"; }
 
     // tunables, set before load()
     int n_ctx = 8192;
@@ -822,15 +774,13 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
                            const std::vector<int> & vpos, int N, std::vector<float> & merged,
                            const PromptPlan * plan) {
     if (N == 0) return true;
-    VitEnv env;
-    env.vc = &vc;
+    vqa::vit::VitHookEnv env;
+    env.n_head = vc.n_head;
+    env.n_embd = vc.n_embd;
     env.N = N;
-    env.n_ctx = n_ctx;
     env.vhd = vc.n_embd / vc.n_head;                // 72
     env.vhd_f = env.vhd + 8;                        // zero-padded rows (rope_layout=2)
-    // converter-permuted rows make n_dims 40; rescale the base so every real
-    // pair keeps its exact frequency (theta^(-p/18))
-    env.rope_base = powf(vc.rope_theta, (float)env.vhd_f / (float)env.vhd);
+    env.dbg_names = true;                           // layer-0 dump tensor names
 
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     ggml_context * gctx = ggml_init(ip);
@@ -858,16 +808,10 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
                                   L.ln2_w, L.ln2_b, L.fc0_w, L.fc0_b, L.fc1_w, L.fc1_b};
         vqa::vit::BlockHooks bh;
         bh.ud = &env;
-        bh.attention = mvit_attention;
+        bh.attention = vqa::vit::vit_attention_hook;
         env.layer = il;
-        if (il == 0 && !dump_dir.empty()) {
-            bh.probe_layer0 = [](void * ud_, const char * stage, ggml_tensor * t) {
-                char nm[48];
-                snprintf(nm, sizeof(nm), "v_blk0_%s", stage);
-                ggml_set_name(t, nm);
-                return false;
-            };
-        }
+        if (il == 0 && !dump_dir.empty())
+            bh.probe_layer0 = vqa::vit::vit_probe_layer0_hook;   // stop_after unused here: names only
         x = vqa::vit::block(gctx, x, bw, vc.layernorm_eps, bh, il);
         if (!x) { ggml_free(gctx); return false; }
         if (il == 0) ggml_set_name(x, "v_blk0_out");

@@ -588,7 +588,7 @@ bool tool_analyze_video(const vqa::json::Value & a, std::string & out, std::stri
     }
     std::string question = a.str("question");
     std::string mode = a.str("mode");
-    const bool tower = (e->arch == "videomae" || e->arch == "vivit");
+    const bool tower = vqa::arch_info(e->arch).pure_vision;
     if (tower && mode.empty()) mode = "5";   // label distribution instead of a caption
     if (question.empty() && !tower) question = "Describe what happens in this video.";
     out = run_ask(m, media, question, mode, a, err);
@@ -602,7 +602,7 @@ bool tool_classify_video(const vqa::json::Value & a, std::string & out, std::str
     const int max_frames = a.integer("max_frames", 16);
     const vqa::ModelEntry * e = resolve_entry(a.str("model"), err);
     if (!e) return false;
-    if (e->arch != "videomae" && e->arch != "vivit") {
+    if (!vqa::arch_info(e->arch).pure_vision) {
         err = "classify_video needs a video tower (videomae / vivit); '" + e->arch +
               "' is a language backend - use analyze_video instead";
         return false;

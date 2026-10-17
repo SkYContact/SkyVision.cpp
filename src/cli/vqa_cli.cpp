@@ -161,7 +161,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "architecture: %s\n", arch.c_str());
 
     // pure video towers (videomae / vivit) have no text side at all: no tokenizer
-    const bool needs_tokenizer = arch != "videomae" && arch != "vivit";
+    const bool needs_tokenizer = vqa::arch_info(arch).needs_tokenizer;
     std::string tok_path = vqa::resolve_tokenizer_path(tokenizer_arg);
     if (!tok_path.empty()) {
         // keep the explicit argument as given
@@ -201,18 +201,17 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    // moondream3.1 is a normal backend now: it is driven through vqa::Model like
-    // every other model. Its *-vision / *-region side files default to the model's
-    // own directory (the adapter resolves them, see moondream_vqa_adapter.inc).
-    if (arch == "moondream3" && !frames_dir.empty()) {
-        fprintf(stderr, "moondream3.1 does not take video input; use a VideoChat3 model\n");
-        return 2;
-    }
-
     vqa::Model * model = vqa::vqa_create_model(arch);
     if (!model) {
         fprintf(stderr, "architecture '%s' is not wired into this build\n", arch.c_str());
         return 3;
+    }
+    // video support is a per-backend capability (e.g. moondream3.1 rejects it).
+    // caps() is authoritative only after load(), so the pure video towers are
+    // let through via ArchInfo (they take frame dirs by definition).
+    if (!frames_dir.empty() && !model->caps().video && !vqa::arch_info(arch).pure_vision) {
+        fprintf(stderr, "arch %s does not take video input\n", arch.c_str());
+        return 2;
     }
 
     vqa::MediaInput media;

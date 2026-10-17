@@ -11,6 +11,7 @@
 // present (moondream3 wants a *-vision.gguf; both want tokenizer.json).
 #include "vqa.hpp"
 #include "http_server.hpp"
+#include "vqa_util.hpp"
 #include "media_io.hpp"
 #include "model_registry.hpp"
 
@@ -123,6 +124,7 @@ struct RtStream {
     std::deque<std::pair<std::vector<unsigned char>, double>> jpegs;  // pending (frame, t)
     std::deque<std::string> prompts;
     std::deque<std::string> events;   // NDJSON lines, oldest first
+    std::string silence_tok;          // backend's "nothing to say" piece (if any)
     long seq = 0;
     std::atomic<bool> stop_flag{false};
     bool started = false;
@@ -245,8 +247,10 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
         gp.max_tokens = 200;
         std::string carry;
         gp.on_token = [](const char * piece, void * ud) {
-            ((RtStream *)ud)->push_event(std::string("{\"t\":\"") +
-                                         vqa::http::json_escape(piece) + "\"}\n");
+            RtStream * s = (RtStream *)ud;
+            if (!s->silence_tok.empty() && s->silence_tok == piece) return;
+            s->push_event(std::string("{\"t\":\"") +
+                          vqa::http::json_escape(piece) + "\"}\n");
         };
         gp.on_token_ud = s.get();
         if (first) {
@@ -255,8 +259,6 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
             // when turn 1 carries no user text — seed one so the narration
             // lands as a normal answer and the session stays responsive
             if (q.empty()) q = "Please observe and describe what you see.";
-            if (s->use_sys_prompt)
-                gp.history = std::string("<|im_start|>system\n") + RT_SYSTEM_PROMPT + "<|im_end|>\n";
         }
         std::string out;
         s->push_event(q.empty() ? "{\"event\":\"observe\"}\n"
@@ -264,6 +266,11 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
         {
             std::lock_guard<std::mutex> lk(g_mu);
             vqa::Model * m = g_reg.loaded();
+            if (m && s->use_sys_prompt)
+                // the chat template belongs to the backend, not this protocol
+                // layer — asking the model keeps front ends template-agnostic
+                gp.history = m->format_system(RT_SYSTEM_PROMPT);
+            if (m) s->silence_tok = m->silence_piece();
             if (!m || g_reg.loaded_id() != model_id) {
                 s->push_event("{\"error\":\"model no longer loaded\"}\n");
                 break;
@@ -324,15 +331,8 @@ static void rt_stop(const std::string & session) {
 }
 
 std::string read_file(const std::string & p) {
-    FILE * f = fopen(p.c_str(), "rb");
-    if (!f) return "";
     std::string out;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    out.resize(n);
-    if (n) fread(out.data(), 1, n, f);
-    fclose(f);
+    if (!vqa::read_file(p.c_str(), out)) out.clear();
     return out;
 }
 
@@ -538,11 +538,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 auto & turns = sessions[sess];
                 while (turns.size() > 12) turns.erase(turns.begin());   // keep the last 12 turns
                 std::string hist;
+                // rendered through the backend's own template: the protocol
+                // layer no longer assumes ChatML (which moondream is not)
                 for (const auto & t : turns) {
                     std::string a = t.second;
                     if (a.size() > 1500) a.resize(1500);
-                    hist += "<|im_start|>user\n" + t.first + "<|im_end|>\n<|im_start|>assistant\n"
-                         + a + "<|im_end|>\n";
+                    hist += g_reg.loaded()->format_history_turn(t.first, a);
                 }
                 gp.history = hist;
             }

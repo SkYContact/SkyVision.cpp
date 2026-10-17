@@ -136,16 +136,24 @@ public:
 
     // batched text-only decode driver (one prompt per line); -1 = unsupported
     virtual int run_batch(const std::string & batch_path, int n_gen) { (void)batch_path; (void)n_gen; return -1; }
+
+    // Chat-template knowledge the front ends need but only the backend has.
+    // format_history_turn renders one prior turn for gp.history ("" = this
+    // backend has no multi-turn template; front ends then skip the prefix).
+    // format_system renders a system prompt prelude for a first realtime turn
+    // ("" = none). silence_piece is the token text meaning "nothing to say"
+    // in realtime narration ("" = no such token).
+    virtual std::string format_history_turn(const std::string & user,
+                                            const std::string & assistant) const {
+        (void)user; (void)assistant; return std::string();
+    }
+    virtual std::string format_system(const std::string & sys) const { (void)sys; return std::string(); }
+    virtual const char * silence_piece() const { return ""; }
 };
 
-// Backend factories (one per architecture).
-Model * create_moondream();
-Model * create_videochat3();
-Model * create_qwen3_5();
-Model * create_moss_vl();
-Model * create_videomae();
-Model * create_qwen2vl();
-Model * create_smolvlm();
+// Backend factories (one per architecture) live in backend_factories.hpp,
+// included only by vqa_registry.cpp - wiring a new backend touches that header
+// plus one table row in vqa_registry.cpp, and nothing else in core.
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);
@@ -180,6 +188,10 @@ std::string architecture_of(const char * gguf_path);
 // containing one. Returns the resolved file path (unchanged when it exists as a
 // file, empty when nothing was found).
 std::string resolve_tokenizer_path(const std::string & arg);
+
+// Fallback vocab size when a GGUF carries no "<arch>.vocab_size": used by
+// discovery to match a tokenizer.json against the model family.
+size_t fallback_vocab_target(const std::string & arch);
 
 // Repo-layout default checkpoint dir whose tokenizer.json serves `arch`
 // ("models/VideoChat3-4B" etc.). Empty when the arch has no canonical dir or

@@ -145,10 +145,6 @@ size_t tokenizer_vocab(const std::string & path) {
     return (size_t)std::count(js.begin() + (long)vp, js.begin() + (long)me, ':');
 }
 
-// Fallback target when the GGUF carries no vocab_size: moondream's starmie is
-// ~51.2k, every Qwen-family checkpoint ~152k.
-size_t fallback_vocab_target(const std::string & arch) { return arch == "moondream3" ? 51200 : 151936; }
-
 }  // namespace
 
 bool path_exists(const std::string & path) {
