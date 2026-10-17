@@ -20,6 +20,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import mmap
 import struct
 import sys
 
@@ -44,7 +45,10 @@ class _RawSafetensors:
            "BOOL": np.uint8}
 
     def __init__(self, path):
-        self._m = open(path, "rb").read()
+        # mmap, never read(): shards are multi-GB and the whole-file read()
+        # OOM-killed the host on the 9.5GB Mage-VL release
+        self._f = open(path, "rb")   # keep the fd alive for the mmap
+        self._m = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
         n = struct.unpack("<Q", self._m[:8])[0]
         self.meta = json.loads(self._m[8:8 + n])
         self._base = 8 + n
@@ -62,7 +66,14 @@ class _RawSafetensors:
         raw = self._m[s:t]
         arr = np.frombuffer(raw, dtype=self._DT[dt]).reshape(shape)
         if dt == "BF16":
-            arr = (arr.astype(np.uint32) << np.uint32(16)).view(np.float32)
+            # expand in 64M-element chunks so the f32 copy never peaks huge
+            flat = arr.reshape(-1)
+            out = np.empty(flat.size, dtype=np.float32)
+            step = 64 * 1024 * 1024
+            for i in range(0, flat.size, step):
+                chunk = flat[i:i + step].astype(np.uint32) << np.uint32(16)
+                out[i:i + step] = chunk.view(np.float32)
+            arr = out.reshape(shape)
         elif dt == "F16":
             arr = arr.astype(np.float32)
         return arr

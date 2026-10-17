@@ -89,6 +89,7 @@ set(MD_INC   ${CMAKE_SOURCE_DIR}/src/models/moondream)
 set(VC3_INC  ${CMAKE_SOURCE_DIR}/src/models/videochat3)
 set(MV_INC   ${CMAKE_SOURCE_DIR}/src/models/moss_vl)
 set(VM_INC   ${CMAKE_SOURCE_DIR}/src/models/videomae)
+set(MAGE_INC ${CMAKE_SOURCE_DIR}/src/models/mage_vl)
 
 # shared layer. media_io.cpp is the single translation unit owning the stb_image
 # implementation; tokenizer.cpp owns the Unicode tables for the Qwen2
@@ -135,6 +136,11 @@ set(QWEN2VL_SRC
 #   src/models/smolvlm/      SmolVLM / Idefics3 backend (SigLIP + SmolLM2)
 set(SMOLVLM_SRC
     src/models/smolvlm/smolvlm_model.cpp)
+#   src/models/mage_vl/      Microsoft Mage-VL backend (Qwen3-4B text + Mage-ViT Codec-ViT;
+#                            reuses vc3's resize/patchify primitives)
+set(MAGE_VL_SRC
+    src/models/videochat3/vc3_preprocess.cpp
+    src/models/mage_vl/mage_model.cpp)
 
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
@@ -151,6 +157,17 @@ add_executable(vqa-cli
     ${SMOLVLM_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
+    ${MAGE_VL_SRC})
+target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${MAGE_INC})
+
+# --- moondream3.1 standalone binary (same engine, its own argument surface) ---
+add_executable(moondream-cli
+    src/models/moondream/moondream_cli.cpp
+    ${MOONDREAM_SRC}
+    ${MOONDREAM_CORE_SRC})
+target_link_libraries(moondream-cli PRIVATE ggml ggml-cpu)
+target_include_directories(moondream-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- vision encoder test target (milestone 6) ---
 add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)

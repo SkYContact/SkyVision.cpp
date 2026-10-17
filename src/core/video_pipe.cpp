@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cerrno>
 
 #ifdef _WIN32
   #define popen _popen
@@ -25,8 +26,10 @@ namespace vqa {
 static std::string find_ffmpeg() {
     if (const char * e = getenv("FFMPEG")) {
         std::string p = e;
+#ifdef _WIN32
         // cmd.exe cannot launch a quoted command whose path uses forward slashes
         std::replace(p.begin(), p.end(), '/', '\\');
+#endif
         return p;
     }
 #ifdef _WIN32
@@ -35,7 +38,11 @@ static std::string find_ffmpeg() {
     const char * candidates[] = { "ffmpeg" };
 #endif
     for (const char * c : candidates) {
+#ifdef _WIN32
         std::string cmd = std::string(c) + " -version 2>NUL >NUL";
+#else
+        std::string cmd = std::string(c) + " -version 2>/dev/null >/dev/null";
+#endif
         if (system(cmd.c_str()) == 0) return c;
     }
     return {};
@@ -45,9 +52,13 @@ static std::string find_ffmpeg() {
 // (avoids a ffprobe dependency)
 static bool probe_metadata(const std::string & ffmpeg, const std::string & path,
                            double & duration, int & w, int & h) {
+#ifdef _WIN32
     // wrap the whole line in an extra quote pair: cmd /c otherwise strips the leading
     // quote of a quoted exe path and mangles the command
     std::string cmd = "\"\"" + ffmpeg + "\" -i \"" + path + "\" -f null - 2>&1\"";
+#else
+    std::string cmd = "\"" + ffmpeg + "\" -i \"" + path + "\" -f null - 2>&1";
+#endif
     FILE * p = popen(cmd.c_str(), "r");
     if (!p) return false;
     std::string buf;
@@ -102,11 +113,17 @@ bool load_video_file(const std::string & path, double fps, int max_frames, Media
 
     char vf[128];
     snprintf(vf, sizeof(vf), "fps=%.4f", eff_fps);
+#ifdef _WIN32
     std::string cmd = "\"\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -i \"" + path + "\" -vf " + vf +
                       " -frames:v " + std::to_string(n) +
                       " -pix_fmt rgb24 -f rawvideo -\"";
-    FILE * p = popen(cmd.c_str(), "rb");
-    if (!p) { fprintf(stderr, "cannot spawn ffmpeg\n"); return false; }
+#else
+    std::string cmd = "\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -i \"" + path + "\" -vf " + vf +
+                      " -frames:v " + std::to_string(n) +
+                      " -pix_fmt rgb24 -f rawvideo -";
+#endif
+    FILE * p = popen(cmd.c_str(), "r");   // glibc popen rejects "rb" (EINVAL)
+    if (!p) { fprintf(stderr, "cannot spawn ffmpeg (errno %d): %s\n", errno, cmd.c_str()); return false; }
 
     out.kind = MediaKind::Video;
     out.width = w;

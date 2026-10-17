@@ -16,6 +16,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#ifndef _WIN32
+#   include <dirent.h>
+#   include <sys/stat.h>
+#endif
 #include <map>
 #include <set>
 #include <deque>
@@ -341,6 +346,161 @@ std::string read_file(const std::string & p) {
 // shared with the MCP front end: one place decides which GGUFs are runnable and
 // which side files (vision tower / tokenizer.json) each one needs.
 const ModelEntry * find_model(const std::string & id) { return g_reg.find(id); }
+std::string stem_of(const std::string & name) {
+    size_t dot = name.rfind('.');
+    return dot == std::string::npos ? name : name.substr(0, dot);
+}
+
+bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ftype) {
+    struct gguf_init_params p = { true, nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    if (!g) return false;
+    int k = gguf_find_key(g, "general.architecture");
+    if (k >= 0) arch = gguf_get_val_str(g, k);
+    // legacy qwen3.5/marlin ggufs carry swapped arch labels; marlin.skills
+    // (written by the converter from the checkpoint's architectures) is
+    // authoritative for which fine-tune it is
+    int ks = gguf_find_key(g, "marlin.skills");
+    if (arch == "qwen3_5" || arch == "marlin") {
+        // skills=true -> Marlin fine-tune; false or key missing (older
+        // converter that labelled plain qwen3.5 files "marlin") -> qwen3_5
+        arch = (ks >= 0 && gguf_get_val_bool(g, ks)) ? "marlin" : "qwen3_5";
+    }
+    int kf = gguf_find_key(g, "general.file_type");
+    if (kf >= 0) {
+        char b[32];
+        snprintf(b, sizeof(b), "f%d", (int)gguf_get_val_u32(g, kf));
+        ftype = b;
+    }
+    gguf_free(g);
+    return !arch.empty();
+}
+
+// pick a tokenizer.json for the arch: vc3 needs the Qwen one (vocab >= 150k);
+// probe the models dir and ./models/* checkpoint dirs by vocab size
+std::string resolve_tokenizer(const std::string & arch) {
+    std::vector<std::string> cands = { g_models_dir + "/tokenizer.json" };
+#ifdef _WIN32
+    // models/<checkpoint>/tokenizer.json (fd.cFileName is a bare name, so
+    // enumerate checkpoint dirs and probe each)
+    WIN32_FIND_DATAA fdd;
+    HANDLE hd = FindFirstFileA("models/*", &fdd);
+    if (hd != INVALID_HANDLE_VALUE) {
+        do {
+            if (fdd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY && fdd.cFileName[0] != '.')
+                cands.push_back(std::string("models/") + fdd.cFileName + "/tokenizer.json");
+        } while (FindNextFileA(hd, &fdd));
+        FindClose(hd);
+    }
+#else
+    // models/<checkpoint>/tokenizer.json: enumerate checkpoint dirs and probe each
+    DIR * dd = opendir("models");
+    if (dd) {
+        struct dirent * de;
+        while ((de = readdir(dd))) {
+            if (de->d_name[0] == '.') continue;
+            std::string c = std::string("models/") + de->d_name + "/tokenizer.json";
+            struct stat st;
+            if (stat(c.c_str(), &st) == 0 && S_ISREG(st.st_mode)) cands.push_back(c);
+        }
+        closedir(dd);
+    }
+#endif
+    const bool need_qwen = arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl" || arch == "mage_vl";
+    for (auto & c : cands) {
+        FILE * f = fopen(c.c_str(), "rb");
+        if (!f) continue;
+        std::string js;
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
+        fclose(f);
+        size_t vp = js.find("\"vocab\"");
+        if (vp == std::string::npos) continue;
+        size_t me = js.find("\"merges\"", vp);
+        if (me == std::string::npos) me = js.size();
+        size_t keys = std::count(js.begin() + vp, js.begin() + me, ':');
+        if ((need_qwen && keys >= 150000) || (!need_qwen && keys >= 50000)) return c;
+    }
+    return "";
+}
+
+void discover_models() {
+    g_models.clear();
+    std::vector<std::string> files;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((g_models_dir + "/*.gguf").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR * d = opendir(g_models_dir.c_str());
+    if (!d) { fprintf(stderr, "serve: models dir not found: %s\n", g_models_dir.c_str()); return; }
+    struct dirent * e;
+    while ((e = readdir(d)))
+        if (e->d_name[0] != '.') {
+            std::string name = e->d_name;
+            if (name.size() > 5 && name.substr(name.size() - 5) == ".gguf") files.push_back(name);
+        }
+    closedir(d);
+    std::sort(files.begin(), files.end());
+#endif
+    // one shared vision/region file for all moondream weights
+    std::string vision_path;
+    for (auto & f : files)
+        if (f.size() > 12 && f.substr(f.size() - 12) == "-vision.gguf") { vision_path = g_models_dir + "/" + f; break; }
+
+    for (auto & f : files) {
+        std::string arch, ftype;
+        if (!gguf_arch_of(g_models_dir + "/" + f, arch, ftype)) continue;
+        // per-model tokenizer wins: models/<gguf-stem>/tokenizer.json (the
+        // generic resolver can pick a same-vocab sibling whose added tokens
+        // differ - moss_vl's <|image_pad|>/<|silence|> only exist in its own)
+        std::string own = std::string("models/") + stem_of(f) + "/tokenizer.json";
+        std::string tok = file_exists(own) ? own : resolve_tokenizer(arch);
+        if (!g_tokenizer.empty()) tok = g_tokenizer;
+        if (arch == "moondream3") {
+            if (vision_path.empty() || !file_exists(tok)) {
+                fprintf(stderr, "serve: skip %s (needs %s + tokenizer.json)\n", f.c_str(),
+                        vision_path.empty() ? "*-vision.gguf" : "tokenizer.json");
+                continue;
+            }
+        } else if (arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl" || arch == "mage_vl") {
+            if (!file_exists(tok)) {
+                fprintf(stderr, "serve: skip %s (needs tokenizer.json)\n", f.c_str());
+                continue;
+            }
+        } else {
+            continue;   // vision/region side files and unknown archs stay unlisted
+        }
+        ModelEntry e;
+        e.id = stem_of(f);
+        e.path = g_models_dir + "/" + f;
+        e.arch = arch;
+        e.quant = ftype;
+        e.vision_path = vision_path;
+        e.tokenizer = tok;
+        // size via filesystem
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(e.path.c_str(), GetFileExInfoStandard, &fa))
+            e.size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+#else
+        struct stat st;
+        if (stat(e.path.c_str(), &st) == 0) e.size = (uint64_t)st.st_size;
+#endif
+        g_models.push_back(e);
+    }
+    fprintf(stderr, "serve: %zu runnable model(s) in %s\n", g_models.size(), g_models_dir.c_str());
+}
+
+const ModelEntry * find_model(const std::string & id) {
+    for (auto & m : g_models) if (m.id == id) return &m;
+    return nullptr;
+}
 
 bool ensure_loaded(const ModelEntry & e, std::string & err) {
     if (g_reg.loaded() && g_reg.loaded_id() == e.id) return true;

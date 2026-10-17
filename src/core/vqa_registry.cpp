@@ -81,6 +81,7 @@ Model * vqa_create_model(const std::string & arch) {
     // video towers: labels or pooled embedding. ViViT is the same graph with a cls
     // token + learned position table, so it reuses the videomae backend.
     if (arch == "videomae" || arch == "vivit") return create_videomae();
+    if (arch == "mage_vl") return create_mage_vl();
     if (arch == "moondream3") return create_moondream();
     return nullptr;
 }
