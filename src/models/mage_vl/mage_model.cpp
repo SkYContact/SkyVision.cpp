@@ -517,8 +517,18 @@ bool MageVL::load_gate(const char * path) {
         if (!bound.ok) { fprintf(stderr, "mage_gate: weight bind failed\n"); return false; }
         gate_wbuf_ = bound.main_buf;
         gate_host_bufs_ = bound.host_bufs;
-        if (ggml_backend_is_cpu(gate_backend_)) gate_mm_ = std::move(mm);  // zero-copy keeps the mapping
-        else mm.release();                                                 // uploaded to the device
+        if (ggml_backend_is_cpu(gate_backend_)) {
+            // zero-copy keeps the mapping: hand it to the member WITHOUT a
+            // move (MMap's default move leaves the local's destructor free
+            // to unmap the region out from under the weights)
+            gate_mm_.release();
+            gate_mm_.ptr = mm.ptr;
+            gate_mm_.size = mm.size;
+            mm.ptr = nullptr;
+            mm.size = 0;
+        } else {
+            mm.release();   // uploaded to the device
+        }
     }
     gate_wctx_ = wctx;
     gate_ready_ = true;
