@@ -248,7 +248,7 @@ docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
 |---|---|---|
 | `toolchain` | 只改 apt 包列表 | apt lists 走 cache mount |
 | `ggml` | 只改 `GGML_REF` | ggml 独立成 stage 单独编译（`-DGGML_PREBUILT_DIR` 复用），**改 `src/` 不会碰它** |
-| `build` | 改源码 | `COPY .` + ccache（CI 里用 `--mount type=bind` 挂 `actions/cache` 的目录，跨 runner 复用） |
+| `build` | 改源码 | `COPY .` + ccache（本地重复构建有效；CI 跨 runner 不复用 ccache，靠上面两层的层缓存） |
 
 CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mount=type=cache` 在新 runner 上
 是空的，带权重等于每次多传 400MB。完整镜像（含 `describe_image` 冒烟）走每周定时 +

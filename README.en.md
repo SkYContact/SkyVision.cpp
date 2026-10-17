@@ -211,7 +211,7 @@ claim. Cost is split across three cacheable stages:
 |---|---|---|
 | `toolchain` | apt package list | apt lists come from a cache mount |
 | `ggml` | `GGML_REF` only | built as its own stage and consumed through `-DGGML_PREBUILT_DIR`, so editing `src/` never rebuilds it |
-| `build` | our sources | `COPY .` + ccache, bind-mounted from a host dir that `actions/cache` carries across runners |
+| `build` | our sources | `COPY .` + ccache (helps repeated local builds; it cannot cross runners — a cache mount never leaves the builder and buildx has no host-bind flag) |
 
 Push builds deliberately ship **without** weights (`MODEL_REPO=`): `--mount=type=cache` is
 empty on a fresh runner, so bundling them would move 400 MB per run. The full image plus the

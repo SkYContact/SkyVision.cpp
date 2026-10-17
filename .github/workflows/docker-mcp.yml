@@ -10,9 +10,12 @@ name: docker-mcp
 #     download would ride along on every run. The weights-less image is what the
 #     initialize/tools/list smoke test needs.
 #   * the full image (weights + describe_image) builds weekly and on demand.
-#   * ccache lives on the host and is carried by actions/cache: the build mounts it
-#     with `--mount type=bind`, which - unlike `--mount type=cache` - can persist
-#     across runners. ggml's objects then hit the cache instead of recompiling.
+#   * ggml is compiled in its own stage (see the Dockerfile), so the layer cache
+#     already skips it; a push build only recompiles our own sources.
+#     ccache can not help across runners: `RUN --mount=type=cache` never leaves the
+#     builder, and `docker buildx build` has no `--mount` flag (only the Dockerfile
+#     does, and its bind sources are limited to the build context / snapshotted
+#     named contexts, which do not write back to the host).
 
 on:
   push:
@@ -59,8 +62,6 @@ jobs:
         id: flags
         run: |
           echo "CACHE_REF=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/skyvision-buildcache" >> "$GITHUB_ENV"
-          echo "CCACHE_DIR=${RUNNER_TEMP}/ccache" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/ccache"
           if [ "${{ github.event_name }}" = "schedule" ] \
              || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bundle_model }}" = "true" ]; }; then
             echo "MODEL_REPO_ARG=SkyContact/SmolVLM-256M-GGUF" >> "$GITHUB_ENV"
@@ -71,16 +72,6 @@ jobs:
             echo "bundle=false" >> "$GITHUB_OUTPUT"
             echo "bundled weights: no"
           fi
-
-      # content-addressed ccache store: a source edit invalidates only what changed,
-      # so ggml (30+ s of C++) is served from cache instead of recompiled
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/ccache
-          key: ccache-${{ github.sha }}
-          restore-keys: |
-            ccache-
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
@@ -100,13 +91,11 @@ jobs:
             --load \
             --tag skyvision-mcp:ci \
             --build-arg MODEL_REPO="${MODEL_REPO_ARG}" \
-            --mount type=bind,source="${CCACHE_DIR}",target=/ccache \
             --cache-from "type=registry,ref=${CACHE_REF}" \
             --cache-from "type=gha" \
             --cache-to "type=registry,ref=${CACHE_REF},mode=max,ignore-error=true" \
             --cache-to "type=gha,mode=min,ignore-error=true" \
             .
-          sudo chown -R "$(id -u):$(id -g)" "${CCACHE_DIR}" || true
 
       - name: Image size
         run: docker images skyvision-mcp:ci --format '{{.Size}}'

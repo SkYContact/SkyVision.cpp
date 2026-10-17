@@ -35,8 +35,7 @@ FROM toolchain AS ggml
 
 ARG GGML_REF=master
 WORKDIR /opt/ggml
-RUN --mount=type=cache,target=/root/.cache/ggml-git \
-    git clone --depth 1 --branch ${GGML_REF} https://github.com/ggml-org/ggml src \
+RUN git clone --depth 1 --branch ${GGML_REF} https://github.com/ggml-org/ggml src \
  && rm -rf src/.git
 
 # BUILD_SHARED_LIBS=OFF matters for the runtime stage: a dynamically linked
