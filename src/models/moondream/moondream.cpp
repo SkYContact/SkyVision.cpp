@@ -799,43 +799,36 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
     if (serve_port > 0) return run_server(e, vision_path, region_path, serve_port, serve_host);
 
     // optional image: encode with the vision model, prefill [bos; 729 img tokens] as raw
-    // embeddings (official: inputs_embeds = cat([bos_emb, img_emb]), prefix attends bidirectionally)
+    // embeddings (official: inputs_embeds = cat([bos_emb, img_emb]), prefix attends bidirectionally).
+    // The encode+prefill itself lives in md_prefill_image (moondream_server.inc) so the CLI and the
+    // web UI share one implementation; `img_rgb` / `vm` stay alive for the region skills below.
     bool have_image = false;
     std::vector<float> prefix_emb;
+    std::vector<uint8_t> img_rgb;
+    int iw = 0, ih = 0;
+    VisionModel vm;
     if (img_path) {
-        int iw = 0, ih = 0, ic = 0;
+        int ic = 0;
         unsigned char * rgb = stbi_load(img_path, &iw, &ih, &ic, 3);
         if (!rgb) { fprintf(stderr, "image load failed: %s\n", img_path); return 1; }
+        img_rgb.assign(rgb, rgb + (size_t)iw * (size_t)ih * 3);
+        stbi_image_free(rgb);
         fprintf(stderr, "image: %dx%d (%s)\n", iw, ih, img_path);
-        VisionModel vm;
         if (!vm.load(vision_path, e.backend)) {
             fprintf(stderr, "vision load on primary backend failed, trying CPU\n");
             ggml_backend_t cpu_be = ggml_backend_cpu_init();
             if (!vm.load(vision_path, cpu_be)) { fprintf(stderr, "vision load failed\n"); return 1; }
         }
         auto tvi = std::chrono::steady_clock::now();
-        // official multi-crop Lanczos preprocessing (bit-exact vs PIL), then encoder+projection
-        int th = 0, tw = 0, n_crops = 0;
-        std::vector<float> crops = mdprep::prepare_crops(rgb, iw, ih, &th, &tw, &n_crops);
-        stbi_image_free(rgb);
-        if (crops.empty()) { fprintf(stderr, "prepare_crops failed\n"); return 1; }
-        fprintf(stderr, "crops: %d (tiling %dx%d)\n", n_crops, th, tw);
-        double t_prep = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count();
-        std::vector<float> enc = vm.encode_crops(crops.data(), n_crops, vm.n_layers, e.backend);
-        double t_enc = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count() - t_prep;
-        std::vector<float> img_emb = vm.project(enc.data(), n_crops, th, tw, e.backend);   // [729, 2048]
-        if (img_emb.empty()) { fprintf(stderr, "vision encode failed\n"); return 1; }
-        double t_proj = std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count() - t_prep - t_enc;
-        fprintf(stderr, "vision: prep %.0fms | encode %.0fms | project %.0fms (total %.2fs)\n",
-                t_prep * 1000, t_enc * 1000, t_proj * 1000,
+        md_prefill_image(e, vm, img_rgb.data(), iw, ih, prefix_emb);   // encode + project + prefill
+        fprintf(stderr, "vision: encode + project + prefill in %.2fs\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tvi).count());
-        // bos embedding = tok_embd row 0
-        const int D = e.model.n_embd;
-        std::vector<ggml_fp16_t> bos16(D);
-        ggml_backend_tensor_get(e.model.tok_embd, bos16.data(), 0, sizeof(ggml_fp16_t) * D);
-        prefix_emb.resize((size_t)(1 + 729) * D);
-        for (int d = 0; d < D; d++) prefix_emb[d] = ggml_fp16_to_fp32(bos16[d]);
-        memcpy(prefix_emb.data() + D, img_emb.data(), sizeof(float) * (size_t)729 * D);
+        // publish it to the shared image cache: a later md_detect/md_point (and any
+        // repeated ask) then just rewinds n_past instead of re-encoding
+        md_cache.img_key = md_img_key(img_rgb.data(), iw, ih);
+        md_cache.prefix = prefix_emb;
+        md_cache.q_key = 0;
+        md_cache.kv_valid = true;
         have_image = true;
     }
 
@@ -849,76 +842,26 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
     toks.insert(toks.end(), q.begin(), q.end());
     toks.push_back(3);
 
-    // ---- detect / point (official md31_moondream.py detect/_generate_points) ----
+    // ---- detect / point (official _generate_points) ----
+    // md_detect / md_point in moondream_server.inc hold the one implementation of
+    // the coordinate loop (the same one the web UI uses); the image cache filled
+    // above means they do not re-encode.
     if (have_image && (detect_obj || point_obj)) {
         RegionModel rm;
         if (!rm.load(region_path)) return 1;
-        // template: detect [1,7235,476,2] / point [1,2581,2], object encoded with leading space
-        std::vector<int> dtoks = detect_obj ? std::vector<int>{ 1, 7235, 476, 2 }
-                                            : std::vector<int>{ 1, 2581, 2 };
-        std::string obj = std::string(" ") + (detect_obj ? detect_obj : point_obj);
-        auto oq = e.tok.encode(obj);
-        dtoks.insert(dtoks.end(), oq.begin(), oq.end());
-        dtoks.push_back(3);
-        // image prefix + detect prompt prefill (image prefix step = bidirectional emb)
-        e.step({}, nullptr, prefix_emb.data(), (int)(prefix_emb.size() / e.model.n_embd), nullptr, true);
-        const int D = e.model.n_embd;
-        std::vector<float> hidden(D), emb(D);
-        std::vector<float> lv(e.model.n_vocab);
-        int next = e.step(dtoks, lv.data(), nullptr, 0, hidden.data(), false);
-        next = (lv[0] >= lv[5]) ? 0 : 5;   // two-way: eos_id(0) vs coord_id(5), like point_gen_indices
-        if (getenv("MD_DBG")) {
-            double s2 = 0; for (int i = 0; i < D; i++) s2 += (double)hidden[i] * hidden[i];
-            fprintf(stderr, "DBG hidden norm=%.2f lv0=%.2f lv5=%.2f\n", s2, lv[0], lv[5]);
-        }
-        auto decode_emb_step = [&](const float * e2048) {
-            e.step({}, nullptr, e2048, 1, hidden.data(), false);
-        };
-        struct Box { float x0, y0, x1, y1; };
-        std::vector<Box> boxes;
-        const int max_objects = 20;
-        // official _generate_points: one text-decoder step per fed embedding. The
-        // LAST step of an object must produce both the next hidden and the
-        // coord/eos logits - feeding the same embedding twice (once for hidden,
-        // once for logits, as the old loop did) shifts every following position
-        // and makes the model march out duplicate points without ever emitting eos.
-        while (next != 0 && (int)boxes.size() < max_objects) {
-            float xl[1024];
-            rm.decode_coordinate(hidden.data(), xl);
-            float xc = RegionModel::logits_to_center(xl, 1024);
-            rm.encode_coordinate(&xc, 1, emb.data());
-            decode_emb_step(emb.data());                 // x-fed: hidden for y
-            rm.decode_coordinate(hidden.data(), xl);
-            float yc = RegionModel::logits_to_center(xl, 1024);
-            rm.encode_coordinate(&yc, 1, emb.data());
-            float w = 0, h = 0;
-            if (detect_obj) {
-                decode_emb_step(emb.data());             // y-fed: hidden for size
-                float sl[2048];
-                rm.decode_size(hidden.data(), sl);
-                int bins[2] = { vqa::greedy_argmax(sl, 1024), vqa::greedy_argmax(sl + 1024, 1024) };
-                float sizes[2];
-                RegionModel::bins_to_size(bins, sizes);
-                w = sizes[0]; h = sizes[1];
-                rm.encode_size(sizes, 1, emb.data());
-            }
-            // size-fed (detect) / y-fed (point): hidden + coord_id(5) vs eos_id(0)
-            e.step({}, lv.data(), emb.data(), 1, hidden.data(), false);
-            if (detect_obj) {
-                boxes.push_back({ xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2 });
-            } else {
-                boxes.push_back({ xc, yc, xc, yc });
-            }
-            next = (lv[0] >= lv[5]) ? 0 : 5;
-        }
+        size_t n = 0;
         if (detect_obj) {
+            auto boxes = md_detect(e, vm, rm, img_rgb.data(), iw, ih, detect_obj);
             for (auto & b : boxes)
-                printf("box [%.3f %.3f %.3f %.3f]  (x_min y_min x_max y_max, normalized)\n", b.x0, b.y0, b.x1, b.y1);
+                printf("box [%.3f %.3f %.3f %.3f]  (x_min y_min x_max y_max, normalized)\n",
+                       b[0], b[1], b[2], b[3]);
+            n = boxes.size();
         } else {
-            for (auto & b : boxes)
-                printf("point (%.3f, %.3f)\n", b.x0, b.y0);
+            auto pts = md_point(e, vm, rm, img_rgb.data(), iw, ih, point_obj);
+            for (auto & p : pts) printf("point (%.3f, %.3f)\n", p[0], p[1]);
+            n = pts.size();
         }
-        fprintf(stderr, "generated %zu object(s)\n", boxes.size());
+        fprintf(stderr, "generated %zu object(s)\n", n);
         return 0;
     }
 
@@ -932,11 +875,11 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
     std::vector<int> out;
     int cur;
     if (have_image) {
-        cur = e.step({}, nullptr, prefix_emb.data(), (int)(prefix_emb.size() / e.model.n_embd), nullptr, true);
-        cur = e.step(toks, nullptr);
-    } else {
-        cur = e.step(toks, nullptr);
+        // the prefix is already in the KV (md_prefill_image above): make sure
+        // n_past points right after it before appending the prompt
+        md_ensure_img_prefill(e, vm, img_rgb.data(), iw, ih);
     }
+    cur = e.step(toks, nullptr);
     out.push_back(cur);
     printf("%s", e.tok.decode({ cur }).c_str());
     fflush(stdout);

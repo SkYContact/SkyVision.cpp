@@ -136,13 +136,19 @@ static uint64_t md_fnv(std::string_view s) {
     return h;
 }
 
+// cache key for an image body (geometry folded in); shared by the prefill paths
+static uint64_t md_img_key(const uint8_t * rgb, int w, int h) {
+    uint64_t key = md_fnv(std::string_view((const char *)rgb, (size_t)w * h * 3));
+    key ^= (uint64_t)w << 32 ^ (uint64_t)h;
+    return key;
+}
+
 // make sure the engine holds THIS image's prefix at KV [0,730); n_past ends at 730
 static void md_ensure_img_prefill(Engine & e, VisionModel & vm, const uint8_t * rgb, int w, int h) {
     // the key must actually gate the reuse: the web UI sends a different image
     // per request, and reusing the first image's prefix made every answer
     // describe the old picture
-    uint64_t key = md_fnv(std::string_view((const char *)rgb, (size_t)w * h * 3));
-    key ^= (uint64_t)w << 32 ^ (uint64_t)h;
+    uint64_t key = md_img_key(rgb, w, h);
     if (md_cache.img_key == key && md_cache.kv_valid) { e.n_past = 730; return; }   // rewind: reuse KV prefix
     if (md_cache.img_key == key && !md_cache.prefix.empty()) {
         e.step({}, nullptr, md_cache.prefix.data(), 730, nullptr, true);   // engine was reset, prefix hot
