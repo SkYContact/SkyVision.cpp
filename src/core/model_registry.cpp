@@ -174,6 +174,17 @@ std::string ModelRegistry::pick_tokenizer(const std::string & base_dir, const st
     // garbage). Match against the model's own vocab size from the GGUF, which
     // every converter in this repo writes as "<arch>.vocab_size".
     const size_t target = vocab ? vocab : fallback_vocab_target(arch);
+    // a tokenizer shipped inside the checkpoint's own directory belongs to that
+    // checkpoint by definition: same-size siblings can still differ in their
+    // added tokens (moss_vl's <|image_pad|>/<|silence|> exist only in its own)
+    const std::string own_suffix = "/" + stem + "/tokenizer.json";
+    for (const auto & c : cands) {
+        if (!ends_with(c, own_suffix.c_str())) continue;
+        const size_t n = tokenizer_vocab(c);
+        if (n == 0) continue;
+        const size_t diff = n > target ? n - target : target - n;
+        if (diff * 5 <= target) return c;
+    }
     size_t best_diff = 0;
     std::string best;
     for (const auto & c : cands) {

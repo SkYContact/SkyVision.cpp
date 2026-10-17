@@ -12,8 +12,7 @@
 #include "vqa.hpp"
 #include "http_server.hpp"
 #include "media_io.hpp"
-
-#include "gguf.h"
+#include "model_registry.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -39,25 +38,15 @@
 
 namespace {
 
-struct ModelEntry {
-    std::string id;          // file stem
-    std::string path;        // gguf path
-    std::string arch;        // moondream3 | videochat3
-    std::string quant;       // from general.file_type / name heuristic
-    uint64_t size = 0;
-    std::string vision_path; // moondream only
-    std::string tokenizer;     // resolved per arch
-};
+using ModelEntry = vqa::ModelEntry;
 
-std::string g_models_dir = ".";
 std::string g_web_dir = "web";
-std::string g_tokenizer = "";        // optional override
-std::vector<ModelEntry> g_models;
 std::mutex g_mu;                      // serializes model access
 std::string g_id_placeholder;         // substituted into pages per request
 std::string g_arch_placeholder;      // ditto, for arch-conditional UI
-vqa::Model * g_loaded = nullptr;
-std::string g_loaded_id;
+
+// discovery + the resident model slot, shared with the MCP front end
+vqa::ModelRegistry g_reg;
 
 // ---------------------------------------------------------------- realtime
 // live stream session: one ffmpeg capture process + a resident inference loop
@@ -274,11 +263,12 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
                                 : std::string("{\"event\":\"ask\",\"q\":\"") + vqa::http::json_escape(q) + "\"}\n");
         {
             std::lock_guard<std::mutex> lk(g_mu);
-            if (!g_loaded || g_loaded_id != model_id) {
+            vqa::Model * m = g_reg.loaded();
+            if (!m || g_reg.loaded_id() != model_id) {
                 s->push_event("{\"error\":\"model no longer loaded\"}\n");
                 break;
             }
-            if (!g_loaded->ask_session(media, q, gp, out)) {
+            if (!m->ask_session(media, q, gp, out)) {
                 s->push_event("{\"error\":\"turn failed\"}\n");
                 continue;
             }
@@ -313,7 +303,7 @@ static bool rt_start(const std::string & session, const std::string & src,
     s->started = true;
     g_rt[session] = s;
     s->reader = std::thread(rt_reader_loop, s);
-    s->worker = std::thread(rt_worker_loop, s, g_loaded_id);
+    s->worker = std::thread(rt_worker_loop, s, g_reg.loaded_id());
     return true;
 }
 
@@ -330,17 +320,7 @@ static void rt_stop(const std::string & session) {
     s->cap.stop();
     if (s->reader.joinable()) s->reader.join();
     if (s->worker.joinable()) s->worker.join();
-    if (g_loaded) g_loaded->session_reset();
-}
-
-bool file_exists(const std::string & p) {
-#ifdef _WIN32
-    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
-#else
-    FILE * f = fopen(p.c_str(), "rb");
-    if (f) { fclose(f); return true; }
-    return false;
-#endif
+    if (g_reg.loaded()) g_reg.loaded()->session_reset();
 }
 
 std::string read_file(const std::string & p) {
@@ -356,175 +336,28 @@ std::string read_file(const std::string & p) {
     return out;
 }
 
-std::string stem_of(const std::string & name) {
-    size_t dot = name.rfind('.');
-    return dot == std::string::npos ? name : name.substr(0, dot);
-}
-
-bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ftype) {
-    struct gguf_init_params p = { true, nullptr };
-    gguf_context * g = gguf_init_from_file(path.c_str(), p);
-    if (!g) return false;
-    int k = gguf_find_key(g, "general.architecture");
-    if (k >= 0) arch = gguf_get_val_str(g, k);
-    // legacy qwen3.5/marlin ggufs carry swapped arch labels; marlin.skills
-    // (written by the converter from the checkpoint's architectures) is
-    // authoritative for which fine-tune it is
-    int ks = gguf_find_key(g, "marlin.skills");
-    if (arch == "qwen3_5" || arch == "marlin") {
-        // skills=true -> Marlin fine-tune; false or key missing (older
-        // converter that labelled plain qwen3.5 files "marlin") -> qwen3_5
-        arch = (ks >= 0 && gguf_get_val_bool(g, ks)) ? "marlin" : "qwen3_5";
-    }
-    int kf = gguf_find_key(g, "general.file_type");
-    if (kf >= 0) {
-        char b[32];
-        snprintf(b, sizeof(b), "f%d", (int)gguf_get_val_u32(g, kf));
-        ftype = b;
-    }
-    gguf_free(g);
-    return !arch.empty();
-}
-
-// pick a tokenizer.json for the arch: vc3 needs the Qwen one (vocab >= 150k);
-// probe the models dir and ./models/* checkpoint dirs by vocab size
-std::string resolve_tokenizer(const std::string & arch) {
-    std::vector<std::string> cands = { g_models_dir + "/tokenizer.json" };
-#ifdef _WIN32
-    // models/<checkpoint>/tokenizer.json (fd.cFileName is a bare name, so
-    // enumerate checkpoint dirs and probe each)
-    WIN32_FIND_DATAA fdd;
-    HANDLE hd = FindFirstFileA("models/*", &fdd);
-    if (hd != INVALID_HANDLE_VALUE) {
-        do {
-            if (fdd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY && fdd.cFileName[0] != '.')
-                cands.push_back(std::string("models/") + fdd.cFileName + "/tokenizer.json");
-        } while (FindNextFileA(hd, &fdd));
-        FindClose(hd);
-    }
-#endif
-    const bool need_qwen = arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl";
-    for (auto & c : cands) {
-        FILE * f = fopen(c.c_str(), "rb");
-        if (!f) continue;
-        std::string js;
-        char buf[65536];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
-        fclose(f);
-        size_t vp = js.find("\"vocab\"");
-        if (vp == std::string::npos) continue;
-        size_t me = js.find("\"merges\"", vp);
-        if (me == std::string::npos) me = js.size();
-        size_t keys = std::count(js.begin() + vp, js.begin() + me, ':');
-        if ((need_qwen && keys >= 150000) || (!need_qwen && keys >= 50000)) return c;
-    }
-    return "";
-}
-
-void discover_models() {
-    g_models.clear();
-    std::vector<std::string> files;
-#ifdef _WIN32
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA((g_models_dir + "/*.gguf").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(fd.cFileName);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-#else
-    fprintf(stderr, "--serve model discovery is Windows-only for now\n");
-    (void)files;
-#endif
-    // one shared vision/region file for all moondream weights
-    std::string vision_path;
-    for (auto & f : files)
-        if (f.size() > 12 && f.substr(f.size() - 12) == "-vision.gguf") { vision_path = g_models_dir + "/" + f; break; }
-
-    for (auto & f : files) {
-        std::string arch, ftype;
-        if (!gguf_arch_of(g_models_dir + "/" + f, arch, ftype)) continue;
-        // per-model tokenizer wins: models/<gguf-stem>/tokenizer.json (the
-        // generic resolver can pick a same-vocab sibling whose added tokens
-        // differ - moss_vl's <|image_pad|>/<|silence|> only exist in its own)
-        std::string own = std::string("models/") + stem_of(f) + "/tokenizer.json";
-        std::string tok = file_exists(own) ? own : resolve_tokenizer(arch);
-        if (!g_tokenizer.empty()) tok = g_tokenizer;
-        if (arch == "moondream3") {
-            if (vision_path.empty() || !file_exists(tok)) {
-                fprintf(stderr, "serve: skip %s (needs %s + tokenizer.json)\n", f.c_str(),
-                        vision_path.empty() ? "*-vision.gguf" : "tokenizer.json");
-                continue;
-            }
-        } else if (arch == "videochat3" || arch == "qwen3_5" || arch == "marlin" || arch == "moss_vl") {
-            if (!file_exists(tok)) {
-                fprintf(stderr, "serve: skip %s (needs tokenizer.json)\n", f.c_str());
-                continue;
-            }
-        } else if (arch == "videomae") {
-            // pure video tower: no tokenizer, no text side
-            tok.clear();
-        } else {
-            continue;   // vision/region side files and unknown archs stay unlisted
-        }
-        ModelEntry e;
-        e.id = stem_of(f);
-        e.path = g_models_dir + "/" + f;
-        e.arch = arch;
-        e.quant = ftype;
-        e.vision_path = vision_path;
-        e.tokenizer = tok;
-        // size via filesystem
-#ifdef _WIN32
-        WIN32_FILE_ATTRIBUTE_DATA fa;
-        if (GetFileAttributesExA(e.path.c_str(), GetFileExInfoStandard, &fa))
-            e.size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-#endif
-        g_models.push_back(e);
-    }
-    fprintf(stderr, "serve: %zu runnable model(s) in %s\n", g_models.size(), g_models_dir.c_str());
-}
-
-const ModelEntry * find_model(const std::string & id) {
-    for (auto & m : g_models) if (m.id == id) return &m;
-    return nullptr;
-}
+// ---------------------------------------------------------------- models
+// Discovery and the single-resident model slot live in core/model_registry.cpp,
+// shared with the MCP front end: one place decides which GGUFs are runnable and
+// which side files (vision tower / tokenizer.json) each one needs.
+const ModelEntry * find_model(const std::string & id) { return g_reg.find(id); }
 
 bool ensure_loaded(const ModelEntry & e, std::string & err) {
-    if (g_loaded && g_loaded_id == e.id) return true;
-    if (g_loaded) {
-        fprintf(stderr, "serve: unloading %s\n", g_loaded_id.c_str());
-        delete g_loaded;    // frees the backend buffers (one model resident at a time)
-        g_loaded = nullptr;
-        g_loaded_id.clear();
-    }
-    fprintf(stderr, "serve: loading %s ...\n", e.id.c_str());
-    fflush(stderr);
-    vqa::Model * m = vqa::vqa_create_model(e.arch);
-    if (!m) { err = "unknown backend"; return false; }
-    vqa::LoadOptions opt;
-    opt.vision_path = e.vision_path;
-    if (!m->load(e.path, e.tokenizer.empty() ? "tokenizer.json" : e.tokenizer, opt)) {
-        err = "model load failed";
-        delete m;
-        return false;
-    }
-    g_loaded = m;
-    g_loaded_id = e.id;
-    fprintf(stderr, "serve: %s ready\n", e.id.c_str());
-    return true;
+    if (g_reg.loaded() && g_reg.loaded_id() == e.id) return true;
+    return g_reg.load(e, vqa::LoadOptions(), err) != nullptr;
 }
 
+// the page JS reads id/arch/quant/size/loaded; the MCP front end builds a richer
+// shape from the same entries (ModelRegistry::models_json)
 std::string models_json() {
     std::string s = "{\"models\":[";
     bool first = true;
-    for (auto & m : g_models) {
+    for (const auto & m : g_reg.entries()) {
         if (!first) s += ",";
         first = false;
         s += "{\"id\":\"" + vqa::http::json_escape(m.id) + "\",\"arch\":\"" + m.arch +
              "\",\"quant\":\"" + m.quant + "\",\"size\":" + std::to_string(m.size) +
-             ",\"loaded\":" + (g_loaded_id == m.id ? "true" : "false") + "}";
+             ",\"loaded\":" + (g_reg.loaded_id() == m.id ? "true" : "false") + "}";
     }
     return s + "]}";
 }
@@ -549,7 +382,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 std::lock_guard<std::mutex> lk(g_mu);
                 std::string err;
                 if (!ensure_loaded(*e, err)) { send_error(c, err); return true; }
-                g_loaded->session_reset();   // a new stream always starts fresh
+                g_reg.loaded()->session_reset();   // a new stream always starts fresh
                 std::string src = query_param(req.query, "src");
                 if (src.empty() && !req.body.empty()) {
                     // uploaded video = the stream itself (plays in realtime with -re)
@@ -683,7 +516,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             const bool realtime = query_param(req.query, "rt") == "1";   // incremental KV session
             if (!sess.empty() && query_param(req.query, "reset") == "1") {
                 sessions.erase(sess);
-                if (realtime) g_loaded->session_reset();
+                if (realtime) g_reg.loaded()->session_reset();
             }
             if (sess.empty() && query_param(req.query, "reset") == "1" && q.empty()) {
                 send_json(c, "{\"ok\":true}"); return true;
@@ -694,7 +527,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 static std::set<std::string> rt_sessions;
                 if (!sess.empty() && !rt_sessions.count(sess)) {
                     rt_sessions.insert(sess);
-                    g_loaded->session_reset();
+                    g_reg.loaded()->session_reset();
                 }
                 if (!sess.empty() && query_param(req.query, "reset") == "1")
                     rt_sessions.erase(sess);
@@ -763,10 +596,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 }
             }
             std::string out;
-            const bool ran = realtime && sess.empty()
-                ? false
-                : (realtime ? g_loaded->ask_session(media, q, gp, out)
-                            : g_loaded->ask(media, q, mode, gp, out));
+            vqa::Model * m = g_reg.loaded();
+            const bool ran = !m ? false
+                : realtime && sess.empty()
+                    ? false
+                    : (realtime ? m->ask_session(media, q, gp, out)
+                                : m->ask(media, q, mode, gp, out));
             if (!ran) {
                 if (stream) { send_chunk_str(c, "{\"error\":\"inference failed (see server log)\"}\n"); send_stream_end(c); }
                 else send_error(c, "inference failed");
@@ -831,11 +666,10 @@ std::string id_placeholder;   // set per page request before serve_page
 namespace vqa {
 int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
                const std::string & tokenizer, const char * bind_host) {
-    g_models_dir = models_dir;
     g_web_dir = web_dir;
-    g_tokenizer = tokenizer;
-    discover_models();
-    printf("SkyVision.cpp web UI: http://127.0.0.1:%d  (%zu models, Ctrl+C to stop)\n", port, g_models.size());
+    g_reg.discover(models_dir, tokenizer);   // same discovery as the MCP server
+    printf("SkyVision.cpp web UI: http://127.0.0.1:%d  (%zu models, Ctrl+C to stop)\n", port,
+           g_reg.entries().size());
     fflush(stdout);
     return http::serve(port, handle_request, bind_host);
 }
