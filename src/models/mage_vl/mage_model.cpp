@@ -31,6 +31,7 @@
 
 #include <map>
 #include "stage_buf.hpp"
+#include "vit_block.hpp"
 #include "mage_preprocess.hpp"
 #include "mage_gate.hpp"
 #include "ggml_dump.hpp"
@@ -106,6 +107,21 @@ public:
                    "", gp, out_text);
     }
 
+    // ChatML template knowledge for the front ends (same convention as
+    // moss_vl: gp.history is prepended verbatim and already carries the
+    // system block; empty history falls back to the default system line).
+    // The gate path signals "nothing to say" with empty output text rather
+    // than a dedicated token, so silence_piece stays "".
+    std::string format_history_turn(const std::string & user,
+                                    const std::string & assistant) const override {
+        return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
+             + assistant + "<|im_end|>\n";
+    }
+    std::string format_system(const std::string & sys) const override {
+        return "<|im_start|>system\n" + sys + "<|im_end|>\n";
+    }
+    const char * silence_piece() const override { return ""; }
+
     // tunables, set before load()
     int n_ctx = 8192;
     bool use_gpu = false;
@@ -125,7 +141,8 @@ private:
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<float> * img_feats,
                   const std::vector<int> * img_pos, std::vector<float> & logits_out);
     std::string render_prompt(int n_img_tokens, const std::string & user_text, bool video,
-                              const std::vector<float> * frame_secs = nullptr) const;
+                              const std::vector<float> * frame_secs = nullptr,
+                              const std::string & history = "") const;
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     float randf();
     void dump(const ggml_cgraph * gf, const char * name);
@@ -263,6 +280,88 @@ static ggml_tensor * rope_mage(ggml_context * ctx, struct ggml_cgraph * gf, ggml
     ggml_tensor * cat = ggml_concat(ctx, ore, oim, 0);
     cat = ggml_cont(ctx, ggml_permute(ctx, cat, 1, 0, 2, 3));   // [pairs, 2, H, N] -> interleaved dims
     return ggml_reshape_3d(ctx, cat, hd, H, N);
+}
+
+// Mage-ViT attention hook + layer-0 parity sinks for the shared
+// vqa::vit::block. The block body (LN affine / fused qkv / gelu-erf MLP) is
+// stock; only the attention differs from the generic VitHookEnv: per-dim
+// rope_mage tables and one unmasked FA per frame (block-diagonal grouping).
+struct MageVisEnv {
+    ggml_context *gctx = nullptr;
+    ggml_cgraph *gf = nullptr;
+    int layer = 0;
+    int n_head = 0, n_embd = 0;
+    int N = 0;               // tokens in this chunk graph (hw * nf)
+    int vhd = 0;
+    int hw = 0, nf = 0;      // tokens per frame, frames in this chunk
+    ggml_tensor *t_ca = nullptr, *t_sa = nullptr, *t_cb = nullptr, *t_sb = nullptr;
+    const char *stop_after = nullptr;              // parity truncation (chunk 0 only)
+    std::function<bool(const char *)> run;
+    int state = 0;           // 1 = truncated ok, 2 = sink failed
+};
+
+static ggml_tensor * mage_vis_attention_hook(void * ud, ggml_tensor * qkv) {
+    MageVisEnv & e = *(MageVisEnv *)ud;
+    ggml_context * gctx = e.gctx;
+    const int H = e.n_head, Nc = e.N, vhd = e.vhd;
+
+    // qkv packs q|k|v blocks of n_head heads along ne0
+    const size_t hbytes = (size_t)vhd * qkv->nb[0];
+    auto qkv_head_view = [&](int block) {
+        return ggml_view_3d(gctx, qkv, vhd, H, Nc,
+                            hbytes, qkv->nb[1], (size_t)block * H * hbytes);
+    };
+    ggml_tensor * q = qkv_head_view(0);
+    ggml_tensor * k = qkv_head_view(1);
+    ggml_tensor * v = qkv_head_view(2);
+    q = rope_mage(gctx, e.gf, q, e.t_ca, e.t_sa, e.t_cb, e.t_sb);
+    k = rope_mage(gctx, e.gf, k, e.t_ca, e.t_sa, e.t_cb, e.t_sb);
+    if (e.layer == 0) {
+        ggml_set_name(q, "v_blk0_q_rope");
+        if (e.stop_after && !strcmp(e.stop_after, "v_blk0_q_rope")) {
+            ggml_build_forward_expand(e.gf, q);
+            if (!e.run("v_blk0_q_rope")) e.state = 2; else e.state = 1;
+            return nullptr;
+        }
+    }
+
+    // per-frame unmasked flash attention (each frame is its own contiguous
+    // chunk), concat along the token axis
+    const float scale = 1.0f / std::sqrt((float)vhd);
+    ggml_tensor * fa = nullptr;
+    for (int f = 0; f < e.nf; f++) {
+        const size_t off = (size_t)f * e.hw;
+        auto cin = [&](ggml_tensor * t) {
+            return ggml_view_3d(gctx, t, vhd, e.hw, H, t->nb[2], t->nb[1], off * t->nb[2]);
+        };
+        ggml_tensor * fc = ggml_flash_attn_ext(gctx, cin(q), cin(k), cin(v), nullptr, scale, 0.0f, 0.0f);
+        fc = ggml_cont(gctx, fc);
+        fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;
+    }
+    ggml_tensor * attn = ggml_reshape_2d(gctx, fa, e.n_embd, Nc);
+    if (e.layer == 0) ggml_set_name(attn, "v_blk0_attn_out");
+    return attn;
+}
+
+// stage mapping into vqa::vit::block probes: "qkv" -> v_blk0_qkv,
+// "attn_out" (residual after the attention branch) -> v_blk0_out; the
+// post-MLP "out" stage has no sink here (v_final covers the whole tower).
+static bool mage_vis_probe_layer0(void * ud, const char * stage, ggml_tensor * t) {
+    MageVisEnv & e = *(MageVisEnv *)ud;
+    const char * nm = !strcmp(stage, "qkv") ? "v_blk0_qkv"
+                    : !strcmp(stage, "attn_out") ? "v_blk0_out" : nullptr;
+    if (!nm || e.layer != 0) return false;
+    ggml_set_name(t, nm);
+    if (e.stop_after && !strcmp(e.stop_after, nm)) {
+        ggml_build_forward_expand(e.gf, t);
+        if (!e.run(nm)) e.state = 2; else e.state = 1;
+        return true;
+    }
+    return false;
+}
+
+static ggml_tensor * mage_vis_gelu_erf(void * ud, ggml_tensor * t) {
+    return ggml_gelu_erf(((MageVisEnv *)ud)->gctx, t);
 }
 
 float MageVL::randf() {
@@ -822,77 +921,35 @@ bool MageVL::encode_vision(const vqa::MediaInput & media, std::vector<float> & f
             return true;
         }
 
+        // block body + layer-0 parity sinks live in the shared vqa::vit::block;
+        // mage supplies only the attention hook (per-dim rope + per-frame FA)
+        MageVisEnv env;
+        env.gctx = gctx; env.gf = gf;
+        env.n_head = vc.n_head; env.n_embd = vc.n_embd;
+        env.N = Nc; env.vhd = vhd; env.hw = hw; env.nf = nf;
+        env.t_ca = t_ca; env.t_sa = t_sa; env.t_cb = t_cb; env.t_sb = t_sb;
+        env.stop_after = (c == 0) ? stop_after : nullptr;   // parity runs are images
+        env.run = [&](const char * nm) { return run_chunk(nm, &feats); };
         for (int il = 0; il < vl_max; il++) {
             VisLayer & L = vl[il];
-            ggml_tensor * l = ggml_norm(gctx, x, vc.eps);
-            l = ggml_add(gctx, ggml_mul(gctx, l, L.norm0_w), L.norm0_b);
-            ggml_tensor * qkv = ggml_mul_mat(gctx, L.wqkv_w, l);
-            qkv = ggml_add(gctx, qkv, L.wqkv_b);
-            if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
-            if (stop_c && il == 0 && !strcmp(stop_c, "v_blk0_qkv")) {
-                ggml_build_forward_expand(gf, qkv);
-                if (!run_chunk("v_blk0_qkv", &feats)) { ggml_free(gctx); return false; }
+            vqa::vit::BlockWeights bw;
+            bw.ln1_w = L.norm0_w; bw.ln1_b = L.norm0_b;
+            bw.qkv_w = L.wqkv_w; bw.qkv_b = L.wqkv_b;
+            bw.wo_w = L.wo_w; bw.wo_b = L.wo_b;
+            bw.ln2_w = L.norm1_w; bw.ln2_b = L.norm1_b;
+            bw.fc0_w = L.fc0_w; bw.fc0_b = L.fc0_b;
+            bw.fc1_w = L.fc1_w; bw.fc1_b = L.fc1_b;
+            vqa::vit::BlockHooks h;
+            h.attention = mage_vis_attention_hook;
+            h.gelu = mage_vis_gelu_erf;                     // config hidden_act = gelu (erf)
+            h.probe_layer0 = mage_vis_probe_layer0;
+            h.ud = &env;
+            env.layer = il;
+            x = vqa::vit::block(gctx, x, bw, vc.eps, h, il);
+            if (!x) {                                        // parity truncation or sink failure
                 ggml_free(gctx);
-                return true;
+                return env.state == 1;
             }
-
-            // qkv packs q|k|v blocks of n_head heads along ne0
-            const size_t hbytes = (size_t)vhd * qkv->nb[0];
-            auto qkv_head_view = [&](int block) {
-                return ggml_view_3d(gctx, qkv, vhd, vc.n_head, Nc,
-                                    hbytes, qkv->nb[1], (size_t)block * vc.n_head * hbytes);
-            };
-            ggml_tensor * q = qkv_head_view(0);
-            ggml_tensor * k = qkv_head_view(1);
-            ggml_tensor * v = qkv_head_view(2);
-            q = rope_mage(gctx, gf, q, t_ca, t_sa, t_cb, t_sb);
-            k = rope_mage(gctx, gf, k, t_ca, t_sa, t_cb, t_sb);
-            if (il == 0) {
-                ggml_set_name(q, "v_blk0_q_rope");
-                if (stop_c && !strcmp(stop_c, "v_blk0_q_rope")) {
-                    ggml_build_forward_expand(gf, q);
-                    if (!run_chunk("v_blk0_q_rope", &feats)) { ggml_free(gctx); return false; }
-                    ggml_free(gctx);
-                    return true;
-                }
-            }
-
-            // per-frame unmasked flash attention (each frame is its own chunk,
-            // contiguous), concat along the token axis - same trick as vc3
-            const float scale = 1.0f / std::sqrt((float)vhd);
-            ggml_tensor * fa = nullptr;
-            for (int f = 0; f < nf; f++) {
-                const size_t off = (size_t)f * hw;
-                auto cin = [&](ggml_tensor * t) {
-                    return ggml_view_3d(gctx, t, vhd, hw, vc.n_head, t->nb[2], t->nb[1], off * t->nb[2]);
-                };
-                ggml_tensor * fc = ggml_flash_attn_ext(gctx, cin(q), cin(k), cin(v), nullptr, scale, 0.0f, 0.0f);
-                fc = ggml_cont(gctx, fc);
-                fa = fa ? ggml_concat(gctx, fa, fc, 2) : fc;
-            }
-            ggml_tensor * attn = ggml_reshape_2d(gctx, fa, vc.n_embd, Nc);
-            if (il == 0) ggml_set_name(attn, "v_blk0_attn_out");
-            attn = ggml_mul_mat(gctx, L.wo_w, attn);
-            attn = ggml_add(gctx, attn, L.wo_b);
-            x = ggml_add(gctx, x, attn);
-            if (il == 0) {
-                ggml_set_name(x, "v_blk0_out");
-                if (stop_c && !strcmp(stop_c, "v_blk0_out")) {
-                    ggml_build_forward_expand(gf, x);
-                    if (!run_chunk("v_blk0_out", &feats)) { ggml_free(gctx); return false; }
-                    ggml_free(gctx);
-                    return true;
-                }
-            }
-
-            ggml_tensor * l2 = ggml_norm(gctx, x, vc.eps);
-            l2 = ggml_add(gctx, ggml_mul(gctx, l2, L.norm1_w), L.norm1_b);
-            ggml_tensor * f = ggml_mul_mat(gctx, L.fc0_w, l2);
-            f = ggml_add(gctx, f, L.fc0_b);
-            f = ggml_gelu_erf(gctx, f);                    // config hidden_act = gelu (erf)
-            f = ggml_mul_mat(gctx, L.fc1_w, f);
-            f = ggml_add(gctx, f, L.fc1_b);
-            x = ggml_add(gctx, x, f);
         }
 
         ggml_set_name(x, "v_final");
@@ -1359,11 +1416,16 @@ bool MageVL::run_text(TextGraph & g, const std::vector<int> & toks, const std::v
 }
 
 std::string MageVL::render_prompt(int n_img_tokens, const std::string & user_text, bool video,
-                                  const std::vector<float> * frame_secs) const {
+                                  const std::vector<float> * frame_secs,
+                                  const std::string & history) const {
     // the checkpoint's chat template: default system prompt + user turn; the
     // processor rewrites a video placeholder into per-frame timestamped blocks
-    // (" <X.X seconds>" tags, image_pad each), so both paths emit image_pad
-    std::string s = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+    // (" <X.X seconds>" tags, image_pad each), so both paths emit image_pad.
+    // gp.history (realtime sessions) replaces the default system block verbatim.
+    std::string s = history.empty()
+        ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        : history;
+    s += "<|im_start|>user\n";
     if (n_img_tokens > 0 && video && frame_secs && !frame_secs->empty()) {
         char ts[32];
         for (float sec : *frame_secs) {
@@ -1392,7 +1454,21 @@ bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
     // ---- System 1 modes ----------------------------------------------------
     // "gate[:tau]"      score only: per-frame p(speak) report, no generation
     // "gated[:tau]"     generate only when the last frame crosses tau
-    if (mode.rfind("gate", 0) == 0) {
+    // "gated" must be tested before "gate": the prefix check would swallow it
+    if (mode.rfind("gated", 0) == 0 && gate_ready_) {
+        const float tau = mode.size() > 5 && mode[5] == ':' ? atof(mode.c_str() + 6) : 0.5f;
+        std::vector<float> scores;
+        if (!gate_scores(media, scores)) return false;
+        if (!scores.empty() && scores.back() < tau) {
+            out_text = "(silence)";
+            if (gp.on_token) gp.on_token(out_text.c_str(), gp.on_token_ud);
+            fprintf(stderr, "gate: silence (p=%.3f < %.2f)\n", (double)scores.back(), (double)tau);
+            return true;
+        }
+        if (!scores.empty())
+            fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
+        // fall through to normal generation
+    } else if (mode.rfind("gate", 0) == 0) {
         if (!gate_ready_) { out_text = "(StreamMind gate not loaded: drop mage-gate-f16.gguf next to the model)"; return true; }
         const float tau = mode.size() > 4 && mode[4] == ':' ? atof(mode.c_str() + 5) : 0.5f;
         std::vector<float> scores;
@@ -1408,23 +1484,15 @@ bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
         }
         return true;
     }
-    if (mode.rfind("gated", 0) == 0 && gate_ready_) {
-        const float tau = mode.size() > 5 && mode[5] == ':' ? atof(mode.c_str() + 6) : 0.5f;
-        std::vector<float> scores;
-        if (!gate_scores(media, scores)) return false;
-        if (!scores.empty() && scores.back() < tau) {
-            out_text = "(silence)";
-            if (gp.on_token) gp.on_token(out_text.c_str(), gp.on_token_ud);
-            fprintf(stderr, "gate: silence (p=%.3f < %.2f)\n", (double)scores.back(), (double)tau);
-            return true;
-        }
-        if (!scores.empty())
-            fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
-        // fall through to normal generation
-    }
 
     std::vector<float> feats;
     int n_img = 0;
+    // a gate-triggered turn carries no user question; give the narration
+    // instruction the streammind training used (same as ask_session)
+    const std::string ask_prompt =
+        (mode.rfind("gated", 0) == 0 && prompt.empty())
+            ? std::string("Please describe the video content in detail based on the provided information.")
+            : prompt;
     stage_cb = gp.on_stage;
     stage_ud = gp.on_stage_ud;
     const auto tv0 = std::chrono::steady_clock::now();
@@ -1434,7 +1502,7 @@ bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
     // overhead with a 1-placeholder prompt so an oversized image is clamped or
     // rejected before the multi-second vision encode
     {
-        const int text_overhead = (int)tok_.encode(render_prompt(1, prompt, video_kind, nullptr)).size();
+        const int text_overhead = (int)tok_.encode(render_prompt(1, ask_prompt, video_kind, nullptr, gp.history)).size();
         const int n_frames = (int)media.frames.size();
         const int budget = n_ctx - gp.max_tokens - text_overhead - 16 - 12 * n_frames;
         if (budget <= 0) {
@@ -1469,7 +1537,7 @@ bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
     const int n_per_frame = video_kind && !frame_secs.empty() ? n_img / (int)frame_secs.size() : n_img;
-    const std::string text = render_prompt(n_per_frame, prompt, video_kind, &frame_secs);
+    const std::string text = render_prompt(n_per_frame, ask_prompt, video_kind, &frame_secs, gp.history);
     const std::vector<int> ids = tok_.encode(text);
     std::vector<int> img_pos;
     for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == id_image_pad) img_pos.push_back(i);
