@@ -196,6 +196,24 @@ vqa-cli --mcp --models-dir models --model moondream3.1-q6k.gguf
 > `SKYVISION_BUILD` / `SKYVISION_MODELS` 覆盖。视频工具另外需要 `ffmpeg`（`FFMPEG` 可指定
 > 路径），纯图片工具不需要。
 
+#### Docker（MCP 目录/沙箱跑的就是这个）
+
+仓库自带 `Dockerfile`：多阶段构建出 CPU 版二进制，并**内置 403MB 的 SmolVLM-256M q8**，
+所以镜像开箱就是个能真答话的 MCP 服务器：
+
+```bash
+docker build -t skyvision-mcp .
+docker run --rm -i skyvision-mcp                      # 内置 smolvlm，直接可用
+docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
+```
+
+入口是 `vqa-cli --mcp --models-dir /models`；内置模型就是 `describe_image` / `ask_image`
+的兜底，挂进去的每个 `*.gguf` 都会出现在 `list_models` 里。镜像预设
+`SMOLVLM_MAX_EDGE=1024`（官方预处理会放大到 2048，见 SmolVLM 那节：同样答案但慢 2.3 倍）。
+
+**完全没有权重时**它也不会崩：`initialize` / `tools/list` / `list_models`（返回空列表）
+都正常应答 —— 这正是目录爬虫、CI 冒烟测试和 MCP 平台审核所做的事。
+
 | 工具 | 说明 |
 |---|---|
 | `list_models` | 列出可运行的 GGUF（架构/量化/体积/是否常驻）+ 已加载模型的能力位 |

@@ -672,7 +672,12 @@ bool SmolVLM::ask(const vqa::MediaInput & media, const std::string & prompt,
     int n_tiles = 0, gx = 0, gy = 0;
     if (!media.empty()) {
         if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
+        const auto tv0 = std::chrono::steady_clock::now();
         if (!encode_image(media, feats, &n_tiles, &gx, &gy)) return false;
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tv0).count();
+        fprintf(stderr, "[perf] smolvlm vision: %.0f ms for %d crops (%.0f ms/crop)\n",
+                ms, n_tiles + 1, ms / (double)(n_tiles + 1));
         if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
     }
 
@@ -716,6 +721,7 @@ bool SmolVLM::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
 
     TextGraph g;
+    const auto tp0 = std::chrono::steady_clock::now();
     if (!build_text_graph(g, T, T, (int)img_pos.size(), true)) { ggml_free(g.ctx); return false; }
     vqa::set_causal_mask(g.mask_in, 0, T);
     std::vector<float> logits;
@@ -726,6 +732,9 @@ bool SmolVLM::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
     ggml_free(g.ctx);
     n_past = T;
+    fprintf(stderr, "[perf] smolvlm prefill: %.0f ms for %d tokens\n",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tp0).count(), T);
 
     if (getenv("SMOLVLM_DEBUG")) {
         fprintf(stderr, "tokens(%d) of which %zu image:", T, img_pos.size());

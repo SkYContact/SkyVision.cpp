@@ -14,6 +14,7 @@ if not exist "%VCVARS%" (
 call "%VCVARS%" >nul
 
 if not exist build mkdir build
-cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF %*
-rem vqa-cli: unified front end   moondream-cli: moondream3.1 standalone binary
-cmake --build build --config Release --target vqa-cli moondream-cli %*
+rem MSVC does not translate GGML_NATIVE into /arch:AVX2, so spell the x86 flags out
+cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON %*
+rem vqa-cli is the single front end (inference / --serve / --mcp)
+cmake --build build --config Release --target vqa-cli %*

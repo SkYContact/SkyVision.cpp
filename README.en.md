@@ -167,6 +167,26 @@ Pointing straight at the binary works too (then the DLLs are your responsibility
 > `SKYVISION_BUILD` and `SKYVISION_MODELS`. Video tools need `ffmpeg` (`FFMPEG` overrides the
 > path); image tools do not.
 
+#### Docker (what an MCP directory runs)
+
+The repository ships a `Dockerfile` that builds the CPU binary and **bundles the 403 MB
+SmolVLM-256M q8 checkpoint**, so the image is a working MCP server with nothing mounted:
+
+```bash
+docker build -t skyvision-mcp .
+docker run --rm -i skyvision-mcp                       # smolvlm is ready out of the box
+docker run --rm -i -v ~/models:/models skyvision-mcp    # or point it at your own GGUFs
+```
+
+Entry point is `vqa-cli --mcp --models-dir /models`; the bundled model is what
+`describe_image` / `ask_image` fall back to, and every `*.gguf` you mount appears in
+`list_models`. `SMOLVLM_MAX_EDGE=1024` is preset in the image (see the SmolVLM section:
+the official processor upscales to 2048, which costs 2.3x more for the same answers).
+
+An image with **no** weights still answers `initialize`, `tools/list` and `list_models`
+(empty list) instead of failing — that is exactly what directory crawlers, CI smoke tests
+and the review step of an MCP registry exercise.
+
 | Tool | What it does |
 |---|---|
 | `list_models` | Runnable GGUFs (arch / quant / size / resident) plus the loaded model's skill bits |

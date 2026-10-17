@@ -40,6 +40,8 @@ cmake -S . -B build-cuda -G Ninja -DCMAKE_MAKE_PROGRAM="%NINJA%" -DCMAKE_BUILD_T
   -DGGML_OPENMP=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF ^
   -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCH% ^
   -DGGML_CUDA_GRAPHS=ON -DCMAKE_CUDA_HOST_COMPILER="%CUDA_HOST_CL:\=/%" ^
+  -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
   -DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -DCMAKE_CXX_FLAGS=/utf-8 %*
-rem vqa-cli: unified front end   moondream-cli: moondream3.1 standalone binary
-cmake --build build-cuda --target vqa-cli moondream-cli %*
+rem vqa-cli is the single front end (inference / --serve / --mcp); the CPU side
+rem still needs the explicit x86 flags because MSVC ignores GGML_NATIVE
+cmake --build build-cuda --target vqa-cli %*

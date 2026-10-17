@@ -1,0 +1,16 @@
+# weights and checkpoints never belong in the build context (the image pulls the one
+# demo model it needs)
+models/
+*.gguf
+*.safetensors
+*.bin
+*.npy
+*.shape
+
+# build trees and local scratch
+build/
+build-*/
+ref_*/
+.venv/
+.git/
+*.log
