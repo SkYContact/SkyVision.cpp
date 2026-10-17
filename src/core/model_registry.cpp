@@ -107,11 +107,16 @@ bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ft
     const int k = gguf_find_key(g, "general.architecture");
     if (k >= 0) arch = gguf_get_val_str(g, k);
     const std::string raw_arch = arch;
-    const int kv = gguf_find_key(g, (raw_arch + ".vocab_size").c_str());
-    if (kv >= 0) vocab = (size_t)gguf_get_val_u32(g, kv);
     const int ks = gguf_find_key(g, "marlin.skills");
     if (arch == "qwen3_5" || arch == "marlin")
         arch = (ks >= 0 && gguf_get_val_bool(g, ks)) ? "marlin" : "qwen3_5";
+    // the two labels swap across converter generations (938a21c): the metadata
+    // keys may carry either name regardless of general.architecture, so probe
+    // both before giving up - a missed vocab_size makes discovery match a
+    // 151k-vocab tokenizer against a 248k-vocab model (garbled output)
+    int kv = gguf_find_key(g, (arch + ".vocab_size").c_str());
+    if (kv < 0) kv = gguf_find_key(g, (raw_arch + ".vocab_size").c_str());
+    if (kv >= 0) vocab = (size_t)gguf_get_val_u32(g, kv);
     const int kf = gguf_find_key(g, "general.file_type");
     if (kf >= 0) {
         char b[32];
@@ -162,6 +167,13 @@ std::string ModelRegistry::pick_tokenizer(const std::string & base_dir, const st
     // models dir (they differ when a single path was registered explicitly)
     std::vector<std::string> dirs = { base_dir };
     if (dir_ != base_dir && !dir_.empty()) dirs.push_back(dir_);
+    // last resort: the arch's canonical checkpoint dir (models/VideoChat3-4B
+    // etc.) - covers single ggufs parked anywhere else in the repo
+    {
+        const std::string hint = default_tokenizer_dir(arch);
+        if (!hint.empty())
+            for (const auto & d : dirs) if (d != hint) { dirs.push_back(hint); break; }
+    }
     std::vector<std::string> cands;
     for (const auto & d : dirs) {
         cands.push_back(d + "/" + stem + "/tokenizer.json");   // per-model checkpoint dir
@@ -254,6 +266,19 @@ void ModelRegistry::discover(const std::string & dir, const std::string & tokeni
         if (it.is_dir || !ends_with(it.name, ".gguf")) continue;
         ggufs.push_back(it.name);
         if (vision_path_.empty() && ends_with(it.name, "-vision.gguf")) vision_path_ = dir_ + "/" + it.name;
+    }
+    // HF-style layout: models/<checkpoint>/<model>.gguf - scan one level of
+    // subdirectories too (pick_tokenizer already prefers a tokenizer.json
+    // sitting in the gguf's own directory)
+    for (const auto & it : list_dir(dir_)) {
+        if (!it.is_dir || it.name[0] == '.') continue;
+        const std::string sub = dir_ + "/" + it.name;
+        for (const auto & g : list_dir(sub)) {
+            if (g.is_dir || !ends_with(g.name, ".gguf")) continue;
+            ggufs.push_back(it.name + "/" + g.name);
+            if (vision_path_.empty() && ends_with(g.name, "-vision.gguf"))
+                vision_path_ = sub + "/" + g.name;
+        }
     }
     for (const auto & g : ggufs) {
         ModelEntry e;
