@@ -68,6 +68,10 @@ CFG = dict(n_layer=12, n_embd=768, n_head=12, n_ff=3072, patch=16, tubelet=2,
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
+# PIL resample id from preprocessor_config.json (2 = BILINEAR, the VideoMAE
+# processors' default; 3 = BICUBIC); written as videomae.resize_resample
+RESAMPLE = {"resample": 2}
+
 OUTTYPES = {"f16": None, "q8_0": gguf.GGMLQuantizationType.Q8_0,
             "q4_0": gguf.GGMLQuantizationType.Q4_0}
 
@@ -80,6 +84,10 @@ def read_config(src_dir):
         return cfg
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
+    pp = os.path.join(src_dir, "preprocessor_config.json")
+    if os.path.isfile(pp):
+        with open(pp, encoding="utf-8") as f:
+            RESAMPLE["resample"] = int(json.load(f).get("resample", 2))
     cfg.update({k: v for k, v in dict(
         n_layer=raw.get("num_hidden_layers"), n_embd=raw.get("hidden_size"),
         n_head=raw.get("num_attention_heads"), n_ff=raw.get("intermediate_size"),
@@ -141,6 +149,7 @@ def write_metadata(gw, cfg, has_classifier, has_final_norm, outtype):
         gw.add_array("videomae.labels", cfg["labels"])
     gw.add_array("videomae.image_mean", [float(x) for x in IMAGENET_MEAN])
     gw.add_array("videomae.image_std", [float(x) for x in IMAGENET_STD])
+    gw.add_uint32("videomae.resize_resample", RESAMPLE["resample"])
 
 
 def verify(path, required):

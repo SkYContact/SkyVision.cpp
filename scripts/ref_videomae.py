@@ -73,6 +73,8 @@ def main():
 
     def hook(name):
         def fn(_m, _i, out):
+            if not torch.is_tensor(out):
+                out = out.last_hidden_state   # newer transformers wraps activations
             seen[name] = out.detach().float()
         return fn
 
@@ -87,7 +89,7 @@ def main():
     patch_out = seen["v_patch_out"][0].numpy()              # [tokens, dim]
     hidden = seen["v_final"][0].numpy()                     # already post-LayerNorm
     if getattr(model, "fc_norm", None) is not None:         # use_mean_pooling fine-tunes
-        pooled = model.fc_norm(torch.from_numpy(hidden.mean(0))).numpy()
+        pooled = model.fc_norm(torch.from_numpy(hidden.mean(0)).float()).detach().numpy()
     else:
         pooled = hidden[0]                                  # no cls token: token 0
 

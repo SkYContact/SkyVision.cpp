@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -126,6 +127,7 @@ inline ggml_tensor * lookup(ggml_cgraph * gf, const char * name) {
 
 inline void write_tensor(ggml_tensor * t, const char * dir, const char * name) {
     if (!t || !t->data) return;
+    std::filesystem::create_directories(dir);   // fopen fails silently on a missing dir
     std::string path = std::string(dir) + "/cpp_" + name + ".bin";
     std::vector<float> tmp;
     const uint8_t * src;

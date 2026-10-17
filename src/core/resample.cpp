@@ -80,7 +80,7 @@ static void build_aa_filters(int in, int out, std::vector<Filter>& fs, bool bili
 }
 
 void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
-                      std::vector<float>& out, bool bilinear) {
+                      std::vector<float>& out, bool bilinear, bool round_u8) {
     std::vector<Filter> fh, fv;
     build_aa_filters(sw, dw, fh, bilinear);
     build_aa_filters(sh, dh, fv, bilinear);
@@ -117,9 +117,19 @@ void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                 acc[2] += f.w[k] * (double)px[2];
             }
             float * dst = &out[((size_t)y * dw + x) * 3];
-            dst[0] = (float)acc[0];
-            dst[1] = (float)acc[1];
-            dst[2] = (float)acc[2];
+            if (round_u8) {
+                // torchvision resizes uint8 input to a uint8 output: the whole
+                // pipeline stays float and rounds ONCE, at the end. Skipping
+                // this leaves a ~1-2 grey level residual against the processor.
+                for (int c = 0; c < 3; c++) {
+                    int v = (int)(acc[c] + 0.5);
+                    dst[c] = (float)(v < 0 ? 0 : v > 255 ? 255 : v);
+                }
+            } else {
+                dst[0] = (float)acc[0];
+                dst[1] = (float)acc[1];
+                dst[2] = (float)acc[2];
+            }
         }
     }
 }

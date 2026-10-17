@@ -47,6 +47,20 @@ std::string resolve_tokenizer_path(const std::string & arg) {
     return std::string();
 }
 
+// Canonical models/<checkpoint> dir per arch, matching the README's model table
+// layout. Without this a GGUF parked in the repo root has no sibling
+// tokenizer.json, and the CLI used to fall back to whatever tokenizer.json sat
+// in the working directory - the moondream one, which silently breaks every
+// Qwen-family backend (no <|image_pad|>).
+std::string default_tokenizer_dir(const std::string & arch) {
+    if (arch == "videochat3") return "models/VideoChat3-4B";
+    if (arch == "marlin")     return "models/Marlin-2B";
+    if (arch == "qwen3_5")    return "models/Qwen3.5-2B";
+    if (arch == "moss_vl")    return "models/Moss-VL-Realtime-q4k";
+    if (arch == "moondream3") return "models/moondream3.1";
+    return std::string();   // videomae/vivit need no tokenizer; unknown: no hint
+}
+
 }  // namespace vqa
 
 namespace vqa {

@@ -131,4 +131,10 @@ std::string architecture_of(const char * gguf_path);
 // file, empty when nothing was found).
 std::string resolve_tokenizer_path(const std::string & arg);
 
+// Repo-layout default checkpoint dir whose tokenizer.json serves `arch`
+// ("models/VideoChat3-4B" etc.). Empty when the arch has no canonical dir or
+// needs no tokenizer (videomae/vivit). Callers must still check existence - a
+// hint, never a guarantee.
+std::string default_tokenizer_dir(const std::string & arch);
+
 }  // namespace vqa

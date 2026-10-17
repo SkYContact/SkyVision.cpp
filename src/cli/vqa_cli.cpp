@@ -150,7 +150,19 @@ int main(int argc, char ** argv) {
         tok_path = vqa::resolve_tokenizer_path(dir);
     }
     if (tok_path.empty() && needs_tokenizer) {
-        fprintf(stderr, "no tokenizer.json found (use --tokenizer)\n");
+        // last resort: the arch's canonical checkpoint dir. Never fall back to a
+        // tokenizer.json merely sitting in the working directory - for a
+        // Qwen-family arch fed the moondream one it fails far from the cause
+        // ("placeholder mismatch: 0 image_pad tokens").
+        const std::string hint = vqa::resolve_tokenizer_path(vqa::default_tokenizer_dir(arch));
+        if (!hint.empty()) {
+            tok_path = hint;
+            fprintf(stderr, "tokenizer: using %s (pass --tokenizer to override)\n", tok_path.c_str());
+        }
+    }
+    if (tok_path.empty() && needs_tokenizer) {
+        fprintf(stderr, "no tokenizer.json found for arch %s (use --tokenizer <dir|tokenizer.json>)\n",
+                arch.c_str());
         return 2;
     }
 
