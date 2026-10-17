@@ -1,5 +1,7 @@
 # SkyVision.cpp
 
+[![docker-mcp](https://github.com/SkYContact/SkyVision.cpp/actions/workflows/docker-mcp.yml/badge.svg)](https://github.com/SkYContact/SkyVision.cpp/actions/workflows/docker-mcp.yml)
+
 Local **image/video VQA** on top of [ggml](https://github.com/ggml-org/ggml) — a multi-model
 inference engine: every vision-language model is a backend implementing `vqa::Model`, and one
 front end picks the backend from the GGUF `general.architecture` field. Images and video frame
@@ -196,6 +198,12 @@ and the review step of an MCP registry exercise.
 The bundled checkpoint is pulled from `SkyContact/SmolVLM-256M-GGUF` on Hugging Face
 (mirrored on ModelScope); pin or switch sources with
 `--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`.
+
+[`.github/workflows/docker-mcp.yml`](.github/workflows/docker-mcp.yml) builds this image on
+every push and runs both smoke tests above (handshake with no models, then `describe_image`
+against the bundled checkpoint), so the badge reflects a real Linux build rather than a
+claim. Layers are ordered so that apt, the ggml checkout and the 403 MB checkpoint are
+cached: a source change re-runs only the compile (through ccache).
 
 | Tool | What it does |
 |---|---|

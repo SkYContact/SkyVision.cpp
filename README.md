@@ -1,5 +1,7 @@
 # SkyVision.cpp
 
+[![docker-mcp](https://github.com/SkYContact/SkyVision.cpp/actions/workflows/docker-mcp.yml/badge.svg)](https://github.com/SkYContact/SkyVision.cpp/actions/workflows/docker-mcp.yml)
+
 用 [ggml](https://github.com/ggml-org/ggml) 在本地跑**图像/视频 VQA** —— 一个多模型推理引擎：
 每个视觉语言模型是一个后端（实现 `vqa::Model`），统一前端按 GGUF 里的
 `general.architecture` 自动选择后端，图像与视频帧序列共用同一套输入抽象。
@@ -221,6 +223,11 @@ docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
 
 内置权重默认从 Hugging Face 的 `SkyContact/SmolVLM-256M-GGUF` 拉取（魔搭有同款镜像），
 换源或固定版本用 `--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`。
+
+[`.github/workflows/docker-mcp.yml`](.github/workflows/docker-mcp.yml) 每次推送都会在
+Linux 上真的构建这个镜像并跑上面两步冒烟（无权重握手 → 用内置模型 `describe_image`），
+所以 README 顶部的徽章是"真构建过"，不是宣称。层顺序按缓存友好排布：apt、ggml checkout、
+403MB 权重都能命中，改源码只重跑编译（走 ccache）。
 
 | 工具 | 说明 |
 |---|---|
