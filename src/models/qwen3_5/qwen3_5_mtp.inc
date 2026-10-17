@@ -159,7 +159,10 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
     const int S = std::min(vqa::block_for(n_past + T), n_ctx);
     SpecCache & c = spec_v[state_slot == 1 ? 1 : 0];
     if (c.blk != S || c.slot != state_slot || !c.gf) {
-        if (c.ctx) ggml_free(c.ctx);
+        if (c.ctx) {
+            ggml_free(c.ctx);
+            if (sdump) vqa::dump::dump_registry_clear();   // the cached graph's sinks die with it
+        }
         TextGraph g;
         if (!build_text_graph(g, T, S, 0, state_slot, /*logits_all*/ true)) return false;
         if (sdump) vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
@@ -171,6 +174,7 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
             ggml_set_name(c.am, "v_am");
             ggml_build_forward_expand(g.gf, c.am);
         }
+        if (sdump) vqa::dump::finalize_sinks(g.ctx, g.gf, backend);   // keeps at the graph tail
         if (!c.alloc) c.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!ggml_gallocr_alloc_graph(c.alloc, g.gf)) { ggml_free(g.ctx); return false; }
         c.ctx = g.ctx; c.gf = g.gf; c.blk = S; c.slot = state_slot;
@@ -288,6 +292,7 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             TextGraph g1;
             if (build_text_graph(g1, 1, save_np + 1, 0, 0, false)) {
                 vqa::dump::mark_sinks(g1.ctx, g1.gf, dn);
+                vqa::dump::finalize_sinks(g1.ctx, g1.gf, backend);
                 if (ggml_gallocr_alloc_graph(allocr, g1.gf)) {
                     int pend = pending;
                     ggml_backend_tensor_set(g1.tok_in, &pend, 0, sizeof(int));
@@ -322,6 +327,7 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
                 const int np = save_np + step;
                 if (!build_text_graph(g1, 1, np + 1, 0, 0, false)) continue;
                 vqa::dump::mark_sinks(g1.ctx, g1.gf, dn2);
+                vqa::dump::finalize_sinks(g1.ctx, g1.gf, backend);
                 if (!ggml_gallocr_alloc_graph(allocr, g1.gf)) { ggml_free(g1.ctx); continue; }
                 ggml_backend_tensor_set(g1.tok_in, &tok, 0, sizeof(int));
                 int mp[4] = { cur + 1 + step, cur + 1 + step, cur + 1 + step, np };

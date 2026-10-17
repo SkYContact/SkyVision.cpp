@@ -33,7 +33,8 @@
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
 #include "stage_buf.hpp"
-#include "resample.hpp"   // vqa::img::smart_resize / resize_bicubic_antialias
+#include "resample.hpp"      // vqa::img::smart_resize / resize_bicubic_antialias
+#include "weight_load.hpp"   // mmap bind / 1D->f32 / zero-copy vs upload
 #include "qwen3_5_preprocess.hpp"
 
 #include <algorithm>
@@ -323,43 +324,12 @@ bool Qwen3_5::load_weights(const char * path) {
     id_vision_end = vqa::gguf::u32(gu, "marlin.vision_end_token_id", id_vision_end);
     id_endoftext = vqa::gguf::u32(gu, "marlin.pad_token_id", id_endoftext);
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; i++) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        ggml_tensor * t = ggml_get_tensor(wctx, name);
-        if (!t) continue;
-        t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     // 1D tensors (norms, biases, dt/a vectors, conv kernels) -> host F32
     vqa::AlignedBuf host_f32;
-    {
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            total += (size_t)ggml_nelements(t) * sizeof(float);
-        }
-        host_f32.resize(total);
-        size_t off = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            const int64_t n = ggml_nelements(t);
-            float * dst = (float *)(host_f32.data() + off);
-            vqa::gguf::tensor_to_f32(t, dst);
-            t->data = dst;
-            t->type = GGML_TYPE_F32;
-            t->nb[0] = sizeof(float);
-            t->nb[1] = (size_t)n * sizeof(float);
-            t->nb[2] = t->nb[1];
-            t->nb[3] = t->nb[2];
-            off += (size_t)n * sizeof(float);
-        }
-        fprintf(stderr, "f32-converted 1D tensors: %.1f MB\n", total / 1e6);
-    }
+    vqa::weights::promote_1d_to_f32(wctx, host_f32);
 
     {
         ggml_tensor * pe = ggml_get_tensor(wctx, "v.pos_emb.weight");
@@ -375,30 +345,11 @@ bool Qwen3_5::load_weights(const char * path) {
     }
 
     {
-        std::vector<std::pair<ggml_tensor *, const void *>> uploads;
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            uploads.push_back({t, t->data});
-            total += ggml_nbytes(t);
-        }
-        if (ggml_backend_is_cpu(backend)) {
-            wbuf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
-            if (!host_f32.empty())
-                wbuf_plain = ggml_backend_cpu_buffer_from_ptr(host_f32.data(), host_f32.size());
-            for (auto & u : uploads) {
-                const char * pdata = (const char *)u.first->data;
-                const char * fb = host_f32.empty() ? nullptr : host_f32.data();
-                const char * fe = fb ? fb + host_f32.size() : nullptr;
-                u.first->buffer = (fb && pdata >= fb && pdata < fe) ? wbuf_plain : wbuf;
-            }
-            fprintf(stderr, "weights: %.2f GB zero-copy from mmap\n", total / 1e9);
-        } else {
-            for (auto & u : uploads) u.first->data = nullptr;
-            wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
-            if (!wbuf) { fprintf(stderr, "weight allocation failed (need %.2f GB)\n", total / 1e9); return false; }
-            for (auto & u : uploads) ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
-            fprintf(stderr, "uploaded %.2f GB of weights\n", total / 1e9);
-        }
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(
+            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
+        if (!bound.host_bufs.empty()) wbuf_plain = bound.host_bufs[0];
         if (ggml_backend_is_cpu(backend)) {
             host_f32_storage = std::move(host_f32);
         } else {
@@ -695,6 +646,8 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
     auto t_now = []() { return std::chrono::steady_clock::now(); };
     for (int s = 0; s < gt; s++) {
         const int Nc = hw;
+        // per-step graph: drop the previous step's registry (and its sink buffers)
+        if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
         struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
         ggml_context * gctx = ggml_init(ip);
         if (!gctx) return false;
@@ -717,13 +670,16 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
         x = ggml_add(gctx, x, t_pos);
         ggml_set_name(x, "v_patch_out");
 
+        bool sinks_ready = false;   // keep nodes attach once, at the graph tail
         auto run_chunk = [&](const char * out_name, std::vector<float> * dest) -> bool {
-            if (!dump_dir.empty()) {
+            if (!dump_dir.empty() && !sinks_ready) {
                 static const char * const dump_names[] = {
                     "patches", "v_pos_in", "v_patch_out", "v_blk0_attn_out", "v_blk0_out",
                     "v_final", nullptr,
                 };
                 vqa::dump::mark_sinks(gctx, gf, dump_names);
+                vqa::dump::finalize_sinks(gctx, gf, backend);
+                sinks_ready = true;
             }
             if (!ggml_gallocr_alloc_graph(allocr, gf)) {
                 fprintf(stderr, "vision graph allocation failed\n");
@@ -797,6 +753,7 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
     const int N = hw * gt;
     const int mh = gh / vc.merge, mw = gw / vc.merge;
     {
+        if (!dump_dir.empty()) vqa::dump::dump_registry_clear();   // new graph, new registry
         struct ggml_init_params ip2 = { 32ull * 1024 * 1024, NULL, true };
         ggml_context * mctx = ggml_init(ip2);
         if (!mctx) return false;
@@ -804,10 +761,13 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
         ggml_tensor * t_x = tower_buf.view(mctx, N, 0);   // device-side, no host round trip
         ggml_tensor * x = t_x;
 
+        bool sinks_ready = false;
         auto run_merger = [&](const char * out_name) -> bool {
-            if (!dump_dir.empty()) {
+            if (!dump_dir.empty() && !sinks_ready) {
                 static const char * const dump_names[] = { "v_merge", "v_proj_out", nullptr };
                 vqa::dump::mark_sinks(mctx, mgf, dump_names);
+                vqa::dump::finalize_sinks(mctx, mgf, backend);
+                sinks_ready = true;
             }
             if (!ggml_gallocr_alloc_graph(allocr, mgf)) {
                 fprintf(stderr, "merger graph allocation failed\n");
@@ -861,6 +821,8 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
 
 // ---------------------------------------------------------------- text
 bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot, bool logits_all) {
+    // new graph -> previous dump registry/sink buffers are stale
+    if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
@@ -1130,6 +1092,7 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
             "t_l0_la_core", "t_l0_swiglu", "t_l0_out", "t_final_norm", nullptr,
         };
         vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
+        vqa::dump::finalize_sinks(g.ctx, g.gf, backend);   // keep nodes at the graph tail
     }
     return true;
 }

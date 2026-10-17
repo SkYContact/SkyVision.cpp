@@ -12,6 +12,7 @@
 
 #include "moondream_vision.hpp"
 #include "vit_block.hpp"
+#include "weight_load.hpp"
 #include <thread>
 #include <atomic>
 #include "ggml.h"
@@ -114,14 +115,7 @@ bool VisionModel::load(const char * path, ggml_backend_t backend) {
     grid = crop / patch;
     patch_dim = in_ch * patch * patch;
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; ++i) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        struct ggml_tensor * t = ggml_get_tensor(W.wctx, name);
-        if (!t) continue;
-        t->data = (char *)W.mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, W.wctx, W.mm);
     gguf_free(gu);
 
     // small F16 tensors used in binary ops (norms, biases, pos_emb) -> CPU F32

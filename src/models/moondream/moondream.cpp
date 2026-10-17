@@ -70,6 +70,7 @@
 #include "vqa_util.hpp"
 #include "backend.hpp"
 #include "ggml_dump.hpp"
+#include "weight_load.hpp"
 using vqa::MMap;
 using vqa::Tokenizer;
 using vqa::init_byte_table;
@@ -136,15 +137,7 @@ bool Model::load(const char * path, ggml_backend_t backend) {
     n_head_dim = n_embd / n_head;
     n_rot = n_head_dim / 2;
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    std::vector<char> names;
-    for (int64_t i = 0; i < nt; ++i) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        struct ggml_tensor * t = ggml_get_tensor(wctx, name);
-        if (!t) continue;
-        t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     // small F16 tensors (norms, biases) -> CPU-side F32 copies (mixed-type binary ops unsupported)
@@ -353,6 +346,7 @@ bool Engine::init(const char * gguf_path, const char * tok_json, int n_ctx_) {
         if (!ggml_gallocr_alloc_graph(gallocr, gf))
             fprintf(stderr, "warning: gallocr pre-grow alloc failed\n");
         ggml_free(gctx);
+        if (getenv("MD_DUMP")) vqa::dump::dump_registry_clear();   // this graph is thrown away
     }
     return true;
 }
@@ -569,6 +563,8 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
         };
         vqa::dump::mark_sinks(gctx, gf, dump_names);
     }
+    // attach the keep nodes at the true tail (no-op when nothing is registered)
+    vqa::dump::finalize_sinks(gctx, gf, backend);
     return gf;
 }
 
@@ -591,6 +587,7 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
     auto t0 = tick();
     if (use_static) {
         if (!dec_ctx) {   // build once: fixed n_ctx KV views + always-present mask
+            if (getenv("MD_DUMP")) vqa::dump::dump_registry_clear();
             struct ggml_init_params ip = { 256ull * 1024 * 1024, NULL, /*no_alloc*/ true };
             dec_ctx = ggml_init(ip);
             int * hb[2] = { nullptr, nullptr };
@@ -604,6 +601,7 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
         gctx = dec_ctx; gf = dec_gf;
     } else {
         const size_t ctx_size = 512ull * 1024 * 1024;   // graph metadata only (no_alloc + gallocr)
+        if (getenv("MD_DUMP")) vqa::dump::dump_registry_clear();   // per-call graph
         struct ggml_init_params ip = { ctx_size, NULL, /*no_alloc*/ true };
         gctx = ggml_init(ip);
         if (!gctx) return -1;

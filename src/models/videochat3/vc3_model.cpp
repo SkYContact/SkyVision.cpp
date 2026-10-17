@@ -28,6 +28,7 @@
 #include "backend.hpp"
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
+#include "weight_load.hpp"
 #include "stage_buf.hpp"
 #include "vc3_preprocess.hpp"
 #include "attention.hpp"
@@ -296,43 +297,12 @@ bool VideoChat3::load_weights(const char * path) {
         return false;
     }
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; i++) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        ggml_tensor * t = ggml_get_tensor(wctx, name);
-        if (!t) continue;
-        t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     // 1D tensors (norms, biases) -> host F32: ggml elementwise ops need matching types
     vqa::AlignedBuf host_f32;
-    {
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            total += (size_t)ggml_nelements(t) * sizeof(float);
-        }
-        host_f32.resize(total);
-        size_t off = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            if (t->ne[1] != 1 || t->ne[2] != 1 || t->ne[3] != 1) continue;
-            if (t->type == GGML_TYPE_F32) continue;
-            const int64_t n = ggml_nelements(t);
-            float * dst = (float *)(host_f32.data() + off);
-            vqa::gguf::tensor_to_f32(t, dst);
-            t->data = dst;
-            t->type = GGML_TYPE_F32;
-            t->nb[0] = sizeof(float);
-            t->nb[1] = (size_t)n * sizeof(float);
-            t->nb[2] = t->nb[1];
-            t->nb[3] = t->nb[2];
-            off += (size_t)n * sizeof(float);
-        }
-        fprintf(stderr, "f32-converted 1D tensors: %.1f MB\n", total / 1e6);
-    }
+    vqa::weights::promote_1d_to_f32(wctx, host_f32);
 
     // --- vision LayerNorm affine folding (opt-in) -----------------------------
     //   W·(norm(x)*w + b) + B  ==  W·(norm(x)*w) + (W·b + B)   [bias fold]
@@ -481,41 +451,17 @@ bool VideoChat3::load_weights(const char * path) {
     }
 
     {
-        std::vector<std::pair<ggml_tensor *, const void *>> uploads;
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            uploads.push_back({t, t->data});
-            total += ggml_nbytes(t);
-        }
-
-        if (ggml_backend_is_cpu(backend)) {
-            // zero-copy (same trick as the moondream engine): the weights keep
-            // pointing into the mmap, the f32-converted 1D tensors into their host
-            // block. Avoids a second multi-GB commit on Windows, where the mmap
-            // already counts against the commit limit - load is faster and the
-            // resident footprint is roughly halved.
-            wbuf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
-            const char * f32_begin = host_f32.empty() ? nullptr : host_f32.data();
-            const char * f32_end = f32_begin ? f32_begin + host_f32.size() : nullptr;
-            if (f32_begin) wbuf_plain = ggml_backend_cpu_buffer_from_ptr(host_f32.data(), host_f32.size());
-            const char * fold_begin = fold_storage.empty() ? nullptr : fold_storage.data();
-            const char * fold_end = fold_begin ? fold_begin + fold_storage.size() : nullptr;
-            if (fold_begin) wbuf_fold = ggml_backend_cpu_buffer_from_ptr(fold_storage.data(), fold_storage.size());
-            for (auto & u : uploads) {
-                ggml_tensor * t = u.first;
-                const char * p = (const char *)t->data;
-                t->buffer = (f32_begin && p >= f32_begin && p < f32_end) ? wbuf_plain
-                          : (fold_begin && p >= fold_begin && p < fold_end) ? wbuf_fold : wbuf;
-            }
-            fprintf(stderr, "weights: %.2f GB zero-copy from mmap (%s)\n", total / 1e9,
-                    f32_begin ? "1D tensors in host f32 block" : "all in mmap");
-        } else {
-            for (auto & u : uploads) u.first->data = nullptr;
-            wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
-            if (!wbuf) { fprintf(stderr, "weight allocation failed (need %.2f GB)\n", total / 1e9); return false; }
-            for (auto & u : uploads) ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
-            fprintf(stderr, "uploaded %.2f GB of weights\n", total / 1e9);
-        }
+        // zero-copy (same trick as the moondream engine): the weights keep pointing
+        // into the mmap, the f32-converted 1D tensors and the folded/padded vision
+        // weights into their host blocks. Avoids a second multi-GB commit on
+        // Windows, where the mmap already counts against the commit limit - load is
+        // faster and the resident footprint is roughly halved.
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(wctx, backend, mm,
+            { { host_f32.data(), host_f32.size() }, { fold_storage.data(), fold_storage.size() } });
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
+        if (bound.host_bufs.size() > 0) wbuf_plain = bound.host_bufs[0];
+        if (bound.host_bufs.size() > 1) wbuf_fold = bound.host_bufs[1];
     }
     if (ggml_backend_is_cpu(backend)) {
         host_f32_storage = std::move(host_f32);   // the 1D tensors point into it
@@ -842,6 +788,8 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     for (size_t c = 0; c < clip_t.size(); c++) {
         const int t = clip_t[c];
         const int Nc = hw * t;
+        // per-clip graph: drop the previous clip's registry (and its sink buffers)
+        if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
         struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
         ggml_context * gctx = ggml_init(ip);
         if (!gctx) return false;
@@ -866,14 +814,17 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         x = ggml_add(gctx, x, t_pos);
         ggml_set_name(x, "v_patch_out");
 
+        bool sinks_ready = false;   // keep nodes attach once, at the graph tail
         auto run_chunk = [&](const char * out_name, std::vector<float> * dest) -> bool {
             const auto ra = t_now();
-            if (!dump_dir.empty()) {
+            if (!dump_dir.empty() && !sinks_ready) {
                 static const char * const dump_names[] = {
                     "v_patch_out", "v_blk0_qkv", "v_blk0_q_rope", "v_blk0_attn_out",
                     "v_blk0_out", "v_final", nullptr,
                 };
                 vqa::dump::mark_sinks(gctx, gf, dump_names);
+                vqa::dump::finalize_sinks(gctx, gf, backend);
+                sinks_ready = true;
             }
             if (!ggml_gallocr_alloc_graph(allocr, gf)) {
                 fprintf(stderr, "vision graph allocation failed\n");
@@ -972,6 +923,7 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 
     // ---- merger + projector over the concatenated tower output
     {
+        if (!dump_dir.empty()) vqa::dump::dump_registry_clear();   // new graph, new registry
         struct ggml_init_params ip2 = { 32ull * 1024 * 1024, NULL, /*no_alloc*/ true };
         ggml_context * mctx = ggml_init(ip2);
         if (!mctx) return false;
@@ -979,10 +931,13 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
         ggml_tensor * t_x = tower_buf.view(mctx, N, 0);   // device-side, no host round trip
         ggml_tensor * x = t_x;
 
+        bool sinks_ready = false;
         auto run_merger = [&](const char * out_name) -> bool {
-            if (!dump_dir.empty()) {
+            if (!dump_dir.empty() && !sinks_ready) {
                 static const char * const dump_names[] = { "v_merge", "v_proj_out", nullptr };
                 vqa::dump::mark_sinks(mctx, mgf, dump_names);
+                vqa::dump::finalize_sinks(mctx, mgf, backend);
+                sinks_ready = true;
             }
             if (!ggml_gallocr_alloc_graph(allocr, mgf)) {
                 fprintf(stderr, "merger graph allocation failed\n");
@@ -1059,6 +1014,9 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
 // ---------------------------------------------------------------- text// ---------------------------------------------------------------- text
 bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all,
                                const std::vector<BatGroup> * bat_groups) {
+    // a new graph invalidates the previous dump registry (its sink buffers are
+    // freed here, so a stale entry can never be read as a live tensor)
+    if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
@@ -1219,6 +1177,7 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
             "t_l0_out", "t_final_norm", nullptr,
         };
         vqa::dump::mark_sinks(g.ctx, g.gf, dump_names);
+        vqa::dump::finalize_sinks(g.ctx, g.gf, backend);   // keep nodes at the graph tail
     }
     return true;
 }

@@ -43,6 +43,7 @@
 #include "backend.hpp"
 #include "ggml_dump.hpp"
 #include "gguf_util.hpp"
+#include "weight_load.hpp"
 #include "videomae_preprocess.hpp"
 #include "vit_block.hpp"
 #include "vqa_util.hpp"
@@ -217,35 +218,15 @@ bool VideoMAE::load_weights(const char * path) {
         return false;
     }
 
-    const size_t data_off = gguf_get_data_offset(gu);
-    const int64_t nt = gguf_get_n_tensors(gu);
-    for (int64_t i = 0; i < nt; i++) {
-        const char * name = gguf_get_tensor_name(gu, i);
-        ggml_tensor * t = ggml_get_tensor(wctx, name);
-        if (!t) continue;
-        t->data = (char *)mm.ptr + data_off + gguf_get_tensor_offset(gu, i);
-    }
+    vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
     {
-        std::vector<std::pair<ggml_tensor *, const void *>> uploads;
-        size_t total = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
-            uploads.push_back({t, t->data});
-            total += ggml_nbytes(t);
-        }
-        if (ggml_backend_is_cpu(backend)) {
-            // every tensor lives in the mmap: one zero-copy buffer covers all of them
-            wbuf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
-            for (auto & u : uploads) u.first->buffer = wbuf;
-            fprintf(stderr, "weights: %.1f MB zero-copy from mmap\n", total / 1e6);
-        } else {
-            for (auto & u : uploads) u.first->data = nullptr;
-            wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
-            if (!wbuf) { fprintf(stderr, "weight allocation failed\n"); return false; }
-            for (auto & u : uploads) ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
-            fprintf(stderr, "uploaded %.1f MB of weights\n", total / 1e6);
-        }
+        // no host blocks (all tensors stay inside the mmap), so this is either one
+        // zero-copy CPU buffer or one device buffer + upload
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(wctx, backend, mm);
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
         if (!ggml_backend_is_cpu(backend)) mm.release();
     }
 
