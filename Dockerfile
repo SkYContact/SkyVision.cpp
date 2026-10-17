@@ -39,10 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /src/SkyVision/build/vqa-cli /usr/local/bin/vqa-cli
 
-# bundled demo model (override the repo/rev to pin or to use a mirror)
+# bundled demo model (override the repo/rev to pin or to use a mirror).
+# ModelScope is the default: the same files are on the Hugging Face mirror
+# `SkyContact/SmolVLM-256M-GGUF`, pass
+#   --build-arg MODEL_BASE=https://huggingface.co --build-arg MODEL_REV=main
+# to pull from there instead.
+ARG MODEL_BASE=https://www.modelscope.cn/models
 ARG MODEL_REPO=SkyContact/SmolVLM-256M-GGUF
-ARG MODEL_REV=main
-ARG MODEL_BASE=https://huggingface.co
+ARG MODEL_REV=master
 RUN mkdir -p /models/smolvlm-256m && cd /models/smolvlm-256m \
     && curl -fsSL -o smolvlm-256m-q8_0.gguf \
          "${MODEL_BASE}/${MODEL_REPO}/resolve/${MODEL_REV}/smolvlm-256m-q8_0.gguf" \
