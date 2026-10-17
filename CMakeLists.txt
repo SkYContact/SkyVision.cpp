@@ -154,9 +154,7 @@ add_executable(vqa-cli
     ${MOSS_VL_SRC}
     ${VIDEOMAE_SRC}
     ${QWEN2VL_SRC}
-    ${SMOLVLM_SRC})
-target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
+    ${SMOLVLM_SRC}
     ${MAGE_VL_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${MAGE_INC})
