@@ -149,13 +149,6 @@ int main(int argc, char ** argv) {
     if (serve_port > 0) {
         const std::string dir = models_dir.empty() ? "." : models_dir;
         return vqa::run_web_ui(serve_port, dir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
-        {
-            // model discovery scans <models_dir>/*.gguf: prefer ./models (the
-            // usual checkout layout), fall back to the cwd
-            const char * mdir = "models";
-            if (FILE * f = fopen("models/.", "rb")) fclose(f); else mdir = ".";
-            return vqa::run_web_ui(serve_port, mdir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
-        }
     }
 
     if (model_path.empty()) { usage(); return 2; }
