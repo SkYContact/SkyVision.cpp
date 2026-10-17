@@ -288,11 +288,64 @@ private:
     int id_im_start = 151644, id_im_end = 151645, id_eos = 151645, id_endoftext = 151643;
     int id_silence = -1;
     // live realtime session state (ask_session): text KV keeps growing via
-    // n_past/rope_delta, cross-KV rows via sess_vrows
+    // n_past/rope_delta, cross-KV rows via sess_vrows.
+    // Long streams evict: the self KV keeps a pinned sink prefix (StreamingVLM
+    // trick) plus a sliding window - rows are physically memmoved down and
+    // sess_rdelta absorbs the shift, so every surviving row keeps its original
+    // MRoPE position (attention only cares about relative distance). The cross
+    // KV compacts the same way: old frames' rows drop, kept rows stay at their
+    // projected vision-mrope positions.
     bool sess_active = false;
     int sess_vrows = 0;
+    int sess_rdelta = 0;   // pos = slot + sess_rdelta for the newest KV rows
+    int sess_nsink = 0;    // pinned self-KV prefix (slots [0, sess_nsink))
     PromptPlan sess_plan;
     int id_time_start = 151669, id_time_end = 151670;
+
+    // memmove `rows` KV rows from `src` down to `dst` in one F16 [D, n_ctx] cache
+    void kv_shift_rows(ggml_tensor * t, int src, int dst, int rows) {
+        if (rows <= 0 || src == dst) return;
+        const size_t rb = (size_t)t->ne[0] * sizeof(ggml_fp16_t);
+        std::vector<uint8_t> tmp((size_t)rows * rb);
+        ggml_backend_tensor_get(t, tmp.data(), (size_t)src * rb, tmp.size());
+        ggml_backend_tensor_set(t, tmp.data(), (size_t)dst * rb, tmp.size());
+    }
+
+    // make room for `need` new self-KV slots: evict the oldest rows after the
+    // sink prefix. Returns false when even a full eviction cannot fit `need`.
+    bool session_compact_self(int need) {
+        if (n_past + need <= n_ctx) return true;
+        const int needed_free = n_past + need - n_ctx;
+        const int recent_floor = 256;                      // never evict into the live window
+        const int evictable = n_past - sess_nsink - recent_floor;
+        if (evictable < needed_free) return false;
+        const int evict = std::min(evictable, (needed_free + 127) / 128 * 128);
+        for (int li = 0; li < kv.n_layer; li++) {
+            kv_shift_rows(kv.k[li], sess_nsink + evict, sess_nsink, n_past - sess_nsink - evict);
+            kv_shift_rows(kv.v[li], sess_nsink + evict, sess_nsink, n_past - sess_nsink - evict);
+        }
+        n_past -= evict;
+        sess_rdelta += evict;   // surviving rows keep their absolute MRoPE positions
+        fprintf(stderr, "session: evicted %d self-KV rows (sink %d, live %d)\n",
+                evict, sess_nsink, n_past);
+        return true;
+    }
+
+    // make room for `need` new cross-KV rows: drop the oldest frames' rows.
+    bool session_compact_cross(int need) {
+        if (sess_vrows + need <= xctx) return true;
+        const int needed_free = sess_vrows + need - xctx;
+        const int evictable = sess_vrows - 128;            // keep at least one frame's worth
+        if (evictable < needed_free) return false;
+        const int evict = std::min(evictable, (needed_free + 127) / 128 * 128);
+        for (size_t li = 0; li < xkv.k.size(); li++) {
+            kv_shift_rows(xkv.k[li], evict, 0, sess_vrows - evict);
+            kv_shift_rows(xkv.v[li], evict, 0, sess_vrows - evict);
+        }
+        sess_vrows -= evict;
+        fprintf(stderr, "session: evicted %d cross-KV rows (%d live)\n", evict, sess_vrows);
+        return true;
+    }
 
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 };
@@ -1528,6 +1581,14 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
                             std::chrono::steady_clock::now() - t1).count() : 0.0);
     sess_plan = plan;      // snapshot for a session started on top of this ask
     sess_vrows = plan.n_vtot;
+    sess_rdelta = plan.rope_delta;
+    {
+        // pinned sink prefix: the chat-template head of turn 1 (StreamingVLM's
+        // attention-sink idea). MOSS_RT_SINK overrides, 0 disables.
+        int s = 64;
+        if (const char * e = getenv("MOSS_RT_SINK")) s = atoi(e);
+        sess_nsink = std::max(0, std::min(s, (int)plan.ids.size() / 2));
+    }
     return true;
 }
 
@@ -1581,13 +1642,28 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
         text += "<|vision_end|>";
     }
 
-    // 3. plan the segment against the live caches
+    // 3. plan the segment against the live caches, then make room:
+    //    evict self-KV (sink + sliding window) and cross-KV rows as needed.
+    //    plan_from_text is cheap (tokenize + index bookkeeping), so plan ->
+    //    compact -> re-plan is fine.
     PromptPlan seg;
-    const int pos_base = n_past + sess_plan.rope_delta;   // mrope pos of slot n_past
+    const int pos_base = n_past + sess_rdelta;           // mrope pos of slot n_past
     if (!plan_from_text(text, grids, seg, pos_base, n_past, sess_vrows)) return false;
-    if (seg.n_vtot + gp.max_tokens + n_past + (int)seg.ids.size() > n_ctx) {
-        fprintf(stderr, "session context overflow (%d used)\n", n_past + (int)seg.ids.size());
+    if (!session_compact_self((int)seg.ids.size() + gp.max_tokens + 64)) {
+        fprintf(stderr, "session context overflow (%d used, sink %d)\n", n_past, sess_nsink);
         return false;
+    }
+    if (n_past != pos_base - sess_rdelta) {              // compaction moved the slots
+        if (!plan_from_text(text, grids, seg, n_past + sess_rdelta, n_past, sess_vrows))
+            return false;
+    }
+    if (!session_compact_cross(seg.n_vtot - sess_vrows)) {   // incremental rows only
+        fprintf(stderr, "session cross-KV overflow (%d rows)\n", sess_vrows);
+        return false;
+    }
+    if (seg.n_vtot != sess_vrows) {                      // cross rows were evicted
+        if (!plan_from_text(text, grids, seg, n_past + sess_rdelta, n_past, sess_vrows))
+            return false;
     }
 
     // 4. project the new frames' cross-KV rows (appended after the old ones)
@@ -1663,6 +1739,7 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
     // carry the session forward: decode positions continue via seg.rope_delta
     sess_plan = seg;
     sess_vrows = seg.n_vtot;
+    sess_rdelta = seg.rope_delta;
     return true;
 }
 
