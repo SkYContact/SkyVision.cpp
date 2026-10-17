@@ -41,6 +41,10 @@ RUN git clone --depth 1 --branch ${GGML_REF} https://github.com/ggml-org/ggml sr
 # BUILD_SHARED_LIBS=OFF matters for the runtime stage: a dynamically linked
 # vqa-cli dies with "cannot open shared object file libggml.so" (exit 127)
 # inside an image that only copies the binary.
+#
+# GGML_NATIVE=OFF pins the ISA to the flags below instead of -march=native: a
+# native build sampled the CI runner's CPU (AVX512 included) and could SIGILL on
+# a machine that does not have it.
 RUN --mount=type=cache,target=/ccache \
     CCACHE_DIR=/ccache \
     cmake -S src -B build -G Ninja \
@@ -49,7 +53,7 @@ RUN --mount=type=cache,target=/ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF \
         -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_OPENMP=OFF \
-        -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+        -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
  && cmake --build build --target ggml ggml-base ggml-cpu \
  && for f in libggml.a libggml-base.a libggml-cpu.a; do \
         test -f "build/src/$f" || { echo "missing build/src/$f"; ls -l build/src; exit 1; }; \
