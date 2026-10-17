@@ -375,6 +375,24 @@ Parity: `python scripts/ref_smolvlm.py --model models/smolvlm-256m --image photo
 resize), last-position logits corr **0.99991** (maxdiff 0.23) and a **byte-identical**
 answer (" There are five persons in the image.").
 
+Speed (CPU, 19 threads, f16 weights, the 960x504 sample):
+
+| setting | crops | end to end |
+|---|---|---|
+| `SMOLVLM_MAX_EDGE=2048` (the official preprocessing) | 4x3 tiles + global = 13 | 8.6 s |
+| **default (longest edge capped at 1024)** | 2x2 + global = 5 | **3.8 s** |
+| `SMOLVLM_MAX_EDGE=512` | 1x1 + global = 2 | 1.6 s |
+
+All three give the same answer. The cost is entirely the tower's **full attention**:
+one 1024-token tile is 2*1024^2*64*12 ~ 1.6 GFLOP per layer, ~19 GFLOP over 12 layers,
+so time scales with the number of tiles.
+
+One counter-intuitive result worth recording: batching all tiles into a single forward
+(batch = crops) buys **nothing** on CPU (8.7 s -> 8.7 s) - it is FLOP bound, not launch
+bound. The batched form is kept anyway (it is what a GPU benefits from) and `--dump-dir`
+falls back to one crop at a time so the stage-by-stage comparison with the reference
+stays valid.
+
 Model weights follow their own licenses (moondream: the
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)) and are **not**
 distributed from this repository. The license explicitly allows quantization, conversion,

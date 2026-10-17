@@ -89,8 +89,8 @@ private:
 
     bool preprocess(const vqa::MediaInput & media, std::vector<std::vector<float>> & tiles,
                     int * gx, int * gy);
-    bool build_vision_graph();
-    bool run_vision(const std::vector<float> & patches, std::vector<float> & feats);
+    bool build_vision_graph(int n_batch);
+    bool run_vision(const std::vector<std::vector<float>> & batch, std::vector<float> & feats);
     bool encode_image(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tiles,
                       int * gx, int * gy);
 
@@ -134,6 +134,7 @@ private:
     ggml_context * vctx = nullptr;
     ggml_cgraph * vgf = nullptr;
     ggml_tensor *v_in = nullptr, *v_feats = nullptr;
+    int v_batch = 0;      // crops currently baked into the vision graph
 
     vqa::KvCache kv;
     int n_past = 0;
@@ -287,26 +288,34 @@ bool SmolVLM::load(const std::string & gguf_path, const std::string & tokenizer_
 
 // ---------------------------------------------------------------- vision
 
-bool SmolVLM::build_vision_graph() {
+// The whole crop set goes through ONE graph: the batch dimension is the crop, so
+// a 13-crop image is a single compute instead of 13 sequential ones (the matmuls
+// and the attention then have B times the work per launch, which is what the CPU
+// backend wants; the FLOPs themselves are unchanged).
+bool SmolVLM::build_vision_graph(int n_batch) {
     if (vctx) { ggml_free(vctx); vctx = nullptr; }
+    const int B = std::max(1, n_batch);
     const int P = v_patch;
     const int n_patch = (v_tile / P) * (v_tile / P);     // 32x32 = 1024
     const int C3 = 3 * P * P;
+    const int side = v_tile / P;
+    const int nm = side / v_merge;
+    const int E = v_embd;
 
-    struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    struct ggml_init_params ip = { 1024ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     vctx = ggml_init(ip);
     if (!vctx) return false;
     vgf = ggml_new_graph_custom(vctx, 32768, false);
 
-    v_in = ggml_new_tensor_2d(vctx, GGML_TYPE_F32, C3, n_patch);
+    v_in = ggml_new_tensor_3d(vctx, GGML_TYPE_F32, C3, n_patch, B);
     ggml_set_name(v_in, "v_patches");
 
-    ggml_tensor * x = ggml_mul_mat(vctx, v_patch_w, v_in);
-    x = ggml_add(vctx, x, v_patch_b);
-    x = ggml_add(vctx, x, v_pos);
+    ggml_tensor * x = ggml_mul_mat(vctx, v_patch_w, v_in);   // [E, n_patch, B]
+    x = ggml_add(vctx, x, v_patch_b);                        // [E] broadcasts
+    x = ggml_add(vctx, x, v_pos);                            // [E, n_patch] broadcasts
     ggml_set_name(x, "v_patch_out");
 
-    const int hd = v_embd / v_head;
+    const int hd = E / v_head;
     for (int il = 0; il < v_layer; il++) {
         VisLayer & L = vl[(size_t)il];
         ggml_tensor * h = ggml_norm(vctx, x, v_eps);
@@ -318,15 +327,17 @@ bool SmolVLM::build_vision_graph() {
         ggml_tensor * v = ggml_add(vctx, ggml_mul_mat(vctx, L.wv, h), L.bv);
         if (il == 0) { ggml_set_name(q, "v_blk0_q"); ggml_set_name(k, "v_blk0_k"); }
 
+        // [hd, n_patch, head, B] - the batch is the trailing dim for flash attention
         ggml_tensor * qf = ggml_cont(vctx, ggml_permute(vctx,
-            ggml_reshape_3d(vctx, q, hd, v_head, n_patch), 0, 2, 1, 3));   // [hd, n, head]
+            ggml_reshape_4d(vctx, q, hd, v_head, n_patch, B), 0, 2, 1, 3));
         ggml_tensor * kf = ggml_cont(vctx, ggml_permute(vctx,
-            ggml_reshape_3d(vctx, k, hd, v_head, n_patch), 0, 2, 1, 3));
+            ggml_reshape_4d(vctx, k, hd, v_head, n_patch, B), 0, 2, 1, 3));
         ggml_tensor * vf = ggml_cont(vctx, ggml_permute(vctx,
-            ggml_reshape_3d(vctx, v, hd, v_head, n_patch), 0, 2, 1, 3));
+            ggml_reshape_4d(vctx, v, hd, v_head, n_patch, B), 0, 2, 1, 3));
         ggml_tensor * fa = ggml_flash_attn_ext(vctx, qf, kf, vf, nullptr,
                                                1.0f / sqrtf((float)hd), 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(vctx, ggml_cont(vctx, fa), v_embd, n_patch);
+        // FA returns [hd, head, n_patch, B]: (head, hd) is already token-major
+        ggml_tensor * attn = ggml_reshape_3d(vctx, ggml_cont(vctx, fa), E, n_patch, B);
         attn = ggml_add(vctx, ggml_mul_mat(vctx, L.wo, attn), L.bo);
         x = ggml_add(vctx, x, attn);
         if (il == 0) ggml_set_name(x, "v_blk0_attn_out");
@@ -346,17 +357,16 @@ bool SmolVLM::build_vision_graph() {
     x = ggml_add(vctx, x, v_post_b);
     ggml_set_name(x, "v_final");
 
-    // ---- 4x4 pixel shuffle (same op sequence llama.cpp uses for Idefics3)
-    const int side = v_tile / P;                       // 32
-    ggml_tensor * c = ggml_reshape_3d(vctx, x, v_embd, side, side);
-    c = ggml_reshape_3d(vctx, c, v_embd * v_merge, side / v_merge, side);
+    // ---- 4x4 pixel shuffle (llama.cpp's op sequence, batch kept last)
+    ggml_tensor * c = ggml_reshape_4d(vctx, x, E, side, side, B);
+    c = ggml_reshape_4d(vctx, c, E * v_merge, nm, side, B);
     c = ggml_permute(vctx, c, 0, 2, 1, 3);
-    c = ggml_cont_3d(vctx, c, v_embd * v_merge * v_merge, side / v_merge, side / v_merge);
+    c = ggml_cont_4d(vctx, c, E * v_merge * v_merge, nm, nm, B);
     c = ggml_permute(vctx, c, 0, 2, 1, 3);
-    c = ggml_cont_2d(vctx, c, c->ne[0], c->ne[1] * c->ne[2]);   // [12288, 64]
+    c = ggml_reshape_3d(vctx, ggml_cont(vctx, c), E * v_merge * v_merge, nm * nm, B);
     ggml_set_name(c, "v_shuffle");
 
-    ggml_tensor * m = ggml_mul_mat(vctx, v_proj, c);               // [576, 64]
+    ggml_tensor * m = ggml_mul_mat(vctx, v_proj, c);               // [576, 64, B]
     ggml_set_name(m, "v_feats");
     v_feats = m;
     ggml_build_forward_expand(vgf, m);
@@ -372,17 +382,20 @@ bool SmolVLM::build_vision_graph() {
         fprintf(stderr, "vision graph allocation failed\n");
         return false;
     }
+    v_batch = B;
     return true;
 }
 
-bool SmolVLM::run_vision(const std::vector<float> & patches, std::vector<float> & feats) {
-    ggml_backend_tensor_set(v_in, patches.data(), 0, sizeof(float) * patches.size());
+bool SmolVLM::run_vision(const std::vector<std::vector<float>> & batch,
+                         std::vector<float> & feats) {
+    std::vector<float> in;
+    for (const auto & c : batch) in.insert(in.end(), c.begin(), c.end());
+    ggml_backend_tensor_set(v_in, in.data(), 0, sizeof(float) * in.size());
     if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vision compute failed\n");
         return false;
     }
-    // parity: the reference exports the FIRST tile, and a per-step dump would be
-    // overwritten by the following tiles
+    // parity dumps only make sense for a single crop (the reference exports tile 0)
     if (!dump_dir.empty() && vis_runs == 0) {
         static const char * const dn[] = { "v_patches", "v_patch_out", "v_blk0_attn_out",
                                            "v_blk0_out", "v_final", "v_shuffle", "v_feats",
@@ -390,8 +403,10 @@ bool SmolVLM::run_vision(const std::vector<float> & patches, std::vector<float> 
         for (int i = 0; dn[i]; i++) dump(vgf, dn[i]);
     }
     vis_runs++;
-    const int n = (int)v_feats->ne[1], d = (int)v_feats->ne[0];
-    feats.resize((size_t)n * d);
+    const int d = (int)v_feats->ne[0];
+    const int per = (int)v_feats->ne[1];
+    const int n = (int)v_feats->ne[2];
+    feats.resize((size_t)n * per * d);
     ggml_backend_tensor_get(v_feats, feats.data(), 0, sizeof(float) * feats.size());
     return true;
 }
@@ -402,8 +417,17 @@ bool SmolVLM::preprocess(const vqa::MediaInput & media, std::vector<std::vector<
     const int w0 = media.width, h0 = media.height;
     const uint8_t * rgb = media.frames[0].rgb.data();
 
-    // step 1: longest edge -> v_longest (aspect preserved)
-    const double scale = (double)v_longest / (double)std::max(w0, h0);
+    // step 1: longest edge (aspect preserved). HF's processor always upscales to
+    // 2048, which turns a 320x240 photo into 12 crops for no information gain; the
+    // engine caps it at 1024 (<= 2x2 tiles + global) because every extra crop costs
+    // a full attention pass over 1024 tokens. Set SMOLVLM_MAX_EDGE=2048 to follow
+    // the official preprocessing exactly (slower, same answers in our tests).
+    int longest = std::min(v_longest, 1024);
+    if (const char * e = getenv("SMOLVLM_MAX_EDGE")) {
+        const int cap = atoi(e);
+        if (cap > 0) longest = cap;
+    }
+    const double scale = (double)longest / (double)std::max(w0, h0);
     int rw = std::max(1, (int)std::lround(w0 * scale));
     int rh = std::max(1, (int)std::lround(h0 * scale));
     std::vector<float> resized;
@@ -479,11 +503,18 @@ bool SmolVLM::encode_image(const vqa::MediaInput & media, std::vector<float> & f
                            int * n_tiles, int * gx, int * gy) {
     std::vector<std::vector<float>> tiles;
     if (!preprocess(media, tiles, gx, gy)) return false;
-    if (!build_vision_graph()) return false;
+    // one compute for the whole crop set; parity dumps need a single crop because
+    // the reference only exports tile 0
+    const int B = dump_dir.empty() ? (int)tiles.size() : 1;
     feats.clear();
-    std::vector<float> f;
-    for (size_t i = 0; i < tiles.size(); i++) {
-        if (!run_vision(tiles[i], f)) return false;
+    for (int off = 0; off < (int)tiles.size(); off += B) {
+        const int n = std::min(B, (int)tiles.size() - off);
+        std::vector<std::vector<float>> chunk(tiles.begin() + off, tiles.begin() + off + n);
+        if (!vgf || v_batch != n) {
+            if (!build_vision_graph(n)) return false;
+        }
+        std::vector<float> f;
+        if (!run_vision(chunk, f)) return false;
         feats.insert(feats.end(), f.begin(), f.end());
     }
     *n_tiles = (int)(tiles.size() - 1);     // the global view is not a tile

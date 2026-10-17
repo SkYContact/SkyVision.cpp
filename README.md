@@ -382,6 +382,18 @@ vqa-cli --model smolvlm-256m-f16.gguf --tokenizer models/smolvlm-256m \
 对拍：`python scripts/ref_smolvlm.py --model models/smolvlm-256m --image photo.jpg --out ref_smolvlm`，
 引擎 `--dump-dir ref_smolvlm` 跑同一输入。实测像素 corr **0.99997**（maxdiff 0.046，来自第二次缩放我们把中间结果取整回 u8）、last-token logits corr **0.99991**（maxdiff 0.23），**生成文本与官方逐字相同**（" There are five persons in the image."）。
 
+性能（CPU 19 线程，f16 权重，960×504 样图）：
+
+| 配置 | 图像块 | 端到端 |
+|---|---|---|
+| `SMOLVLM_MAX_EDGE=2048`（官方预处理原样） | 4×3 瓦片 + 全局 = 13 | 8.6 s |
+| **默认（长边上限 1024）** | 2×2 + 全局 = 5 | **3.8 s** |
+| `SMOLVLM_MAX_EDGE=512` | 1×1 + 全局 = 2 | 1.6 s |
+
+三档答案完全相同。开销几乎全在视觉塔的**全注意力**：一块 1024 token = 2·1024²·64·12 ≈ 1.6 GFLOP/层 × 12 层 ≈ 19 GFLOP，所以"块数"就是时间，`--dump-dir` 那种逐块模式并不会更慢。
+
+顺带记录一个反直觉的结论：把所有瓦片**批合并**成一次前向（batch = 块数）在 CPU 上**几乎没有收益**（8.7 s → 8.7 s）——瓶颈是 FLOP 不是调度，批合并只是少几次 launch；代码保留了批处理形式（GPU 上才有意义），并且 `--dump-dir` 时自动退化成单块以保证可与官方逐级对比。
+
 模型权重遵循各自的许可证（moondream 为
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。
 该许可明确允许量化、转换、再分发、自托管与商用集成；仅对公众开放的通用 moondream API
