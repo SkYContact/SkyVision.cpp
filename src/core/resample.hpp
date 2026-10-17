@@ -23,12 +23,12 @@ bool smart_resize(int height, int width, int factor, int min_pixels, int max_pix
 void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                               std::vector<float>& out);
 
-// Same, with a selectable kernel. HF stores `resample` as a PILImageResampling
-// value: 2 = BILINEAR, 3 = BICUBIC - so a checkpoint can ask for either.
+// Same, with a selectable kernel. `pil_resample` is HF's `resample` value (a
+// PILImageResampling enum): 1 = LANCZOS, 2 = BILINEAR, 3 = BICUBIC.
 // round_u8: torchvision resizes uint8 input to a uint8 output (float pipeline,
 // one rounding at the end); videomae/vivit preprocessors need it for exactness.
 void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
-                      std::vector<float>& out, bool bilinear = false, bool round_u8 = false);
+                      std::vector<float>& out, int pil_resample = 3, bool round_u8 = false);
 
 // Bilinear interpolation of a learned (side, side, dim) position table onto a
 // (gh, gw) grid: torch.linspace(0, side-1, g) endpoints, floor/ceil clipping.

@@ -547,7 +547,7 @@ bool Qwen25VL::encode_vision(const vqa::MediaInput & media, std::vector<float> &
     // patches (temporal tap duplicated, like the official processor)
     std::vector<float> resized;
     vqa::img::resize_antialias(media.frames[0].rgb.data(), media.width, media.height, rw, rh,
-                               resized, /*bilinear*/ false);
+                               resized, /*pil_resample=*/3);
     if (getenv("Q2V_DUMP_CACHE")) {   // raw resized RGB, for preprocessing debugging
         FILE * f = fopen((dump_dir + "/dbg_resized.bin").c_str(), "wb");
         if (f) { fwrite(resized.data(), sizeof(float), resized.size(), f); fclose(f); }

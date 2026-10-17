@@ -115,6 +115,7 @@ Model * create_qwen3_5();
 Model * create_moss_vl();
 Model * create_videomae();
 Model * create_qwen2vl();
+Model * create_smolvlm();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);

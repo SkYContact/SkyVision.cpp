@@ -73,6 +73,8 @@ Model * vqa_create_model(const std::string & arch) {
     if (arch == "qwen3_5" || arch == "marlin") return create_qwen3_5();   // marlin = legacy GGUF label
     if (arch == "moss_vl") return create_moss_vl();
     if (arch == "qwen2vl" || arch == "qwen2_5_vl") return create_qwen2vl();
+    // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk
+    if (arch == "smolvlm" || arch == "idefics3") return create_smolvlm();
     // video towers: labels or pooled embedding. ViViT is the same graph with a cls
     // token + learned position table, so it reuses the videomae backend.
     if (arch == "videomae" || arch == "vivit") return create_videomae();

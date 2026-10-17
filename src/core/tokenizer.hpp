@@ -21,9 +21,17 @@
 namespace vqa {
 
 enum class TokenizerMode {
-    PlainGpt2,   // moondream / starmie: whole-string BPE, no specials
-    Qwen2Regex,  // Qwen2/Qwen3 (VideoChat3): regex pre-tokenizer + added tokens
+    PlainGpt2,    // moondream / starmie: whole-string BPE, no specials
+    Qwen2Regex,   // Qwen2/Qwen3 (VideoChat3): regex pre-tokenizer + added tokens
+    Gpt2Regex,    // SmolLM2 (SmolVLM): Digits + ByteLevel/GPT-2 regex + added tokens
 };
+
+// which pre-tokenizer / added-token handling a backend's checkpoint needs
+inline TokenizerMode tokenizer_mode_for_arch(const std::string & arch) {
+    if (arch == "moondream3" || arch == "moondream") return TokenizerMode::PlainGpt2;
+    if (arch == "smolvlm") return TokenizerMode::Gpt2Regex;   // SmolLM2: Digits + ByteLevel
+    return TokenizerMode::Qwen2Regex;
+}
 
 struct Tokenizer {
     std::unordered_map<std::string, int> vocab;
@@ -34,6 +42,7 @@ struct Tokenizer {
 
     bool use_pretokenizer = false;
     bool use_added_tokens = false;
+    bool gpt2_pretok = false;   // Gpt2Regex: \s? prefix on words, no trailing CR/LF glue
 
     bool load(const char * tokenizer_json, TokenizerMode mode = TokenizerMode::PlainGpt2);
 

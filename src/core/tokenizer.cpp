@@ -49,8 +49,10 @@ static inline bool ascii_eq_ci(char a, char b) {
 
 // ---------------------------------------------------------------- pre-tokenizer
 // Byte length of the pre-token starting at text[pos], replicating the Rust
-// `regex` crate's leftmost-first alternation for the Qwen2 pattern.
-static size_t pretoken_len(const std::string & text, size_t pos) {
+// `regex` crate's leftmost-first alternation. `gpt2` selects the ByteLevel /
+// GPT-2 pattern used by SmolLM2 (SmolVLM) instead of the Qwen2 one; the two
+// differ in how a word run may be prefixed and in the CR/LF glue after punctuation.
+static size_t pretoken_len(const std::string & text, size_t pos, bool gpt2 = false) {
     const size_t n = text.size();
     const unsigned char * s = (const unsigned char *)text.data();
 
@@ -72,10 +74,14 @@ static size_t pretoken_len(const std::string & text, size_t pos) {
         }
     }
 
-    // alt 2: [^\r\n\p{L}\p{N}]? \p{L}+
+    // alt 2: Qwen2 `[^\r\n\p{L}\p{N}]? \p{L}+` / GPT-2 `\s? \p{L}+`
     {
         size_t j = pos;
-        if (cp0 != '\r' && cp0 != '\n' && !is_letter(cp0) && !is_number(cp0)) j = i;
+        if (gpt2) {
+            if (is_space(cp0)) j = i;            // only one whitespace char may prefix
+        } else if (cp0 != '\r' && cp0 != '\n' && !is_letter(cp0) && !is_number(cp0)) {
+            j = i;
+        }
         size_t k = j, nletters = 0;
         while (k < n) {
             size_t k2 = k;
@@ -102,7 +108,9 @@ static size_t pretoken_len(const std::string & text, size_t pos) {
             run++;
         }
         if (run > 0) {
-            while (k < n && (text[k] == '\r' || text[k] == '\n')) k++;
+            // Qwen2 glues trailing CR/LF onto a punctuation run; GPT-2 does not
+            if (!gpt2)
+                while (k < n && (text[k] == '\r' || text[k] == '\n')) k++;
             return k - pos;
         }
     }
@@ -134,8 +142,9 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
     if (!read_file(path, js)) { fprintf(stderr, "tokenizer.json not found: %s\n", path); return false; }
     init_byte_table();
 
-    use_pretokenizer = (mode == TokenizerMode::Qwen2Regex);
-    use_added_tokens = (mode == TokenizerMode::Qwen2Regex);
+    use_pretokenizer = (mode == TokenizerMode::Qwen2Regex || mode == TokenizerMode::Gpt2Regex);
+    use_added_tokens = use_pretokenizer;
+    gpt2_pretok = (mode == TokenizerMode::Gpt2Regex);
 
     // vocab
     size_t vp = js.find("\"vocab\"");
@@ -233,7 +242,8 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
 
     fprintf(stderr, "tokenizer: %zu tokens, %zu merges, %zu added (%s)\n",
             id_to_piece.size(), merge_rank.size(), added.size(),
-            mode == TokenizerMode::Qwen2Regex ? "qwen2 regex" : "plain gpt2");
+            mode == TokenizerMode::Qwen2Regex ? "qwen2 regex"
+            : mode == TokenizerMode::Gpt2Regex ? "gpt2 regex" : "plain gpt2");
     return !id_to_piece.empty();
 }
 
@@ -307,7 +317,7 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
                 if (p != std::string::npos && p < stop) stop = p;
             }
             while (i < stop) {
-                size_t n = use_pretokenizer ? pretoken_len(text, i) : (stop - i);
+                size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (stop - i);
                 if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
                 if (i + n > stop) n = stop - i;   // safe: added tokens start with ASCII
                 encode_piece(text.substr(i, n), out);
@@ -315,7 +325,7 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
             }
             continue;
         }
-        size_t n = use_pretokenizer ? pretoken_len(text, i) : (text.size() - i);
+        size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (text.size() - i);
         if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
         encode_piece(text.substr(i, n), out);
         i += n;

@@ -18,6 +18,7 @@
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 | **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
 | **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
+| **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 
 ## 当前状态
 
@@ -355,6 +356,31 @@ vqa-cli --model qwen2vl-f16.gguf --tokenizer models/qwen2.5-vl-3b \
 问答结果与官方一致（"There are five people in the image."）。调试开关：`Q2V_MAX_VLAYERS=N`
 截断视觉层数、`Q2V_FEATS=<file>` 直接用磁盘上的特征（隔离塔与文本侧）、`Q2V_DEBUG=1` 打印
 token 与首 token top5。
+
+### SmolVLM（最小可用后端）
+
+256M 的 Idefics3 模型，量化后 ~270 MB，适合塞进容器/CI 里当"永远能跑"的 demo：
+
+```bash
+python convert/convert_smolvlm.py --src models/smolvlm-256m        # → smolvlm-256m-f16.gguf（515MB）
+python convert/convert_smolvlm.py --src models/smolvlm-256m --outtype q8_0   # ~270MB
+vqa-cli --model smolvlm-256m-f16.gguf --tokenizer models/smolvlm-256m \
+        --image photo.jpg --ask "How many people are in the image?"
+```
+
+结构（都是实测的，不是照文档推的）：
+
+- **视觉塔**是 SigLIP-base：`Conv2d(3,768,16,16)` 折成一次 matmul（带 bias）、**学出来的 32×32 位置表**（无 cls）、12 层 **LayerNorm 带 bias** + 注意力 qkv/out 全带 bias（**没有 rope**）+ 普通 MLP（`gelu_pytorch_tanh`，不是 SwiGLU）
+- **连接器**是 4×4 pixel shuffle → 一次 `Linear(12288→576)`，所以每张 512² 瓦片恰好 64 个文本 token
+- **文本主干**是 SmolLM2-135M：30 层、d=576、9/3 heads、**所有投影都没有 bias**、RMSNorm eps 1e-5、rope theta 1e5、**lm_head 不共享**
+
+预处理照官方 Idefics3（这条最容易做错）：先把长边缩到 **2048**（不是 512），再把两边**补齐到 512 的倍数**（第二次缩放会拉伸、不保比例），切成 512² 瓦片（行优先），**最后追加一张整图的全局视图**；`<image>` 会展开成
+`<fake><row_R_col_C><image>×64`（每块）与结尾的 `<fake><global-img><image>×64<fake>`。960×504 的样图是 4×3 瓦片 + 全局 = **13 块 / 832 token**，与官方处理器逐项一致。
+
+分词器是 SmolLM2 的 `Digits + ByteLevel/GPT-2 regex`，为此给 `core/tokenizer` 加了第三种模式（`Gpt2Regex`）——和 Qwen 的差别在"标点能否前缀字母"和标点后是否吞 CR/LF；三种测试串（特殊 token / 缩略语 / 数字 / 制表符 / 多空格）与官方分词器**逐 id 相同**。
+
+对拍：`python scripts/ref_smolvlm.py --model models/smolvlm-256m --image photo.jpg --out ref_smolvlm`，
+引擎 `--dump-dir ref_smolvlm` 跑同一输入。实测像素 corr **0.99997**（maxdiff 0.046，来自第二次缩放我们把中间结果取整回 u8）、last-token logits corr **0.99991**（maxdiff 0.23），**生成文本与官方逐字相同**（" There are five persons in the image."）。
 
 模型权重遵循各自的许可证（moondream 为
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。

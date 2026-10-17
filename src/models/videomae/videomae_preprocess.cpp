@@ -38,7 +38,7 @@ void preprocess_frame(const uint8_t * rgb, int w, int h, const PreConfig & pc, f
     std::vector<float> resized;
     // interleaved RGB, [0,255]; HF's `resample` is a PILImageResampling value
     vqa::img::resize_antialias(rgb, w, h, rw, rh, resized,
-                               /*bilinear=*/pc.resample == 2, /*round_u8=*/true);
+                               /*pil_resample=*/pc.resample, /*round_u8=*/true);
 
     const int oy = (rh - S) / 2, ox = (rw - S) / 2;
     for (int y = 0; y < S; y++) {

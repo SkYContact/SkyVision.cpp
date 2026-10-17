@@ -47,6 +47,16 @@ static inline double bilinear_aa(double x) {
     return x < 1.0 ? 1.0 - x : 0.0;
 }
 
+// PIL's LANCZOS kernel (a = 3): sinc(x) * sinc(x / 3)
+static inline double lanczos_aa(double x) {
+    const double ax = std::fabs(x);
+    if (ax < 1e-12) return 1.0;
+    if (ax >= 3.0) return 0.0;
+    constexpr double kPi = 3.14159265358979323846;   // M_PI is not defined on MSVC
+    const double px = kPi * ax;
+    return (std::sin(px) / px) * (std::sin(px / 3.0) / (px / 3.0));
+}
+
 struct Filter {
     int start = 0;              // first source index
     std::vector<double> w;      // weights
@@ -54,10 +64,10 @@ struct Filter {
 
 // builds the antialias filter bank for one axis (PIL semantics: the support is
 // widened by the downscale factor, which is what makes it antialiased)
-static void build_aa_filters(int in, int out, std::vector<Filter>& fs, bool bilinear = false) {
+static void build_aa_filters(int in, int out, std::vector<Filter>& fs, int pil_resample = 3) {
     const double scale = (double)in / (double)out;
     const double filterscale = std::max(1.0, scale);
-    const double support = (bilinear ? 1.0 : 2.0) * filterscale;
+    const double support = (pil_resample == 1 ? 3.0 : pil_resample == 2 ? 1.0 : 2.0) * filterscale;
     fs.resize(out);
     for (int o = 0; o < out; o++) {
         const double center = ((double)o + 0.5) * scale;
@@ -71,7 +81,8 @@ static void build_aa_filters(int in, int out, std::vector<Filter>& fs, bool bili
         double sum = 0.0;
         for (int x = xmin; x < xmax; x++) {
             double t = ((double)x - center + 0.5) / filterscale;
-            double w = bilinear ? bilinear_aa(t) : bicubic_aa(t);
+            double w = pil_resample == 1 ? lanczos_aa(t)
+                       : pil_resample == 2 ? bilinear_aa(t) : bicubic_aa(t);
             f.w[x - xmin] = w;
             sum += w;
         }
@@ -80,10 +91,10 @@ static void build_aa_filters(int in, int out, std::vector<Filter>& fs, bool bili
 }
 
 void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
-                      std::vector<float>& out, bool bilinear, bool round_u8) {
+                      std::vector<float>& out, int pil_resample, bool round_u8) {
     std::vector<Filter> fh, fv;
-    build_aa_filters(sw, dw, fh, bilinear);
-    build_aa_filters(sh, dh, fv, bilinear);
+    build_aa_filters(sw, dw, fh, pil_resample);
+    build_aa_filters(sh, dh, fv, pil_resample);
 
     // horizontal pass: (sw,sh) -> (dw,sh), float
     std::vector<float> tmp((size_t)dw * sh * 3);
@@ -136,7 +147,7 @@ void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
 
 void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                               std::vector<float>& out) {
-    resize_antialias(src, sw, sh, dw, dh, out, /*bilinear*/ false);
+    resize_antialias(src, sw, sh, dw, dh, out, /*pil_resample=*/3);
 }
 
 // ---------------------------------------------------------------- pos table

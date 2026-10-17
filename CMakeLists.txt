@@ -78,6 +78,10 @@ set(VIDEOMAE_SRC
 set(QWEN2VL_SRC
     src/models/qwen2vl/qwen2vl_model.cpp)
 
+#   src/models/smolvlm/      SmolVLM / Idefics3 backend (SigLIP + SmolLM2)
+set(SMOLVLM_SRC
+    src/models/smolvlm/smolvlm_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -89,7 +93,8 @@ add_executable(vqa-cli
     ${QWEN35_SRC}
     ${MOSS_VL_SRC}
     ${VIDEOMAE_SRC}
-    ${QWEN2VL_SRC})
+    ${QWEN2VL_SRC}
+    ${SMOLVLM_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
 

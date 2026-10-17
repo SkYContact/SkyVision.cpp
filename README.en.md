@@ -38,6 +38,7 @@ needed to run it.
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
+| SmolVLM-256M (Idefics3) | ✅ arch `smolvlm`, the smallest backend here: SigLIP-base tower (12L, patch 16, 512², learned positions, LayerNorm/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30L, no biases, GQA 9:3, rope 1e5). Idefics3 preprocessing: longest edge 2048 → pad to multiples of 512 → 512² tiles + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8. Logits corr 0.99991 and byte-identical answers |
 
 ## Quick start
 
@@ -329,6 +330,50 @@ first token matches the official argmax and the answer matches too
 ("There are five people in the image."). Debug knobs: `Q2V_MAX_VLAYERS=N` truncates the tower,
 `Q2V_FEATS=<file>` feeds features from disk (isolates tower vs text), `Q2V_DEBUG=1` prints tokens
 and the first-token top-5.
+
+### SmolVLM (the smallest backend)
+
+A 256M Idefics3 model, ~270 MB quantized - small enough to ship inside a container
+image so "it always runs" (CI, demos, an MCP server that must answer without weights
+mounted):
+
+```bash
+python convert/convert_smolvlm.py --src models/smolvlm-256m                  # -> f16, 515 MB
+python convert/convert_smolvlm.py --src models/smolvlm-256m --outtype q8_0   # -> q8, ~270 MB
+vqa-cli --model smolvlm-256m-f16.gguf --tokenizer models/smolvlm-256m \
+        --image photo.jpg --ask "How many people are in the image?"
+```
+
+What it actually is (measured from the checkpoint, not assumed):
+
+- the tower is SigLIP-base: `Conv2d(3,768,16,16)` folded into one matmul (with bias), a
+  **learned 32×32 position table** (no cls), 12 layers of **LayerNorm with bias** +
+  attention with bias on qkv/out (**no rope**) + a plain MLP (`gelu_pytorch_tanh`, not
+  SwiGLU);
+- the connector is a 4×4 pixel shuffle followed by one `Linear(12288→576)`, so a
+  512×512 tile becomes exactly 64 text tokens;
+- the trunk is SmolLM2-135M: 30 layers, d=576, 9/3 heads, **no biases anywhere**,
+  RMSNorm 1e-5, rope theta 1e5 and an **untied** lm_head.
+
+Idefics3 preprocessing is the easy thing to get wrong: resize the longest edge to
+**2048** (not 512), then resize again so both sides are multiples of 512 (this second
+pass does not preserve the aspect ratio), cut 512² tiles row-major and **append one
+global view** of the whole image last; `<image>` expands into
+`<fake><row_R_col_C><image>×64` per tile plus `<fake><global-img><image>×64<fake>` at
+the end. The 960×504 sample becomes 4×3 tiles + global = **13 crops / 832 tokens**,
+matching the official processor item by item.
+
+The tokenizer is SmolLM2's `Digits + ByteLevel/GPT-2 regex`, which is why
+`core/tokenizer` grew a third mode (`Gpt2Regex`); it differs from the Qwen pattern in
+whether punctuation may prefix a word run and whether CR/LF glues to punctuation.
+Three test strings (specials, contractions, digits, tabs, repeated spaces) tokenize
+**identically** to the official tokenizer.
+
+Parity: `python scripts/ref_smolvlm.py --model models/smolvlm-256m --image photo.jpg
+--out ref_smolvlm` plus the engine with `--dump-dir ref_smolvlm`. Measured: pixels corr
+**0.99997** (maxdiff 0.046, from rounding the intermediate back to u8 before the second
+resize), last-position logits corr **0.99991** (maxdiff 0.23) and a **byte-identical**
+answer (" There are five persons in the image.").
 
 Model weights follow their own licenses (moondream: the
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)) and are **not**

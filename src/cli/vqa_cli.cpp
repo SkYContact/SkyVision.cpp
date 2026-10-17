@@ -184,9 +184,8 @@ int main(int argc, char ** argv) {
     if (dump_ids) {   // tokenizer self test: no model load needed
         std::vector<int> ids;
         std::string dec;
-        const bool md = (arch == "moondream3" || arch == "moondream");
         if (!vqa::debug_tokenize(tok_path.c_str(), ask_text, ids, dec,
-                                 md ? vqa::TokenizerMode::PlainGpt2 : vqa::TokenizerMode::Qwen2Regex)) {
+                                 vqa::tokenizer_mode_for_arch(arch))) {
             fprintf(stderr, "tokenizer failed\n");
             return 4;
         }
