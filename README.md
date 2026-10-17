@@ -7,6 +7,11 @@
 
 [English](README.en.md)
 
+也可以用 **MCP（Model Context Protocol）服务器**的方式跑：`vqa-cli --mcp` 把同一套引擎包成
+stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目标检测 / 定位 / 注视点 / 视频问答 /
+视频分类 / 模型管理），仓库自带 `Dockerfile`，镜像内置 403MB 的 SmolVLM，**不挂载任何权重也能
+开箱回答"这张图里有什么"**。见 [MCP 服务器](#4-mcp-服务器给-agent-用) 一节。
+
 ## 支持的后端
 
 | 后端 | 架构标签 | 输入 | 说明 |
@@ -213,6 +218,9 @@ docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
 
 **完全没有权重时**它也不会崩：`initialize` / `tools/list` / `list_models`（返回空列表）
 都正常应答 —— 这正是目录爬虫、CI 冒烟测试和 MCP 平台审核所做的事。
+
+内置权重默认从 Hugging Face 的 `SkyContact/SmolVLM-256M-GGUF` 拉取（魔搭有同款镜像），
+换源或固定版本用 `--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`。
 
 | 工具 | 说明 |
 |---|---|

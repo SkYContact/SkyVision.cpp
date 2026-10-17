@@ -8,6 +8,12 @@ needed to run it.
 
 [中文](README.md)
 
+It also runs as an **MCP (Model Context Protocol) server**: `vqa-cli --mcp` exposes the same
+engine over stdio JSON-RPC with 9 tools (image Q&A, captioning, object detection / pointing,
+gaze, video Q&A, video classification, model management). The repository ships a `Dockerfile`
+whose image bundles a 403 MB SmolVLM, so it answers "what is in this image" out of the box
+with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
+
 ## Supported backends
 
 | Backend | Architecture tag | Input | Notes |
@@ -186,6 +192,10 @@ the official processor upscales to 2048, which costs 2.3x more for the same answ
 An image with **no** weights still answers `initialize`, `tools/list` and `list_models`
 (empty list) instead of failing — that is exactly what directory crawlers, CI smoke tests
 and the review step of an MCP registry exercise.
+
+The bundled checkpoint is pulled from `SkyContact/SmolVLM-256M-GGUF` on Hugging Face
+(mirrored on ModelScope); pin or switch sources with
+`--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`.
 
 | Tool | What it does |
 |---|---|
