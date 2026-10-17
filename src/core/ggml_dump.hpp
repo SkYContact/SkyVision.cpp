@@ -23,6 +23,8 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 
@@ -40,7 +42,26 @@ inline std::vector<std::pair<std::string, ggml_tensor *>> & dump_registry() {
     return reg;
 }
 
-inline void dump_registry_clear() { dump_registry().clear(); }
+// sink dup tensors live in private contexts whose buffers come from
+// ggml_backend_alloc_ctx_tensors (NOT the gallocr pool). A dup output inside
+// the pool is a graph leaf nothing consumes, so gallocr frees its memory the
+// moment the dup executes and later nodes overwrite it -> the file written
+// after compute contains another node's data (repro'd: dup(xkv_knorm) shared
+// an address with dup(v_patch_out)). Pre-allocated tensors are skipped by
+// gallocr (treated like weights), so the copied value survives the graph.
+inline std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> & sink_pool() {
+    static std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> v;
+    return v;
+}
+
+inline void dump_registry_clear() {
+    dump_registry().clear();
+    for (auto & p : sink_pool()) {
+        if (p.second) ggml_backend_buffer_free(p.second);
+        if (p.first) ggml_free(p.first);
+    }
+    sink_pool().clear();
+}
 
 // sink names are REGISTERED as the graph is built and only attached at the
 // very end (finalize_sinks). Attaching a keep node mid-build lets gallocr
@@ -61,8 +82,10 @@ inline void mark_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * const 
 // call ONCE per graph, after the build is complete and BEFORE
 // ggml_gallocr_alloc_graph: resolves pending names and appends the keep
 // nodes at the true tail of the graph.
-inline void finalize_sinks(ggml_context * ctx, ggml_cgraph * gf) {
-    if (!ctx || !gf) { pending_sinks().clear(); return; }
+inline void finalize_sinks(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_t backend) {
+    if (!ctx || !gf || pending_sinks().empty()) { pending_sinks().clear(); return; }
+    ggml_context * sctx = ggml_init({ 128ull << 20, nullptr, true });
+    size_t ndup = 0;
     for (const std::string & want : pending_sinks()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (!t->name[0] || strcmp(t->name, want.c_str())) continue;
@@ -70,14 +93,28 @@ inline void finalize_sinks(ggml_context * ctx, ggml_cgraph * gf) {
             // gallocr (repro: values overwritten mid-graph). Force a real
             // value copy into a fresh tensor - its buffer is owned by the
             // dump alone.
-            ggml_tensor * dup = ggml_dup(ctx, t);
+            ggml_tensor * dup = ggml_dup(sctx, t);
             ggml_set_name(dup, "dump_sink");
             ggml_build_forward_expand(gf, dup);
             dump_registry().push_back({want, dup});
+            ndup++;
             break;
         }
     }
     pending_sinks().clear();
+    if (ndup) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(sctx, backend);
+        if (!buf) { fprintf(stderr, "dump: sink buffer alloc failed\n"); }
+        sink_pool().push_back({ sctx, buf });
+    } else {
+        ggml_free(sctx);
+    }
+}
+
+// compat overload (standalone CPU probes)
+inline void finalize_sinks(ggml_context * ctx, ggml_cgraph * gf) {
+    static ggml_backend_t sink_cpu = ggml_backend_cpu_init();
+    finalize_sinks(ctx, gf, sink_cpu);
 }
 
 // registry-first tensor lookup (falls back to graph name lookup)
