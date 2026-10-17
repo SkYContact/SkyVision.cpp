@@ -1,10 +1,23 @@
 // moondream_vqa_adapter.inc - vqa::Model adapter for the moondream3.1 engine.
 // Included from moondream.cpp AFTER Engine/VisionModel/RegionModel and AFTER
-// moondream_server.inc (whose static helpers - caption templates, detect/point/
-// gaze, image prefill with KV-prefix caching - are reused verbatim), so the
-// unified front end (vqa-cli, Web UI) can drive this backend like any other.
+// moondream_skills.inc (whose static helpers - detect/point/gaze and the image
+// prefill with KV-prefix caching - are reused verbatim), so the unified front end
+// (vqa-cli, Web UI) can drive this backend like any other: there is no separate
+// moondream binary or HTTP server any more.
 
 namespace {
+
+// side models default to the checkpoint's own directory, then to the CWD
+static std::string md_side_model(const std::string & gguf_path, const std::string & given,
+                                 const char * name) {
+    if (!given.empty()) return given;
+    const size_t slash = gguf_path.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        const std::string p = gguf_path.substr(0, slash) + "/" + name;
+        if (FILE * f = fopen(p.c_str(), "rb")) { fclose(f); return p; }
+    }
+    return name;
+}
 
 struct MoondreamModel : vqa::Model {
     Engine e;
@@ -18,15 +31,15 @@ struct MoondreamModel : vqa::Model {
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override {
         if (!e.init(gguf_path.c_str(), tokenizer_path.c_str(), opt.n_ctx > 0 ? std::min(opt.n_ctx, 2048) : 1024))
             return false;
-        const char * vp = opt.vision_path.empty() ? "moondream3.1-vision.gguf" : opt.vision_path.c_str();
-        vm_ok = vm.load(vp, e.backend);
+        const std::string vp = md_side_model(gguf_path, opt.vision_path, "moondream3.1-vision.gguf");
+        vm_ok = vm.load(vp.c_str(), e.backend);
         if (!vm_ok) {
             ggml_backend_t cpu_be = ggml_backend_cpu_init();
-            vm_ok = vm.load(vp, cpu_be);
+            vm_ok = vm.load(vp.c_str(), cpu_be);
         }
-        if (!vm_ok) fprintf(stderr, "moondream adapter: vision model failed to load\n");
-        const char * rp = opt.region_path.empty() ? "moondream3.1-region.gguf" : opt.region_path.c_str();
-        rm_ok = rm.load(rp);
+        if (!vm_ok) fprintf(stderr, "moondream: vision model failed to load (%s)\n", vp.c_str());
+        const std::string rp = md_side_model(gguf_path, opt.region_path, "moondream3.1-region.gguf");
+        rm_ok = rm.load(rp.c_str());
         caps_.image = true;
         caps_.video = false;
         return true;
@@ -35,8 +48,7 @@ struct MoondreamModel : vqa::Model {
     const vqa::Capabilities & caps() const override { return caps_; }
     const char * name() const override { return "moondream3.1"; }
 
-    // text-only batched decoding (moondream_batch.inc); the unified CLI drives
-    // moondream through its own entry point, this keeps the adapter usable too
+    // text-only batched decoding (moondream_batch.inc)
     int run_batch(const std::string & path, int n_gen) override {
         return ::run_batch(e, path.c_str(), e.n_ctx, n_gen);
     }

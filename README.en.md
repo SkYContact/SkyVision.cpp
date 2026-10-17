@@ -48,19 +48,19 @@ git clone https://github.com/SkYContact/SkyVision.cpp
 cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
-# Windows (MSVC + Ninja): builds vqa-cli and moondream-cli in one go
+# Windows (MSVC + Ninja)
 scripts\build-cuda.bat        # CUDA backend (defaults to sm_89 = Ada, override with CUDA_ARCH)
 scripts\build-vqa.bat         # CPU only
 scripts\build.bat             # CPU only, Visual Studio generator (artifacts in build\Release\)
 # or plain CMake:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
-cmake --build build --config Release --target vqa-cli moondream-cli
+cmake --build build --config Release --target vqa-cli
 ```
 
-`vqa-cli` is the architecture-dispatching front end; `moondream-cli` is the standalone
-moondream3.1 binary (it owns the web UI, batch mode and the skill flags). Both share the same
-engine code. In a CUDA build the engine prefers the GPU; `--cpu` (or `MD_CPU=1` for the
-moondream binary) forces the CPU backend.
+`vqa-cli` is the architecture-dispatching front end - **moondream3.1 included**: it has no
+standalone binary and no HTTP server of its own. Every capability (VQA, caption/detect/point/
+gaze/ask-think, batch, web UI) goes through `vqa::Model` like the other backends. In a CUDA
+build the engine prefers the GPU; `--cpu` (or `MD_CPU=1`) forces the CPU backend.
 
 ### 2. Get the weights
 
@@ -94,21 +94,17 @@ vqa-cli --model moondream3.1-q6k.gguf --tokenizer tokenizer.json \
         --vision moondream3.1-vision.gguf --region moondream3.1-region.gguf \
         --image photo.jpg --ask "What is in this image?" --n-ctx 1024
 
-# standalone moondream3.1 binary: skills, web UI, batch
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
-    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf \
-    -i photo.jpg -p "What is in this image?"
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
-    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf --serve   # http://127.0.0.1:8080
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
+# moondream3.1 is a normal backend: skills, batch and the web UI live in vqa-cli
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask "What is in this image?"
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask person --mode detect
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask normal --mode caption
+vqa-cli --model models/moondream3.1-q6k.gguf --batch prompts.txt
+vqa-cli --serve 8080
+# --vision/--region default to the moondream3.1-*.gguf siblings of the model file
 ```
 
-`vqa-cli` also drives moondream's own surface: `--batch` forwards to the engine's batched
-decoder, `--mode detect|point` map onto the engine's native `--detect/--point` flags,
-`--mode caption|gaze|ask-think` go through the `vqa::Model` adapter (the same path the web
-UI uses), `--threads/--dump-dir` are exported as the `MD_THREADS`/`MD_DUMP` variables the
-engine reads, and `--vision/--region` default to the `moondream3.1-*.gguf` siblings in the
-model's own directory.
+`--vision/--region` default to the `moondream3.1-*.gguf` siblings of the model file, so
+`--model models/moondream3.1-q6k.gguf` is enough for the skills too.
 
 Common `vqa-cli` flags: `--frames <dir> --fps 2` (video frames), `--temp/--top-k/--top-p`
 (sampling, greedy by default), `--max-tokens`, `--n-ctx`, `--threads`, `--cpu`,

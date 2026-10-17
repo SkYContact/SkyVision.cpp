@@ -14,6 +14,9 @@
   #define NOMINMAX
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #ifdef _MSC_VER
+    #pragma comment(lib, "ws2_32.lib")   // the server used to live in a moondream file that had this
+  #endif
 #else
   #include <arpa/inet.h>
   #include <netinet/in.h>

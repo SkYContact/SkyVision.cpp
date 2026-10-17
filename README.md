@@ -19,8 +19,9 @@
 
 ## 当前状态
 
-> moondream3.1 全部功能已就绪：文本 + 视觉 + 五个官方技能 + 嵌入式 Web UI + 批量推理
-> + 流式输出，CPU / CUDA 双后端。VideoChat3-4B 后端可用的部分见下方标注。
+> moondream3.1 全部功能已就绪：文本 + 视觉 + 五个官方技能 + Web UI + 批量推理 + 流式输出，
+> CPU / CUDA 双后端，且和其它后端一样只通过统一的 `vqa-cli` 驱动（没有专属二进制/接口）。
+> VideoChat3-4B 后端可用的部分见下方标注。
 
 | | |
 |---|---|
@@ -55,17 +56,18 @@ git clone https://github.com/SkYContact/SkyVision.cpp
 cd SkyVision.cpp
 git clone --depth 1 https://github.com/ggml-org/ggml
 
-# Windows（MSVC + Ninja）：一次构建 vqa-cli 与 moondream-cli
+# Windows（MSVC + Ninja）
 scripts\build-cuda.bat        # CUDA 后端（默认 sm_89=Ada，可用 CUDA_ARCH 覆盖）
 scripts\build-vqa.bat         # 仅 CPU
 scripts\build.bat             # 仅 CPU，改用 Visual Studio 生成器（产物在 build\Release\）
 # 手工 CMake：
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
-cmake --build build --config Release --target vqa-cli moondream-cli
+cmake --build build --config Release --target vqa-cli
 ```
 
-`vqa-cli` 是按架构分派的统一前端；`moondream-cli` 是 moondream3.1 的独立二进制
-（Web UI、批量推理等专属开关都在它上面）。两者共用同一套引擎代码。
+`vqa-cli` 是按架构分派的统一前端——**包括 moondream3.1**：它没有独立二进制，也没有自带
+HTTP server，全部能力（看图问答、caption/detect/point/gaze/ask-think、批量、Web UI）都通过
+`vqa::Model` 接口由同一个 `vqa-cli` 驱动。
 CUDA 构建下引擎默认优先使用 GPU，`--cpu`（或 moondream 的 `MD_CPU=1`）可强制 CPU。
 
 ### 2. 取权重
@@ -123,21 +125,14 @@ vqa-cli --model moondream3.1-q6k.gguf --tokenizer tokenizer.json \
 vqa-cli --model videomae-base-ft.gguf --video clip.mp4 --ask x --mode 5
 vqa-cli --model videomae-base.gguf    --video clip.mp4 --ask x --mode embed
 
-# moondream3.1 独立二进制：技能、Web UI、批量
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
-    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf \
-    -i photo.jpg -p "What is in this image?"
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
-    -v moondream3.1-vision.gguf --region moondream3.1-region.gguf --serve   # http://127.0.0.1:8080
-moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
-
-# 统一前端也能用这些：--batch 直通引擎的批处理；
-# --mode detect/point 走引擎原生标志（--detect/--point），
-# --mode caption/gaze/ask-think 走 vqa::Model 适配器（与 Web UI 同一条路径），
-# --threads / --dump-dir 会导出成引擎读取的 MD_THREADS / MD_DUMP 环境变量，
+# moondream3.1 就是一个普通后端：技能、批量、Web UI 全在 vqa-cli 上
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask "What is in this image?"
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask person  --mode detect
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask normal  --mode caption
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask "0.5,0.5" --mode gaze
+vqa-cli --model models/moondream3.1-q6k.gguf --batch prompts.txt      # 纯文本批量
+vqa-cli --serve 8080                                                  # 统一 Web UI
 # --vision/--region 省略时按模型所在目录找 moondream3.1-vision/-region.gguf
-vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask person --mode detect
-vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask normal --mode caption
 ```
 
 `vqa-cli` 常用开关：`--video <file> --fps 2 --max-frames 32`（内置视频：ffmpeg 管道解码 + qwen_vl_utils 式采样 n = min(duration×fps, max_frames)，超限自动全片均匀重采样）、`--frames <dir>`（预抽帧目录）、`--temp/--top-k/--top-p`（采样，默认贪心）、

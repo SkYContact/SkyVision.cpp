@@ -54,13 +54,6 @@ set(MOONDREAM_SRC
     src/models/moondream/moondream_preprocess.cpp
     src/models/moondream/moondream_region.cpp)
 
-# core pieces the moondream engine itself needs (no registry, no other backend)
-set(MOONDREAM_CORE_SRC
-    src/core/media_io.cpp
-    src/core/vqa_util.cpp
-    src/core/backend.cpp
-    src/core/tokenizer.cpp)
-
 set(VIDEOCHAT3_SRC
     src/models/videochat3/vc3_preprocess.cpp
     src/models/videochat3/vc3_model.cpp)
@@ -92,14 +85,6 @@ add_executable(vqa-cli
     ${VIDEOMAE_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
-
-# --- moondream3.1 standalone binary (same engine, its own argument surface) ---
-add_executable(moondream-cli
-    src/models/moondream/moondream_cli.cpp
-    ${MOONDREAM_SRC}
-    ${MOONDREAM_CORE_SRC})
-target_link_libraries(moondream-cli PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- vision encoder test target (milestone 6) ---
 add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)
