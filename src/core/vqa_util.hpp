@@ -45,6 +45,27 @@ struct MMap {
     bool map_file(const char * path);      // alias kept for readability
     void release();
     ~MMap() { release(); }
+
+    // move-only: the destructor unmaps, so a shallow copy would leave two
+    // owners and the first one to die unmaps the region out from under the
+    // other (hit as a zero-copy weight segfault in mage_vl's gate loader).
+    MMap() = default;
+    MMap(const MMap &) = delete;
+    MMap & operator=(const MMap &) = delete;
+    MMap(MMap && o) noexcept { steal(o); }
+    MMap & operator=(MMap && o) noexcept {
+        if (this != &o) { release(); steal(o); }
+        return *this;
+    }
+private:
+    void steal(MMap & o) {
+        ptr = o.ptr; size = o.size;
+#ifdef _WIN32
+        hfile = o.hfile; hmap = o.hmap;
+        o.hfile = nullptr; o.hmap = nullptr;
+#endif
+        o.ptr = nullptr; o.size = 0;
+    }
 };
 
 // whole-file read (returns empty on failure)
