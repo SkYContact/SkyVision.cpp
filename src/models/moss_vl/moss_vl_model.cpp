@@ -215,7 +215,8 @@ private:
     // [out_hidden, V] cross-state input (host tensor or in-graph concat)
     bool append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor * cs,
                          int V, const PromptPlan & plan,
-                         ggml_tensor ** t_mpos_out, std::vector<int> & mpos_out);
+                         ggml_tensor ** t_mpos_out, std::vector<int> & mpos_out,
+                         const char * tag = "");   // see the naming note in the impl
     bool build_text_graph(TextGraph & g, const PromptPlan & plan, int T, int S, int blk);
     bool run_text(TextGraph & g, const PromptPlan & plan, const std::vector<int> & toks,
                   int base_slot, std::vector<float> & logits_out);
@@ -983,6 +984,7 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
         dump_host("vpos", vpos.data(), sizeof(int) * vpos.size(), {N * 4});
         dump_host("pos_in", pos.data(), sizeof(float) * pos.size(), {vc.n_embd, N});
     }
+    vqa::dump::finalize_sinks(gctx, gf);
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "vision graph allocation failed\n");
         ggml_free(gctx);
@@ -1035,8 +1037,26 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
     }
     dump(gf, "v_final");
     dump(gf, "v_merged");
+    {   // read back the merger output: the per-media cache entry AND the
+        // standalone re-projection input
+        ggml_tensor * got = ggml_graph_get_tensor(gf, "v_merged");
+        merged.resize((size_t)got->ne[0] * got->ne[1]);
+        ggml_backend_tensor_get(got, merged.data(), 0, sizeof(float) * merged.size());
+    }
     if (plan && plan->n_vtot > 0) {
         dump(gf, "xkv_k0");
+        dump(gf, "xkv_kcont");
+        dump(gf, "xkv_knorm");
+        dump(gf, "xkv_kva");
+        {   // the K actually used by attention: read straight from the
+            // persistent cache buffer (owned by alloc_ctx_tensors, immune to
+            // gallocr scratch reuse that corrupts sink dumps)
+            std::vector<ggml_fp16_t> kh((size_t)1024 * plan->n_vtot);
+            ggml_backend_tensor_get(xkv.k[0], kh.data(), 0, sizeof(ggml_fp16_t) * kh.size());
+            std::vector<float> kf(kh.size());
+            ggml_cpu_fp16_to_fp32(kh.data(), kf.data(), (int64_t)kf.size());
+            dump_host("xkv_kcache", kf.data(), sizeof(float) * kf.size(), {1024, plan->n_vtot});
+        }
         fprintf(stderr, "cross kv: %d rows projected with the vision graph\n", plan->n_vtot);
     }
     if (plan && plan->n_vtot > 0 && !dump_dir.empty()) {   // parity input for the numpy recompute
@@ -1053,6 +1073,7 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
             off += fm.tpf;
         }
         dump_host("xkv_cs", cs_host.data(), sizeof(float) * cs_host.size(), {vc.out_hidden, V});
+        dump_host("xkv_mpos", xkv_mpos.data(), sizeof(int) * xkv_mpos.size(), {4 * V});
     }
     fprintf(stderr, "vision: %d patches -> %d merged tokens\n", N, (int)(merged.size() / vc.out_hidden));
     ggml_free(gctx);
@@ -1064,7 +1085,8 @@ bool MossVL::encode_vision(const std::vector<float> & patches, const std::vector
 // t_mpos_out/mpos_out receive the position tensor + host data to set post-alloc
 bool MossVL::append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor * cs,
                              int V, const PromptPlan & plan,
-                             ggml_tensor ** t_mpos_out, std::vector<int> & mpos_out) {
+                             ggml_tensor ** t_mpos_out, std::vector<int> & mpos_out,
+                             const char * tag) {
     if (V > xctx) {
         fprintf(stderr, "vision tokens %d exceed cross-KV capacity %d (raise MOSS_XCTX)\n", V, xctx);
         return false;
@@ -1089,7 +1111,18 @@ bool MossVL::append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor 
     }
     int sections[GGML_MROPE_SECTIONS] = { mrope_t, mrope_h, mrope_w, 0 };
     // one fused GEMM for all cross layers' k/v projections: [nx*2048, V]
+    //
+    // The names below are LOAD-BEARING: ggml-cuda keys CUDA-graph reuse on the
+    // FIRST NODE POINTER (which the ggml ctx pool happily recycles between
+    // graphs) and then a memcmp of node properties. Unnamed/tagged alike, this
+    // chain embedded in the vision graph and the standalone re-projection graph
+    // (cache-hit path) are property-identical -> the OTHER graph's captured
+    // instance gets wrongly replayed -> garbage KV on CUDA. The per-caller tag
+    // keeps the properties distinct so each graph gets its own capture.
+    // Do not remove the names or share one tag between callers.
+    ggml_set_name(cs, tag[0] ? "xkv_cs_g_host" : "xkv_cs_g");
     ggml_tensor * kva = ggml_mul_mat(gctx, xkv_fused, cs);
+    ggml_set_name(kva, tag[0] ? "xkv_kva_host" : "xkv_kva");
     const int64_t kv_dim = (int64_t)n_kv_head * head_dim;
     int li = 0;
     for (int il : xlayers) {
@@ -1099,12 +1132,14 @@ bool MossVL::append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor 
         ggml_tensor * k = ggml_cont(gctx, ggml_view_2d(gctx, kva, kv_dim, V,
                                                        kva->nb[1], (size_t)(li * 2) * kv_dim * sizeof(float)));
         ggml_tensor * k3 = ggml_reshape_3d(gctx, k, head_dim, n_kv_head, V);
+        if (li == 0) ggml_set_name(k3, tag[0] ? "xkv_kcont_host" : "xkv_kcont");
         k3 = ggml_rms_norm(gctx, k3, rms_eps);
         k3 = ggml_mul(gctx, k3, L.ckn);
+        if (li == 0) ggml_set_name(k3, tag[0] ? "xkv_knorm_host" : "xkv_knorm");
         k3 = ggml_rope_multi(gctx, k3, t_mpos, nullptr, head_dim, sections,
                              GGML_ROPE_TYPE_IMROPE, n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         ggml_tensor * k2 = ggml_reshape_2d(gctx, k3, n_kv_head * head_dim, V);
-        if (li == 0) ggml_set_name(k2, "xkv_k0");
+        if (li == 0) ggml_set_name(k2, tag[0] ? "xkv_k0_host" : "xkv_k0");
         ggml_build_forward_expand(gf, ggml_set_rows(gctx, xkv.k[li], k2, t_rows));
         ggml_tensor * v2 = ggml_cont(gctx, ggml_view_2d(gctx, kva, kv_dim, V,
                                                         kva->nb[1], (size_t)(li * 2 + 1) * kv_dim * sizeof(float)));
@@ -1112,7 +1147,11 @@ bool MossVL::append_cross_kv(ggml_context * gctx, ggml_cgraph * gf, ggml_tensor 
         li++;
     }
     if (!dump_dir.empty()) {
-        static const char * const dump_names[] = { "xkv_k0", nullptr };
+        static const char * const dump_names[] = {
+            "xkv_k0", "xkv_k0_host", "xkv_kcont", "xkv_kcont_host",
+            "xkv_knorm", "xkv_knorm_host", "xkv_kva", "xkv_kva_host",
+            "xkv_cs_g", "xkv_cs_g_host", nullptr,
+        };
         vqa::dump::mark_sinks(gctx, gf, dump_names);
     }
     // hand the input tensors + host position data back for post-alloc filling
@@ -1157,7 +1196,7 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
     }
     ggml_tensor * t_mpos = nullptr;
     std::vector<int> mpos;
-    if (!append_cross_kv(gctx, gf, cs, V, plan, &t_mpos, mpos)) {
+    if (!append_cross_kv(gctx, gf, cs, V, plan, &t_mpos, mpos, "host")) {
         ggml_free(gctx);
         return false;
     }
@@ -1165,6 +1204,7 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
     for (int i = 0; i < V; i++) rows[i] = row_base + i;
     ggml_tensor * t_rows = ggml_graph_get_tensor(gf, "xkv_t_rows");   // the one set_rows reads
 
+    vqa::dump::finalize_sinks(gctx, gf);
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "cross kv graph allocation failed\n");
         ggml_free(gctx);
@@ -1181,7 +1221,7 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
     fprintf(stderr, "cross kv: %d rows projected into %d layers\n", V, (int)xlayers.size());
     if (getenv("MOSS_TIMING"))
         fprintf(stderr, "[timing] cross-kv compute %.0f ms\n", ggml_time_ms() - t_ck);
-    dump(gf, "xkv_k0");
+    dump(gf, "xkv_k0_host");
     if (!dump_dir.empty()) {   // parity inputs for the xkv numpy recompute
         std::vector<int> vmpos((size_t)V * 4, 0);
         for (const FrameMeta & fm : plan.frames) {
@@ -1365,7 +1405,7 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
 
     // single-token decode: static graph with a block-rounded KV window
     ggml_tensor * logits_t = nullptr;
-    const bool use_static = (T == 1);
+    const bool use_static = (T == 1) && !getenv("MOSS_NO_STATIC");
     if (use_static) {
         const int blk = std::min(vqa::block_for(S), n_ctx);
         if (!dec_gf || dec_blk != blk || dec_vtot != plan.n_vtot) {
@@ -1379,6 +1419,7 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
                 return false;
             }
             dec_gf = dg.gf;
+            vqa::dump::finalize_sinks(dec_ctx, dec_gf);
             if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
@@ -1414,6 +1455,7 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
     }
 
     if (!build_text_graph(g, plan, T, S, S)) return false;
+    vqa::dump::finalize_sinks(g.ctx, g.gf);
     if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
         fprintf(stderr, "text graph allocation failed\n");
         ggml_free(g.ctx);
@@ -1582,11 +1624,17 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
         }
         key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
         bool projected = false;
-        // CUDA: the standalone re-projection graph computes systematically
-        // different values than the in-vision-graph one (ggml-cuda numerics,
-        // same inputs + weights); the tower only costs ~0.2-0.8s on GPU, so
-        // always take the verified in-graph path there. CPU keeps the cache
-        // (its standalone projection is correct).
+        // Cache-hit re-projection on CUDA used to replay the VISION graph's
+        // captured CUDA-graph instance (nodes[0]-pointer key collision + a
+        // fully-matching node-property memcmp) -> garbage KV. The per-caller
+        // tensor-name tags in append_cross_kv now force a separate capture,
+        // so cache hits are safe on every backend again.
+        // CUDA: cache-hit re-projection still drifts from the in-graph result
+        // when both graphs run in one process (see the tensor-name note in
+        // append_cross_kv for the fixed CUDA-graph replay part; a residual
+        // kernel-level difference remains under investigation). The tower only
+        // costs ~0.2-0.8s on GPU, so CUDA always takes the verified in-graph
+        // path; CPU keeps the cache.
         const bool cache_ok = ggml_backend_is_cpu(backend);
         if (vcache.key == key && !vcache.merged.empty() && cache_ok) {
             fprintf(stderr, "vision: cache hit (%d merged tokens)\n",

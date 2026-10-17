@@ -42,20 +42,42 @@ inline std::vector<std::pair<std::string, ggml_tensor *>> & dump_registry() {
 
 inline void dump_registry_clear() { dump_registry().clear(); }
 
+// sink names are REGISTERED as the graph is built and only attached at the
+// very end (finalize_sinks). Attaching a keep node mid-build lets gallocr
+// hand the tensor's buffer to later nodes (the keep is then mid-graph, not
+// last-use), so the dumped value is silently overwritten - repro'd in
+// convert/sink_repro.cpp (mid-build mark -> 99.99% corrupted values).
+inline std::vector<std::string> & pending_sinks() {
+    static std::vector<std::string> v;
+    return v;
+}
+
 inline void mark_sinks(ggml_context * ctx, ggml_cgraph * gf, const char * const * names) {
-    if (!ctx || !gf || !names) return;
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-        if (!t->name[0]) continue;
-        for (const char * const * n = names; *n; ++n) {
-            if (!strcmp(t->name, *n)) {
-                ggml_tensor * keep = ggml_scale(ctx, t, 1.0f);
-                ggml_set_name(keep, "dump_sink");
-                ggml_build_forward_expand(gf, keep);
-                dump_registry().push_back({*n, t});
-                break;
-            }
+    (void)ctx; (void)gf;
+    if (!names) return;
+    for (const char * const * n = names; *n; ++n) pending_sinks().push_back(*n);
+}
+
+// call ONCE per graph, after the build is complete and BEFORE
+// ggml_gallocr_alloc_graph: resolves pending names and appends the keep
+// nodes at the true tail of the graph.
+inline void finalize_sinks(ggml_context * ctx, ggml_cgraph * gf) {
+    if (!ctx || !gf) { pending_sinks().clear(); return; }
+    for (const std::string & want : pending_sinks()) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->name[0] || strcmp(t->name, want.c_str())) continue;
+            // ggml_scale(t) keeps are NOT reliably honored by this fork's
+            // gallocr (repro: values overwritten mid-graph). Force a real
+            // value copy into a fresh tensor - its buffer is owned by the
+            // dump alone.
+            ggml_tensor * dup = ggml_dup(ctx, t);
+            ggml_set_name(dup, "dump_sink");
+            ggml_build_forward_expand(gf, dup);
+            dump_registry().push_back({want, dup});
+            break;
         }
     }
+    pending_sinks().clear();
 }
 
 // registry-first tensor lookup (falls back to graph name lookup)
