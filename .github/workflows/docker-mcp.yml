@@ -3,6 +3,16 @@ name: docker-mcp
 # Builds the MCP server image on a Linux runner and smoke-tests the protocol over
 # stdio. This is the same check an MCP directory (glama.ai, mcp.so, ...) runs before
 # listing a server, so a green run here is the evidence they ask for.
+#
+# Cost control:
+#   * put-commits build WITHOUT the bundled checkpoint (--build-arg MODEL_REPO=):
+#     BuildKit cache mounts do not survive a fresh runner, so a bundled 400 MB
+#     download would ride along on every run. The weights-less image is what the
+#     initialize/tools/list smoke test needs.
+#   * the full image (weights + describe_image) builds weekly and on demand.
+#   * ccache lives on the host and is carried by actions/cache: the build mounts it
+#     with `--mount type=bind`, which - unlike `--mount type=cache` - can persist
+#     across runners. ggml's objects then hit the cache instead of recompiling.
 
 on:
   push:
@@ -20,6 +30,17 @@ on:
       - 'Dockerfile'
       - 'src/**'
   workflow_dispatch:
+    inputs:
+      bundle_model:
+        description: 'build the release image (bundled SmolVLM weights + caption test)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 4 * * 1'   # weekly full image, so the bundled-weights path stays tested
+
+permissions:
+  contents: read
+  packages: write   # registry build cache (ghcr.io); ignored if the push is denied
 
 jobs:
   build-and-smoke:
@@ -34,17 +55,58 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           df -h /
 
+      - name: Build flags
+        id: flags
+        run: |
+          echo "CACHE_REF=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/skyvision-buildcache" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=${RUNNER_TEMP}/ccache" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          if [ "${{ github.event_name }}" = "schedule" ] \
+             || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bundle_model }}" = "true" ]; }; then
+            echo "MODEL_REPO_ARG=SkyContact/SmolVLM-256M-GGUF" >> "$GITHUB_ENV"
+            echo "bundle=true" >> "$GITHUB_OUTPUT"
+            echo "bundled weights: yes"
+          else
+            echo "MODEL_REPO_ARG=" >> "$GITHUB_ENV"
+            echo "bundle=false" >> "$GITHUB_OUTPUT"
+            echo "bundled weights: no"
+          fi
+
+      # content-addressed ccache store: a source edit invalidates only what changed,
+      # so ggml (30+ s of C++) is served from cache instead of recompiled
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: |
+            ccache-
+
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build the image
-        uses: docker/build-push-action@v6
+      # the registry cache is an optimisation: a denied push must not fail the build
+      - name: Log in to ghcr.io (build cache)
+        continue-on-error: true
+        uses: docker/login-action@v3
         with:
-          context: .
-          load: true
-          tags: skyvision-mcp:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the image
+        run: |
+          docker buildx build \
+            --load \
+            --tag skyvision-mcp:ci \
+            --build-arg MODEL_REPO="${MODEL_REPO_ARG}" \
+            --mount type=bind,source="${CCACHE_DIR}",target=/ccache \
+            --cache-from "type=registry,ref=${CACHE_REF}" \
+            --cache-from "type=gha" \
+            --cache-to "type=registry,ref=${CACHE_REF},mode=max,ignore-error=true" \
+            --cache-to "type=gha,mode=min,ignore-error=true" \
+            .
+          sudo chown -R "$(id -u):$(id -g)" "${CCACHE_DIR}" || true
 
       - name: Image size
         run: docker images skyvision-mcp:ci --format '{{.Size}}'
@@ -104,7 +166,9 @@ jobs:
           PY
 
       # 2) the bundled SmolVLM must actually caption an image without any mounts
+      #    (only in the weekly / on-demand full build: it needs the weights in the image)
       - name: MCP describe_image with the bundled model
+        if: steps.flags.outputs.bundle == 'true'
         run: |
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \

@@ -12,7 +12,9 @@ build/
 build-*/
 ref_*/
 .venv/
+.venv-*/
 .git/
+tmp_*/
 *.log
 
 # ggml is fetched inside the image (add_subdirectory(ggml)); shipping a local

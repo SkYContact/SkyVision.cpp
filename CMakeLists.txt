@@ -6,12 +6,66 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ggml only: the standalone https://github.com/ggml-org/ggml checkout (it also
 # ships gguf). We do not depend on llama.cpp - only ggml + our own model layers.
-# CUDA graph capture for static decode graphs: the standalone ggml checkout
-# defaults this OFF ("llama.cpp only"), which silently compiled the feature
-# out after the move off llama.cpp - enable it explicitly (a no-op for
-# CPU-only builds).
-set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs" FORCE)
-add_subdirectory(ggml)
+#
+# Two ways to provide it:
+#   * in-tree (default): a clone at ./ggml, built here via add_subdirectory
+#   * prebuilt: -DGGML_PREBUILT_DIR=<prefix> with lib/libggml*.a + include/,
+#     which lets the Docker build compile ggml in an earlier stage so that a
+#     source edit never rebuilds it (and CUDA builds keep using the in-tree path)
+set(GGML_PREBUILT_DIR "" CACHE PATH
+    "Use an already-built ggml (lib/libggml*.a + include/) instead of add_subdirectory(ggml)")
+set(GGML_PREBUILT_CUDA OFF CACHE BOOL
+    "The prebuilt ggml was compiled with CUDA (adds GGML_USE_CUDA for our sources)")
+
+if (GGML_PREBUILT_DIR)
+    get_filename_component(GGML_PREBUILT_DIR "${GGML_PREBUILT_DIR}" ABSOLUTE)
+    set(GGML_INC ${GGML_PREBUILT_DIR}/include)
+    # libggml.a (Linux) or ggml.lib (MSVC), both spellings are accepted
+    set(_ggml_missing "")
+    foreach (_lib ggml ggml-base ggml-cpu)
+        set(_path "")
+        foreach (_cand "${GGML_PREBUILT_DIR}/lib/lib${_lib}.a" "${GGML_PREBUILT_DIR}/lib/${_lib}.lib")
+            if (EXISTS "${_cand}")
+                set(_path "${_cand}")
+                break()
+            endif()
+        endforeach()
+        if (NOT _path)
+            list(APPEND _ggml_missing "lib${_lib}.a")
+        endif()
+        set(_ggml_lib_${_lib} "${_path}")
+    endforeach()
+    if (_ggml_missing)
+        message(FATAL_ERROR "GGML_PREBUILT_DIR=${GGML_PREBUILT_DIR} is missing ${_ggml_missing}")
+    endif()
+    find_package(Threads REQUIRED)
+    set(_ggml_defs)
+    if (GGML_PREBUILT_CUDA)
+        list(APPEND _ggml_defs GGML_USE_CUDA)
+    endif()
+    foreach (_lib ggml-base ggml-cpu ggml)
+        add_library(${_lib} STATIC IMPORTED GLOBAL)
+        set_target_properties(${_lib} PROPERTIES
+            IMPORTED_LOCATION "${_ggml_lib_${_lib}}"
+            INTERFACE_INCLUDE_DIRECTORIES ${GGML_INC}
+            INTERFACE_COMPILE_DEFINITIONS "${_ggml_defs}")
+    endforeach()
+    # static link order: the backends need ggml-base, and every consumer of either
+    # one also needs the C++/thread/dl runtime ggml pulls in
+    set_target_properties(ggml-base PROPERTIES
+        INTERFACE_LINK_LIBRARIES "Threads::Threads;${CMAKE_DL_LIBS};m")
+    set_target_properties(ggml-cpu PROPERTIES INTERFACE_LINK_LIBRARIES ggml-base)
+    set_target_properties(ggml PROPERTIES INTERFACE_LINK_LIBRARIES ggml-base)
+    message(STATUS "ggml: prebuilt at ${GGML_PREBUILT_DIR}")
+else()
+    # CUDA graph capture for static decode graphs: the standalone ggml checkout
+    # defaults this OFF ("llama.cpp only"), which silently compiled the feature
+    # out after the move off llama.cpp - enable it explicitly (a no-op for
+    # CPU-only builds).
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "ggml: use CUDA graphs" FORCE)
+    add_subdirectory(ggml)
+    set(GGML_INC ${CMAKE_SOURCE_DIR}/ggml/include)
+endif()
 
 # our sources carry UTF-8 comments/strings; MSVC defaults to the ANSI codepage
 # (only our targets, ggml is added above)
@@ -28,7 +82,7 @@ endif()
 #   src/cli/                 unified image/video VQA front end
 # ---------------------------------------------------------------------------
 
-set(GGML_INC ${CMAKE_SOURCE_DIR}/ggml/include)
+# GGML_INC was set by the ggml block above (in-tree or prebuilt)
 set(STB_INC  ${CMAKE_SOURCE_DIR}/vendor/stb)   # vendored single-header image decoder
 set(CORE_INC ${CMAKE_SOURCE_DIR}/src/core)
 set(MD_INC   ${CMAKE_SOURCE_DIR}/src/models/moondream)

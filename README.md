@@ -224,7 +224,8 @@ vqa-cli --mcp --models-dir models --model moondream3.1-q6k.gguf
 所以镜像开箱就是个能真答话的 MCP 服务器：
 
 ```bash
-docker build -t skyvision-mcp .
+docker build -t skyvision-mcp .                       # 内置 403MB smolvlm
+docker build --build-arg MODEL_REPO= -t skyvision-mcp:bare .   # 不带权重（CI 用）
 docker run --rm -i skyvision-mcp                      # 内置 smolvlm，直接可用
 docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
 ```
@@ -237,12 +238,21 @@ docker run --rm -i -v ~/models:/models skyvision-mcp   # 换成自己的 GGUF
 都正常应答 —— 这正是目录爬虫、CI 冒烟测试和 MCP 平台审核所做的事。
 
 内置权重默认从 Hugging Face 的 `SkyContact/SmolVLM-256M-GGUF` 拉取（魔搭有同款镜像），
-换源或固定版本用 `--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`。
+换源或固定版本用 `--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`；
+`--build-arg MODEL_REPO=` 则完全不下载（得到一个只有二进制、靠 `-v` 挂权重的镜像）。
 
-[`.github/workflows/docker-mcp.yml`](.github/workflows/docker-mcp.yml) 每次推送都会在
-Linux 上真的构建这个镜像并跑上面两步冒烟（无权重握手 → 用内置模型 `describe_image`），
-所以 README 顶部的徽章是"真构建过"，不是宣称。层顺序按缓存友好排布：apt、ggml checkout、
-403MB 权重都能命中，改源码只重跑编译（走 ccache）。
+[`.github/workflows/docker-mcp.yml`](.github/workflows/docker-mcp.yml) 在 Linux 上真的构建
+这个镜像并跑冒烟，所以 README 顶部的徽章是"真构建过"，不是宣称。构建成本按三层摊开：
+
+| 层 | 何时失效 | 说明 |
+|---|---|---|
+| `toolchain` | 只改 apt 包列表 | apt lists 走 cache mount |
+| `ggml` | 只改 `GGML_REF` | ggml 独立成 stage 单独编译（`-DGGML_PREBUILT_DIR` 复用），**改 `src/` 不会碰它** |
+| `build` | 改源码 | `COPY .` + ccache（CI 里用 `--mount type=bind` 挂 `actions/cache` 的目录，跨 runner 复用） |
+
+CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mount=type=cache` 在新 runner 上
+是空的，带权重等于每次多传 400MB。完整镜像（含 `describe_image` 冒烟）走每周定时 +
+手动 `workflow_dispatch`，缓存用 ghcr registry（`mode=max`，无 10GB 配额限制）。
 
 | 工具 | 说明 |
 |---|---|

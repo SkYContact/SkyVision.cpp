@@ -183,7 +183,8 @@ The repository ships a `Dockerfile` that builds the CPU binary and **bundles the
 SmolVLM-256M q8 checkpoint**, so the image is a working MCP server with nothing mounted:
 
 ```bash
-docker build -t skyvision-mcp .
+docker build -t skyvision-mcp .                        # bundles the 403 MB smolvlm
+docker build --build-arg MODEL_REPO= -t skyvision-mcp:bare .   # no weights (what CI does)
 docker run --rm -i skyvision-mcp                       # smolvlm is ready out of the box
 docker run --rm -i -v ~/models:/models skyvision-mcp    # or point it at your own GGUFs
 ```
@@ -199,13 +200,23 @@ and the review step of an MCP registry exercise.
 
 The bundled checkpoint is pulled from `SkyContact/SmolVLM-256M-GGUF` on Hugging Face
 (mirrored on ModelScope); pin or switch sources with
-`--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`.
+`--build-arg MODEL_BASE=... --build-arg MODEL_REV=...`, or pass
+`--build-arg MODEL_REPO=` to skip it entirely (a binary-only image that expects `-v`).
 
 [`.github/workflows/docker-mcp.yml`](.github/workflows/docker-mcp.yml) builds this image on
-every push and runs both smoke tests above (handshake with no models, then `describe_image`
-against the bundled checkpoint), so the badge reflects a real Linux build rather than a
-claim. Layers are ordered so that apt, the ggml checkout and the 403 MB checkpoint are
-cached: a source change re-runs only the compile (through ccache).
+a Linux runner and runs the smoke tests, so the badge reflects a real build rather than a
+claim. Cost is split across three cacheable stages:
+
+| Stage | Invalidated by | Note |
+|---|---|---|
+| `toolchain` | apt package list | apt lists come from a cache mount |
+| `ggml` | `GGML_REF` only | built as its own stage and consumed through `-DGGML_PREBUILT_DIR`, so editing `src/` never rebuilds it |
+| `build` | our sources | `COPY .` + ccache, bind-mounted from a host dir that `actions/cache` carries across runners |
+
+Push builds deliberately ship **without** weights (`MODEL_REPO=`): `--mount=type=cache` is
+empty on a fresh runner, so bundling them would move 400 MB per run. The full image plus the
+`describe_image` smoke test builds weekly and on `workflow_dispatch`, with a ghcr registry
+cache (`mode=max`, not subject to the 10 GB Actions cache quota).
 
 | Tool | What it does |
 |---|---|
