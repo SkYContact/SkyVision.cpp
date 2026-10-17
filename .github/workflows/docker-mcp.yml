@@ -1,0 +1,115 @@
+name: docker-mcp
+
+# Builds the MCP server image on a Linux runner and smoke-tests the protocol over
+# stdio. This is the same check an MCP directory (glama.ai, mcp.so, ...) runs before
+# listing a server, so a green run here is the evidence they ask for.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'convert/**'
+      - 'ggml/**'
+      - 'tests/**'
+      - '.github/workflows/docker-mcp.yml'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'src/**'
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h /
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: skyvision-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image size
+        run: docker images skyvision-mcp:ci --format '{{.Size}}'
+
+      # 1) the "no weights at all" path every crawler hits: the server must still
+      #    answer initialize / tools/list / list_models instead of failing
+      - name: MCP smoke test without any models
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_models","arguments":{}}}' \
+          | docker run --rm -i --entrypoint vqa-cli -v "$PWD/tests/data:/data:ro" \
+              skyvision-mcp:ci --mcp --models-dir /data/empty \
+          > empty.out 2> empty.err
+          echo '--- stderr'; cat empty.err
+          python3 - <<'PY'
+          import json
+          msgs = [json.loads(l) for l in open('empty.out') if l.strip()]
+          by_id = {m.get('id'): m for m in msgs}
+          assert by_id[1]['result']['serverInfo']['name'] == 'skyvision', by_id[1]
+          tools = [t['name'] for t in by_id[2]['result']['tools']]
+          assert len(tools) >= 9, tools
+          print('tools:', ', '.join(tools))
+          models = json.loads(by_id[3]['result']['content'][0]['text'])['models']
+          assert models == [], models
+          print('empty models dir ->', models)
+          PY
+
+      # 2) the bundled SmolVLM must actually caption an image without any mounts
+      - name: MCP describe_image with the bundled model
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_models","arguments":{}}}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_image","arguments":{"image":"/data/mcp-smoke.bmp","length":"short"}}}' \
+          | docker run --rm -i -v "$PWD/tests/data:/data:ro" skyvision-mcp:ci \
+          > real.out 2> real.err
+          echo '--- stderr'; tail -40 real.err
+          python3 - <<'PY'
+          import json
+          msgs = [json.loads(l) for l in open('real.out') if l.strip()]
+          by_id = {m.get('id'): m for m in msgs}
+          models = json.loads(by_id[2]['result']['content'][0]['text'])['models']
+          archs = {m['arch'] for m in models}
+          assert 'smolvlm' in archs, archs
+          print('models:', [(m['id'], m['arch']) for m in models])
+          res = by_id[3]['result']
+          assert not res.get('isError'), res
+          text = res['content'][0]['text']
+          assert len(text.strip()) > 3, repr(text)
+          print('caption:', text.strip()[:160])
+          PY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-smoke-logs
+          path: |
+            empty.out
+            empty.err
+            real.out
+            real.err
+          if-no-files-found: ignore
