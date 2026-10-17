@@ -422,6 +422,9 @@ bool VideoMAE::build_graph() {
         };
         vqa::dump::mark_sinks(gctx, gf, dump_names);
     }
+    // attach the keep nodes at the true tail of the graph (mark_sinks only
+    // registers names; a mid-build attach lets gallocr reuse the buffer)
+    vqa::dump::finalize_sinks(gctx, gf, backend);
 
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "graph allocation failed\n");
