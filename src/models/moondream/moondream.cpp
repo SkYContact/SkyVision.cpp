@@ -877,18 +877,23 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
         struct Box { float x0, y0, x1, y1; };
         std::vector<Box> boxes;
         const int max_objects = 20;
+        // official _generate_points: one text-decoder step per fed embedding. The
+        // LAST step of an object must produce both the next hidden and the
+        // coord/eos logits - feeding the same embedding twice (once for hidden,
+        // once for logits, as the old loop did) shifts every following position
+        // and makes the model march out duplicate points without ever emitting eos.
         while (next != 0 && (int)boxes.size() < max_objects) {
             float xl[1024];
             rm.decode_coordinate(hidden.data(), xl);
             float xc = RegionModel::logits_to_center(xl, 1024);
             rm.encode_coordinate(&xc, 1, emb.data());
-            decode_emb_step(emb.data());
+            decode_emb_step(emb.data());                 // x-fed: hidden for y
             rm.decode_coordinate(hidden.data(), xl);
             float yc = RegionModel::logits_to_center(xl, 1024);
             rm.encode_coordinate(&yc, 1, emb.data());
-            decode_emb_step(emb.data());
             float w = 0, h = 0;
             if (detect_obj) {
+                decode_emb_step(emb.data());             // y-fed: hidden for size
                 float sl[2048];
                 rm.decode_size(hidden.data(), sl);
                 int bins[2] = { vqa::greedy_argmax(sl, 1024), vqa::greedy_argmax(sl + 1024, 1024) };
@@ -896,15 +901,14 @@ int moondream_main(int argc, char ** argv, bool argv_is_utf8) {
                 RegionModel::bins_to_size(bins, sizes);
                 w = sizes[0]; h = sizes[1];
                 rm.encode_size(sizes, 1, emb.data());
-                decode_emb_step(emb.data());
             }
+            // size-fed (detect) / y-fed (point): hidden + coord_id(5) vs eos_id(0)
+            e.step({}, lv.data(), emb.data(), 1, hidden.data(), false);
             if (detect_obj) {
                 boxes.push_back({ xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2 });
             } else {
                 boxes.push_back({ xc, yc, xc, yc });
             }
-            // next: coord_id(5) vs eos_id(0) — official point_gen_indices two-way argmax
-            e.step({}, lv.data(), emb.data(), 1, nullptr, false);
             next = (lv[0] >= lv[5]) ? 0 : 5;
         }
         if (detect_obj) {
