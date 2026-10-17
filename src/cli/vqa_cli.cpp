@@ -37,6 +37,7 @@ void usage() {
         "usage: vqa-cli --model <gguf> [--tokenizer <path|dir>]\n"
         "               [--image <file>] [--video <file> | --frames <dir>] [--fps <f>] [--max-frames <n>]\n"
         "               --ask <question> [--mode <skill>] [options]\n"
+        "               --batch <prompts.txt>   text-only batched decode (one prompt per line)\n"
         "\n"
         "options:\n"
         "  --max-tokens N   max new tokens (default 256)\n"
@@ -58,15 +59,20 @@ void usage() {
 }
 
 // moondream3.1 is dispatched through its own entry point, which speaks its own
-// flag names; translate the unified options into that vocabulary.
+// flag names; translate the unified options into that vocabulary. Flags the engine
+// only reads from the environment (MD_THREADS / MD_DUMP) are exported here so that
+// --threads and --dump-dir work for this backend too instead of being silently
+// dropped.
 int run_moondream(const std::string & model, const std::string & tok, const std::string & image,
                   const std::string & ask, int max_tokens, int n_ctx, float temp,
-                  const std::string & vision, const std::string & region) {
+                  const std::string & vision, const std::string & region,
+                  const std::string & batch, int n_threads, const std::string & dump_dir) {
     if (temp > 0.0f)
         fprintf(stderr, "note: %s is greedy-only, --temp is ignored\n", "moondream3.1");
     std::vector<std::string> args = {"moondream-cli", "-m", model, "-t", tok};
     if (!image.empty()) { args.push_back("-i"); args.push_back(image); }
     if (!ask.empty()) { args.push_back("-p"); args.push_back(ask); }
+    if (!batch.empty()) { args.push_back("--batch"); args.push_back(batch); }
     args.push_back("-n"); args.push_back(std::to_string(max_tokens));
     if (n_ctx > 0) {   // otherwise the engine keeps its own (small) default
         args.push_back("-c");
@@ -74,6 +80,20 @@ int run_moondream(const std::string & model, const std::string & tok, const std:
     }
     if (!vision.empty()) { args.push_back("-v"); args.push_back(vision); }
     if (!region.empty()) { args.push_back("--region"); args.push_back(region); }
+    if (n_threads > 0) {
+#ifdef _WIN32
+        _putenv_s("MD_THREADS", std::to_string(n_threads).c_str());
+#else
+        setenv("MD_THREADS", std::to_string(n_threads).c_str(), 1);
+#endif
+    }
+    if (!dump_dir.empty()) {   // the engine's MD_DUMP is a directory, not a flag
+#ifdef _WIN32
+        _putenv_s("MD_DUMP", dump_dir.c_str());
+#else
+        setenv("MD_DUMP", dump_dir.c_str(), 1);
+#endif
+    }
     std::vector<char *> argv;
     argv.reserve(args.size());
     for (auto & s : args) argv.push_back(const_cast<char *>(s.c_str()));
@@ -200,7 +220,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
         return run_moondream(model_path, tok_path, image_path, ask_text, max_tokens, n_ctx,
-                             temp, vision_path, region_path);
+                             temp, vision_path, region_path, batch_path, threads, dump_dir);
     }
 
     vqa::Model * model = vqa::vqa_create_model(arch);

@@ -35,6 +35,12 @@ struct MoondreamModel : vqa::Model {
     const vqa::Capabilities & caps() const override { return caps_; }
     const char * name() const override { return "moondream3.1"; }
 
+    // text-only batched decoding (moondream_batch.inc); the unified CLI drives
+    // moondream through its own entry point, this keeps the adapter usable too
+    int run_batch(const std::string & path, int n_gen) override {
+        return ::run_batch(e, path.c_str(), e.n_ctx, n_gen);
+    }
+
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override {
         if (!vm_ok && !media.empty()) { out_text = "vision model unavailable"; return false; }
