@@ -38,12 +38,13 @@ def hf_upload(path, card, repo, remote_name, message, dry):
     print(f"[hf] done: https://huggingface.co/{repo}", flush=True)
 
 
-def ms_upload(path, card, repo, remote_name, message, dry):
+def ms_upload(path, card, repo, remote_name, message, dry, base_model="", chinese_name=""):
     from modelscope.hub.api import HubApi
 
+    token = os.environ.get("MODELSCOPE_API_TOKEN") or None
     api = HubApi()
     try:
-        info = api.get_model(repo, revision="master")
+        info = api.get_model(repo, revision="master", token=token)
         print(f"[ms] repo exists: {getattr(info, 'Name', repo)}", flush=True)
         exists = True
     except Exception:
@@ -53,13 +54,17 @@ def ms_upload(path, card, repo, remote_name, message, dry):
               f"({path} -> {remote_name})")
         return
     if not exists:
+        # original_model_id is what ModelScope turns into the lineage edge; it has to
+        # be a repository that exists on *this* hub, otherwise the edge is dropped
         api.create_model(repo, visibility=5, license="Apache License 2.0",
-                         chinese_name="VideoJev-4B GGUF")
-    api.upload_file(model_id=repo, path_or_fileobj=path, path_in_repo=remote_name,
-                    commit_message=message)
+                         chinese_name=chinese_name or repo,
+                         original_model_id=base_model, token=token)
+    # note: the SDK takes repo_id (model_id is only used by create_model)
+    api.upload_file(path_or_fileobj=path, path_in_repo=remote_name, repo_id=repo,
+                    token=token, repo_type="model", commit_message=message)
     if card and os.path.isfile(card):
-        api.upload_file(model_id=repo, path_or_fileobj=card, path_in_repo="README.md",
-                        commit_message="model card")
+        api.upload_file(path_or_fileobj=card, path_in_repo="README.md", repo_id=repo,
+                        token=token, repo_type="model", commit_message="model card")
     print(f"[ms] done: https://modelscope.cn/models/{repo}", flush=True)
 
 
@@ -73,6 +78,9 @@ def main():
     ap.add_argument("--commit-message", default="", help="commit message")
     ap.add_argument("--hf", action="store_true", help="only Hugging Face")
     ap.add_argument("--ms", action="store_true", help="only ModelScope")
+    ap.add_argument("--base-model", default="",
+                    help="ModelScope original_model_id (lineage); must exist on ModelScope")
+    ap.add_argument("--chinese-name", default="", help="ModelScope display name")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -91,7 +99,8 @@ def main():
             hf_upload(args.file, args.card, args.hf_repo, remote, msg, args.dry_run)
     if (both or args.ms) and args.ms_repo:
         try:
-            ms_upload(args.file, args.card, args.ms_repo, remote, msg, args.dry_run)
+            ms_upload(args.file, args.card, args.ms_repo, remote, msg, args.dry_run,
+                      base_model=args.base_model, chinese_name=args.chinese_name)
         except Exception as e:
             print(f"[ms] failed: {type(e).__name__}: {e}", file=sys.stderr)
             rc = 1

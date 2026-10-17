@@ -3,7 +3,11 @@ license: apache-2.0
 base_model:
 - ZhuYuhan/VideoJev-4B
 base_model_relation: quantized
-library_name: SkyVision.cpp
+library_name: gguf
+pipeline_tag: video-text-to-text
+language:
+- en
+- zh
 tags:
 - vision
 - video
@@ -12,6 +16,7 @@ tags:
 - video-question-answering
 - decision-head
 - hybrid-attention
+- skyvision.cpp
 ---
 
 # VideoJev-4B GGUF
@@ -32,7 +37,8 @@ tags:
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `videojev-4b-q8_0.gguf` | 5.08 GB | 视觉塔 F16 保留，决策头 FP32；CPU 841 token 前向 ≈ 9.8 s |
+| `videojev-4b-q8_0.gguf` | 4.73 GiB (5.08 GB) | 视觉塔 F16 保留，决策头 FP32；CPU 841 token 前向 ≈ 9.8 s |
+| `tokenizer.json` | 19 MB | 官方检查点的分词器，本仓库一并附带，不用再单独下 |
 
 ## 模型做了什么
 
@@ -51,9 +57,8 @@ git clone https://github.com/SkYContact/SkyVision.cpp
 cd SkyVision.cpp && git clone --depth 1 https://github.com/ggml-org/ggml
 scripts\build-cuda.bat
 
-# 权重（本仓库）与 tokenizer（官方检查点目录，无需转换）
-hf download <this-repo> --local-dir models/VideoJev-4B-GGUF
-hf download ZhuYuhan/VideoJev-4B --local-dir models/VideoJev-4B
+# 权重与 tokenizer 都在本仓库里
+hf download SkyContact/VideoJev-4B-GGUF --local-dir models/VideoJev-4B-GGUF
 
 cat > qs.json <<'JSON'
 {"questions": [{"id": "q1", "task": "grounding", "query": "when does the person sit down"},
@@ -61,7 +66,7 @@ cat > qs.json <<'JSON'
                 "options": ["A. indoors", "B. outdoors"]}]}
 JSON
 
-vqa-cli --model videojev-4b-q8_0.gguf --tokenizer models/VideoJev-4B \
+vqa-cli --model videojev-4b-q8_0.gguf --tokenizer models/VideoJev-4B-GGUF \
         --video clip.mp4 --fps 2 --score qs.json
 # [{"id":"q1",...,"probabilities":[...],"times":[...],"start":..,"end":..},
 #  {"id":"q2",...,"probabilities":[...],"answer_index":1,"answer":"B. outdoors"}]
