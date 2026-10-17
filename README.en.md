@@ -103,6 +103,13 @@ moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
 moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
 ```
 
+`vqa-cli` also drives moondream's own surface: `--batch` forwards to the engine's batched
+decoder, `--mode detect|point` map onto the engine's native `--detect/--point` flags,
+`--mode caption|gaze|ask-think` go through the `vqa::Model` adapter (the same path the web
+UI uses), `--threads/--dump-dir` are exported as the `MD_THREADS`/`MD_DUMP` variables the
+engine reads, and `--vision/--region` default to the `moondream3.1-*.gguf` siblings in the
+model's own directory.
+
 Common `vqa-cli` flags: `--frames <dir> --fps 2` (video frames), `--temp/--top-k/--top-p`
 (sampling, greedy by default), `--max-tokens`, `--n-ctx`, `--threads`, `--cpu`,
 `--dump-ids` (tokenizer self test) — see `--help` for the rest.

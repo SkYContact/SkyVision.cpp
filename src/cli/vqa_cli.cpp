@@ -64,14 +64,26 @@ void usage() {
 // --threads and --dump-dir work for this backend too instead of being silently
 // dropped.
 int run_moondream(const std::string & model, const std::string & tok, const std::string & image,
-                  const std::string & ask, int max_tokens, int n_ctx, float temp,
-                  const std::string & vision, const std::string & region,
+                  const std::string & ask, const std::string & mode, int max_tokens, int n_ctx,
+                  float temp, const std::string & vision, const std::string & region,
                   const std::string & batch, int n_threads, const std::string & dump_dir) {
     if (temp > 0.0f)
         fprintf(stderr, "note: %s is greedy-only, --temp is ignored\n", "moondream3.1");
     std::vector<std::string> args = {"moondream-cli", "-m", model, "-t", tok};
     if (!image.empty()) { args.push_back("-i"); args.push_back(image); }
-    if (!ask.empty()) { args.push_back("-p"); args.push_back(ask); }
+    // --mode detect/point are native flags on this entry point (the object text
+    // takes the place of -p); caption/gaze/ask-think have no equivalent and are
+    // routed through the vqa::Model adapter instead (see the caller).
+    if (mode == "detect") {
+        args.push_back("--detect");
+        args.push_back(ask);
+    } else if (mode == "point") {
+        args.push_back("--point");
+        args.push_back(ask);
+    } else if (!ask.empty()) {
+        args.push_back("-p");
+        args.push_back(ask);
+    }
     if (!batch.empty()) { args.push_back("--batch"); args.push_back(batch); }
     args.push_back("-n"); args.push_back(std::to_string(max_tokens));
     if (n_ctx > 0) {   // otherwise the engine keeps its own (small) default
@@ -219,8 +231,26 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "moondream3.1 does not take video input; use a VideoChat3 model\n");
             return 2;
         }
-        return run_moondream(model_path, tok_path, image_path, ask_text, max_tokens, n_ctx,
-                             temp, vision_path, region_path, batch_path, threads, dump_dir);
+        // the engine entry point resolves the side models relative to the CWD;
+        // fall back to the model's own directory so `--model models/xxx.gguf`
+        // finds the vision/region siblings without extra flags
+        const size_t slash = model_path.find_last_of("/\\");
+        const std::string mdir = slash == std::string::npos ? std::string(".") : model_path.substr(0, slash);
+        if (vision_path.empty()) {
+            const std::string p = mdir + "/moondream3.1-vision.gguf";
+            if (FILE * f = fopen(p.c_str(), "rb")) { fclose(f); vision_path = p; }
+        }
+        if (region_path.empty()) {
+            const std::string p = mdir + "/moondream3.1-region.gguf";
+            if (FILE * f = fopen(p.c_str(), "rb")) { fclose(f); region_path = p; }
+        }
+        // caption / gaze / ask-think only exist on the vqa::Model adapter (the
+        // same code path the web UI drives); detect/point are native engine flags
+        const bool via_adapter = mode == "caption" || mode == "gaze" || mode == "ask-think";
+        if (!via_adapter)
+            return run_moondream(model_path, tok_path, image_path, ask_text, mode, max_tokens, n_ctx,
+                                 temp, vision_path, region_path, batch_path, threads, dump_dir);
+        fprintf(stderr, "mode '%s': using the unified model adapter\n", mode.c_str());
     }
 
     vqa::Model * model = vqa::vqa_create_model(arch);
@@ -255,6 +285,8 @@ int main(int argc, char ** argv) {
     opt.n_threads = threads;
     opt.use_gpu = use_gpu;
     opt.dump_dir = dump_dir;
+    opt.vision_path = vision_path;
+    opt.region_path = region_path;
     if (!model->load(model_path, tok_path, opt)) { fprintf(stderr, "model load failed\n"); return 4; }
     if (!batch_path.empty()) {
         const int rc = model->run_batch(batch_path, max_tokens);

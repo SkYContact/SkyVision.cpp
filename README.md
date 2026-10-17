@@ -130,6 +130,14 @@ moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
 moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
     -v moondream3.1-vision.gguf --region moondream3.1-region.gguf --serve   # http://127.0.0.1:8080
 moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json --batch prompts.txt
+
+# 统一前端也能用这些：--batch 直通引擎的批处理；
+# --mode detect/point 走引擎原生标志（--detect/--point），
+# --mode caption/gaze/ask-think 走 vqa::Model 适配器（与 Web UI 同一条路径），
+# --threads / --dump-dir 会导出成引擎读取的 MD_THREADS / MD_DUMP 环境变量，
+# --vision/--region 省略时按模型所在目录找 moondream3.1-vision/-region.gguf
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask person --mode detect
+vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask normal --mode caption
 ```
 
 `vqa-cli` 常用开关：`--video <file> --fps 2 --max-frames 32`（内置视频：ffmpeg 管道解码 + qwen_vl_utils 式采样 n = min(duration×fps, max_frames)，超限自动全片均匀重采样）、`--frames <dir>`（预抽帧目录）、`--temp/--top-k/--top-p`（采样，默认贪心）、
