@@ -31,7 +31,7 @@
 <div class="wrap">
   <a class="back" href="/">&larr; 所有模型</a>
   <h1>__MODEL_ID__</h1>
-  <div class="sub">VideoChat3-4B · 图像 / 视频问答（视频自动帧采样 + 时间戳）</div>
+  <div class="sub" id="sub">图像 / 视频问答（视频自动帧采样 + 时间戳）</div>
 
   <label id="drop" for="file">点击或拖入图片 / 视频（mp4 等）</label>
   <img id="preview" alt="">
@@ -59,6 +59,14 @@
 <script>
 const MODEL = '__MODEL_ID__';
 const ARCH = '__MODEL_ARCH__';
+// every text backend shares this page; only the label differs
+const ARCH_LABEL = {
+  videochat3: 'VideoChat3-4B', qwen3_5: 'Qwen3.5', qwen2vl: 'Qwen2.5-VL',
+  qwen2_5_vl: 'Qwen2.5-VL', marlin: 'Marlin', moss_vl: 'MOSS-VL',
+  videomae: 'VideoMAE', vivit: 'ViViT', moondream3: 'moondream3.1',
+};
+document.getElementById('sub').textContent =
+  (ARCH_LABEL[ARCH] || ARCH) + ' · ' + document.getElementById('sub').textContent;
 if (ARCH === 'marlin') document.getElementById('mode').style.display = '';
 const drop = document.getElementById('drop'), file = document.getElementById('file');
 const imgP = document.querySelector('img#preview'), vidP = document.querySelector('video#preview');
