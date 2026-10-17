@@ -36,6 +36,9 @@ struct BlockHooks {
     ggml_tensor *(*to_act)(void *ud, ggml_tensor *t) = nullptr;
     // optional cast to F32 before the LayerNorms (f16act experiment); null = identity
     ggml_tensor *(*to_f32)(void *ud, ggml_tensor *t) = nullptr;
+    // optional MLP activation; null = ggml_gelu (tanh). VideoMAE's nn.GELU() is the
+    // exact erf form, so it passes ggml_gelu_erf here instead of writing its own block.
+    ggml_tensor *(*gelu)(void *ud, ggml_tensor *t) = nullptr;
     // optional layer-0 parity sink, stage "qkv" | "attn_out" | "out"; return
     // true after handling the truncation (build/run/free) to stop the block
     bool (*probe_layer0)(void *ud, const char *stage, ggml_tensor *t) = nullptr;
@@ -77,7 +80,7 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, const BlockWeights
     ggml_tensor *f = ggml_mul_mat(ctx, w.fc0_w, l2);
     f = act(f);
     f = ggml_add(ctx, f, w.fc0_b);
-    f = ggml_gelu(ctx, f);
+    f = h.gelu ? h.gelu(h.ud, f) : ggml_gelu(ctx, f);
     f = ggml_mul_mat(ctx, w.fc1_w, f);
     f = act(f);
     f = ggml_add(ctx, f, w.fc1_b);

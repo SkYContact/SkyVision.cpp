@@ -10,10 +10,17 @@
 //      grid, torch F.interpolate semantics (A = -0.75, align_corners = false)
 #pragma once
 
+#include "resample.hpp"
+
 #include <cstdint>
 #include <vector>
 
 namespace vc3 {
+
+// shared image kernels now live in core/resample.hpp; keep the vc3 names so the
+// call sites in this backend (and the pos-embedding path below) read unchanged
+using vqa::img::resize_bicubic_antialias;
+using vqa::img::smart_resize;
 
 struct VisConfig {
     int patch = 14;
@@ -29,14 +36,7 @@ struct VisConfig {
     float rope_theta = 10000.0f;
 };
 
-// Qwen2VL smart_resize. Returns false when the image is smaller than `factor`.
-bool smart_resize(int height, int width, int factor, int min_pixels, int max_pixels,
-                  int * out_h, int * out_w);
-
-// Separable antialias bicubic resize of an interleaved RGB8 (HWC) buffer into
-// float32 CHW-free layout: out is interleaved RGB float [oh*ow*3] in [0,255].
-void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
-                              std::vector<float> & out);
+// smart_resize / resize_bicubic_antialias: see core/resample.hpp (aliased above).
 
 // Normalize + patchify. `rgb` is interleaved RGB float [h*w*3] in [0,255].
 // Produces `patches` of shape (3*patch*patch, N) laid out for ggml ne = [C*P*P, N],

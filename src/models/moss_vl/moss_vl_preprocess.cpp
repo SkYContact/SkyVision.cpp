@@ -1,6 +1,8 @@
 // moss_vl_preprocess.cpp - see moss_vl_preprocess.hpp.
 #include "moss_vl_preprocess.hpp"
 
+#include "resample.hpp"
+
 #include <cmath>
 
 namespace moss_vl {
@@ -22,32 +24,9 @@ void patchify_frame(const float * rgb, int h, int w, const VisConfig & vc,
 
     // bilinear interp of the learned (side,side,dim) table to (gh,gw):
     // torch.linspace(0, side-1, g) endpoints, floor/ceil clipped
-    std::vector<float> pos_rows((size_t)gh * gw * dim);
-    {
-        std::vector<float> ys(gh), xs(gw);
-        for (int i = 0; i < gh; i++) ys[i] = gh > 1 ? (float)i * (side - 1) / (gh - 1) : 0.0f;
-        for (int j = 0; j < gw; j++) xs[j] = gw > 1 ? (float)j * (side - 1) / (gw - 1) : 0.0f;
-        for (int i = 0; i < gh; i++) {
-            const int y0 = (int)ys[i], smax = side - 1;
-            const int y1 = y0 + 1 <= smax ? y0 + 1 : smax;
-            const float dy = ys[i] - y0;
-            for (int j = 0; j < gw; j++) {
-                const int x0 = (int)xs[j];
-                const int x1 = x0 + 1 <= smax ? x0 + 1 : smax;
-                const float dx = xs[j] - x0;
-                const float * r00 = pos_table + (size_t)(y0 * side + x0) * dim;
-                const float * r01 = pos_table + (size_t)(y0 * side + x1) * dim;
-                const float * r10 = pos_table + (size_t)(y1 * side + x0) * dim;
-                const float * r11 = pos_table + (size_t)(y1 * side + x1) * dim;
-                float * o = pos_rows.data() + ((size_t)i * gw + j) * dim;
-                for (int d = 0; d < dim; d++) {
-                    const float a = r00[d] * (1 - dx) + r01[d] * dx;
-                    const float b = r10[d] * (1 - dx) + r11[d] * dx;
-                    o[d] = a * (1 - dy) + b * dy;
-                }
-            }
-        }
-    }
+    // (core/resample.hpp, shared with Qwen3.5-VL)
+    std::vector<float> pos_rows;
+    vqa::img::interp_pos_grid(pos_table, side, dim, gh, gw, pos_rows);
 
     // tokens in block-major order (mh, mw, ir, ic); patch vector (c, y, x)
     patches.reserve(patches.size() + (size_t)gh * gw * C3);

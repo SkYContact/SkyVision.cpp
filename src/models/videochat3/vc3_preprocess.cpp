@@ -6,38 +6,7 @@
 
 namespace vc3 {
 
-// ---------------------------------------------------------------- smart_resize
-static int round_by_factor(int n, int f) { return (int)nearbyint((double)n / (double)f) * f; }
-static int ceil_by_factor(double n, int f) { return (int)std::ceil(n / f) * f; }
-static int floor_by_factor(double n, int f) { return (int)std::floor(n / f) * f; }
-
-bool smart_resize(int height, int width, int factor, int min_pixels, int max_pixels,
-                  int * out_h, int * out_w) {
-    if (height < factor || width < factor) return false;
-    int h_bar = std::max(factor, round_by_factor(height, factor));
-    int w_bar = std::max(factor, round_by_factor(width, factor));
-    if ((long long)h_bar * w_bar > (long long)max_pixels) {
-        double beta = std::sqrt((double)height * (double)width / (double)max_pixels);
-        h_bar = std::max(factor, floor_by_factor((double)height / beta, factor));
-        w_bar = std::max(factor, floor_by_factor((double)width / beta, factor));
-    } else if ((long long)h_bar * w_bar < (long long)min_pixels) {
-        double beta = std::sqrt((double)min_pixels / ((double)height * (double)width));
-        h_bar = ceil_by_factor((double)height * beta, factor);
-        w_bar = ceil_by_factor((double)width * beta, factor);
-    }
-    *out_h = h_bar;
-    *out_w = w_bar;
-    return true;
-}
-
-// ---------------------------------------------------------------- resamplers
-// antialias bicubic kernel used by PIL / torchvision (a = -0.5)
-static inline double bicubic_aa(double x) {
-    x = std::fabs(x);
-    if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
-    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
-    return 0.0;
-}
+// smart_resize + resize_bicubic_antialias live in core/resample.cpp now.
 
 // torch F.interpolate(mode="bicubic", align_corners=False) kernel (a = -0.75)
 static inline double cubic_torch(double x, double A) {
@@ -45,82 +14,6 @@ static inline double cubic_torch(double x, double A) {
     if (x <= 1.0) return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
     if (x < 2.0) return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
     return 0.0;
-}
-
-struct Filter {
-    int start = 0;              // first source index
-    std::vector<double> w;      // weights
-};
-
-// builds the antialias bicubic filter bank for one axis
-static void build_aa_filters(int in, int out, std::vector<Filter> & fs) {
-    const double scale = (double)in / (double)out;
-    const double filterscale = std::max(1.0, scale);
-    const double support = 2.0 * filterscale;
-    fs.resize(out);
-    for (int o = 0; o < out; o++) {
-        const double center = ((double)o + 0.5) * scale;
-        int xmin = (int)std::floor(center - support + 0.5);
-        if (xmin < 0) xmin = 0;
-        int xmax = (int)std::ceil(center + support + 0.5);
-        if (xmax > in) xmax = in;
-        Filter & f = fs[o];
-        f.start = xmin;
-        f.w.resize(xmax - xmin);
-        double sum = 0.0;
-        for (int x = xmin; x < xmax; x++) {
-            double t = ((double)x - center + 0.5) / filterscale;
-            double w = bicubic_aa(t);
-            f.w[x - xmin] = w;
-            sum += w;
-        }
-        if (sum != 0.0) for (double & w : f.w) w /= sum;
-    }
-}
-
-void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
-                              std::vector<float> & out) {
-    std::vector<Filter> fh, fv;
-    build_aa_filters(sw, dw, fh);
-    build_aa_filters(sh, dh, fv);
-
-    // horizontal pass: (sw,sh) -> (dw,sh), float
-    std::vector<float> tmp((size_t)dw * sh * 3);
-    for (int y = 0; y < sh; y++) {
-        const uint8_t * row = src + (size_t)y * sw * 3;
-        for (int x = 0; x < dw; x++) {
-            const Filter & f = fh[x];
-            double acc[3] = {0, 0, 0};
-            for (size_t k = 0; k < f.w.size(); k++) {
-                const uint8_t * px = row + (size_t)(f.start + (int)k) * 3;
-                acc[0] += f.w[k] * (double)px[0];
-                acc[1] += f.w[k] * (double)px[1];
-                acc[2] += f.w[k] * (double)px[2];
-            }
-            float * dst = &tmp[((size_t)y * dw + x) * 3];
-            dst[0] = (float)acc[0];
-            dst[1] = (float)acc[1];
-            dst[2] = (float)acc[2];
-        }
-    }
-    // vertical pass: (dw,sh) -> (dw,dh)
-    out.assign((size_t)dw * dh * 3, 0.0f);
-    for (int y = 0; y < dh; y++) {
-        const Filter & f = fv[y];
-        for (int x = 0; x < dw; x++) {
-            double acc[3] = {0, 0, 0};
-            for (size_t k = 0; k < f.w.size(); k++) {
-                const float * px = &tmp[((size_t)(f.start + (int)k) * dw + x) * 3];
-                acc[0] += f.w[k] * (double)px[0];
-                acc[1] += f.w[k] * (double)px[1];
-                acc[2] += f.w[k] * (double)px[2];
-            }
-            float * dst = &out[((size_t)y * dw + x) * 3];
-            dst[0] = (float)acc[0];
-            dst[1] = (float)acc[1];
-            dst[2] = (float)acc[2];
-        }
-    }
 }
 
 // ---------------------------------------------------------------- patchify

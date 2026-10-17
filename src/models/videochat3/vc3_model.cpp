@@ -25,7 +25,9 @@
 #   include "ggml-cuda.h"   // ggml_backend_cuda_init
 #endif
 #include "tokenizer.hpp"
+#include "backend.hpp"
 #include "ggml_dump.hpp"
+#include "gguf_util.hpp"
 #include "stage_buf.hpp"
 #include "vc3_preprocess.hpp"
 #include "attention.hpp"
@@ -174,34 +176,7 @@ private:
 };
 
 // ---------------------------------------------------------------- helpers
-static float gguf_f32(struct gguf_context * g, const char * key, float def) {
-    int64_t id = gguf_find_key(g, key);
-    return id >= 0 ? gguf_get_val_f32(g, id) : def;
-}
-static int gguf_u32(struct gguf_context * g, const char * key, int def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return def;
-    switch (gguf_get_kv_type(g, id)) {
-        case GGUF_TYPE_UINT32: return (int)gguf_get_val_u32(g, id);
-        case GGUF_TYPE_INT32:  return gguf_get_val_i32(g, id);
-        case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(g, id);
-        case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(g, id);
-        default: return def;
-    }
-}
 
-static void tensor_to_f32(ggml_tensor * t, float * dst) {
-    const int64_t n = ggml_nelements(t);
-    if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, t->data, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * s = (const ggml_fp16_t *)t->data;
-        for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
-    } else {
-        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-        tt->to_float(t->data, dst, n);
-    }
-}
 
 // per-pair complex rotation on an interleaved head vector: pair p = (v[2p], v[2p+1]).
 // cos_t/sin_t are [1, pairs, H, N] - pre-expanded on the host to re/im's exact shape,
@@ -246,20 +221,8 @@ VideoChat3::~VideoChat3() {
 }
 
 bool VideoChat3::init_backend() {
-    if (use_gpu) {
-#ifdef GGML_USE_CUDA
-        backend = ggml_backend_cuda_init(0);
-#endif
-    }
-    if (backend) {
-        fprintf(stderr, "backend: %s\n", ggml_backend_name(backend));
-    } else {
-        backend = ggml_backend_cpu_init();
-        if (!backend) { fprintf(stderr, "no backend available\n"); return false; }
-        if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency() / 2);
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-        fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), n_threads);
-    }
+    backend = vqa::init_backend(use_gpu, n_threads);
+    if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return allocr != nullptr;
 }
@@ -307,28 +270,28 @@ bool VideoChat3::load_weights(const char * path) {
     struct gguf_context * gu = gguf_init_from_file(path, p);
     if (!gu) { fprintf(stderr, "gguf init failed\n"); return false; }
 
-    n_layer   = gguf_u32(gu, "videochat3.block_count", n_layer);
-    n_embd    = gguf_u32(gu, "videochat3.embedding_length", n_embd);
-    n_head    = gguf_u32(gu, "videochat3.attention.head_count", n_head);
-    n_kv_head = gguf_u32(gu, "videochat3.attention.head_count_kv", n_kv_head);
-    head_dim  = gguf_u32(gu, "videochat3.attention.key_length", head_dim);
-    n_ff      = gguf_u32(gu, "videochat3.feed_forward_length", n_ff);
-    n_vocab   = gguf_u32(gu, "videochat3.vocab_size", n_vocab);
-    rms_eps   = gguf_f32(gu, "videochat3.attention.layer_norm_rms_epsilon", rms_eps);
-    rope_theta = gguf_f32(gu, "videochat3.rope.freq_base", rope_theta);
+    n_layer   = vqa::gguf::u32(gu, "videochat3.block_count", n_layer);
+    n_embd    = vqa::gguf::u32(gu, "videochat3.embedding_length", n_embd);
+    n_head    = vqa::gguf::u32(gu, "videochat3.attention.head_count", n_head);
+    n_kv_head = vqa::gguf::u32(gu, "videochat3.attention.head_count_kv", n_kv_head);
+    head_dim  = vqa::gguf::u32(gu, "videochat3.attention.key_length", head_dim);
+    n_ff      = vqa::gguf::u32(gu, "videochat3.feed_forward_length", n_ff);
+    n_vocab   = vqa::gguf::u32(gu, "videochat3.vocab_size", n_vocab);
+    rms_eps   = vqa::gguf::f32(gu, "videochat3.attention.layer_norm_rms_epsilon", rms_eps);
+    rope_theta = vqa::gguf::f32(gu, "videochat3.rope.freq_base", rope_theta);
 
-    vc.n_layer = gguf_u32(gu, "videochat3.vision.block_count", vc.n_layer);
-    vc.n_embd  = gguf_u32(gu, "videochat3.vision.embedding_length", vc.n_embd);
-    vc.n_head  = gguf_u32(gu, "videochat3.vision.attention.head_count", vc.n_head);
-    vc.n_ff    = gguf_u32(gu, "videochat3.vision.feed_forward_length", vc.n_ff);
-    vc.patch   = gguf_u32(gu, "videochat3.vision.patch_size", vc.patch);
-    vc.merge   = gguf_u32(gu, "videochat3.vision.merge_size", vc.merge);
-    vc.temporal_merge = gguf_u32(gu, "videochat3.vision.temporal_merge_size", vc.temporal_merge);
-    vc.pos_h   = gguf_u32(gu, "videochat3.vision.pos_emb_height", vc.pos_h);
-    vc.pos_w   = gguf_u32(gu, "videochat3.vision.pos_emb_width", vc.pos_w);
-    vc.layernorm_eps = gguf_f32(gu, "videochat3.vision.layer_norm_epsilon", vc.layernorm_eps);
-    vc.rope_theta = gguf_f32(gu, "videochat3.vision.rope_theta", vc.rope_theta);
-    if (gguf_u32(gu, "videochat3.vision.rope_layout", 0) != 2) {
+    vc.n_layer = vqa::gguf::u32(gu, "videochat3.vision.block_count", vc.n_layer);
+    vc.n_embd  = vqa::gguf::u32(gu, "videochat3.vision.embedding_length", vc.n_embd);
+    vc.n_head  = vqa::gguf::u32(gu, "videochat3.vision.attention.head_count", vc.n_head);
+    vc.n_ff    = vqa::gguf::u32(gu, "videochat3.vision.feed_forward_length", vc.n_ff);
+    vc.patch   = vqa::gguf::u32(gu, "videochat3.vision.patch_size", vc.patch);
+    vc.merge   = vqa::gguf::u32(gu, "videochat3.vision.merge_size", vc.merge);
+    vc.temporal_merge = vqa::gguf::u32(gu, "videochat3.vision.temporal_merge_size", vc.temporal_merge);
+    vc.pos_h   = vqa::gguf::u32(gu, "videochat3.vision.pos_emb_height", vc.pos_h);
+    vc.pos_w   = vqa::gguf::u32(gu, "videochat3.vision.pos_emb_width", vc.pos_w);
+    vc.layernorm_eps = vqa::gguf::f32(gu, "videochat3.vision.layer_norm_epsilon", vc.layernorm_eps);
+    vc.rope_theta = vqa::gguf::f32(gu, "videochat3.vision.rope_theta", vc.rope_theta);
+    if (vqa::gguf::u32(gu, "videochat3.vision.rope_layout", 0) != 2) {
         fprintf(stderr, "this build expects a rope_layout=2 GGUF (wqkv rows permuted + zero-padded for the fused vision rope); re-run convert/convert_videochat3.py\n");
         return false;
     }
@@ -359,7 +322,7 @@ bool VideoChat3::load_weights(const char * path) {
             if (t->type == GGML_TYPE_F32) continue;
             const int64_t n = ggml_nelements(t);
             float * dst = (float *)(host_f32.data() + off);
-            tensor_to_f32(t, dst);
+            vqa::gguf::tensor_to_f32(t, dst);
             t->data = dst;
             t->type = GGML_TYPE_F32;
             t->nb[0] = sizeof(float);
@@ -513,8 +476,8 @@ bool VideoChat3::load_weights(const char * path) {
         if (!pe || !tw) { fprintf(stderr, "missing positional embedding tensors\n"); return false; }
         pos_emb_host.resize(ggml_nelements(pe));
         pos_time_host.resize(ggml_nelements(tw));
-        tensor_to_f32(pe, pos_emb_host.data());
-        tensor_to_f32(tw, pos_time_host.data());
+        vqa::gguf::tensor_to_f32(pe, pos_emb_host.data());
+        vqa::gguf::tensor_to_f32(tw, pos_time_host.data());
     }
 
     {
@@ -631,25 +594,7 @@ bool VideoChat3::alloc_kv() {
 
 void VideoChat3::dump(const ggml_cgraph * gf, const char * name) {
     if (dump_dir.empty()) return;
-    ggml_tensor * t = ggml_graph_get_tensor((ggml_cgraph *)gf, name);
-    if (!t || !t->data) return;
-    std::string path = dump_dir + "/cpp_" + name + ".bin";
-    std::vector<float> tmp((size_t)ggml_nelements(t));
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, tmp.data(), 0, sizeof(float) * tmp.size());
-    } else {
-        std::vector<ggml_fp16_t> h(ggml_nelements(t));
-        ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
-        for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
-    }
-    FILE * f = fopen(path.c_str(), "wb");
-    if (f) { fwrite(tmp.data(), sizeof(float), tmp.size(), f); fclose(f); }
-    FILE * m = fopen((dump_dir + "/cpp_" + name + ".shape").c_str(), "w");
-    if (m) {
-        fprintf(m, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1],
-                (long long)t->ne[2], (long long)t->ne[3]);
-        fclose(m);
-    }
+    vqa::dump::write((ggml_cgraph *)gf, dump_dir.c_str(), name);   // core/ggml_dump.hpp
 }
 
 // ---- shared ViT block plumbing (vqa::vit::block) --------------------------

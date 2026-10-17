@@ -68,6 +68,7 @@
 // regex pre-tokenizer, no <|...|> specials).
 #include "tokenizer.hpp"
 #include "vqa_util.hpp"
+#include "backend.hpp"
 #include "ggml_dump.hpp"
 using vqa::MMap;
 using vqa::Tokenizer;
@@ -323,7 +324,7 @@ bool Engine::init(const char * gguf_path, const char * tok_json, int n_ctx_) {
 #endif
     if (!backend) {
         backend = ggml_backend_cpu_init();
-        int nth = std::max(1u, std::thread::hardware_concurrency() / 2);   // physical cores; SMT hurts GEMV
+        int nth = vqa::default_n_threads();                                // physical cores; SMT hurts GEMV
         if (const char * e = getenv("MD_THREADS")) nth = atoi(e);          // ggml CPU default is only 4
         ggml_backend_cpu_set_n_threads(backend, nth);
         fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), nth);

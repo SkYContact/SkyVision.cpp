@@ -162,6 +162,8 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "architecture: %s\n", arch.c_str());
 
+    // a pure video tower (videomae) has no text side at all: no tokenizer needed
+    const bool needs_tokenizer = arch != "videomae";
     std::string tok_path = vqa::resolve_tokenizer_path(tokenizer_arg);
     if (!tok_path.empty()) {
         // keep the explicit argument as given
@@ -170,7 +172,10 @@ int main(int argc, char ** argv) {
         std::string dir = slash == std::string::npos ? std::string(".") : model_path.substr(0, slash);
         tok_path = vqa::resolve_tokenizer_path(dir);
     }
-    if (tok_path.empty()) { fprintf(stderr, "no tokenizer.json found (use --tokenizer)\n"); return 2; }
+    if (tok_path.empty() && needs_tokenizer) {
+        fprintf(stderr, "no tokenizer.json found (use --tokenizer)\n");
+        return 2;
+    }
 
     if (dump_ids) {   // tokenizer self test: no model load needed
         std::vector<int> ids;

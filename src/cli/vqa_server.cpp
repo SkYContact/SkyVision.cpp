@@ -462,6 +462,9 @@ void discover_models() {
                 fprintf(stderr, "serve: skip %s (needs tokenizer.json)\n", f.c_str());
                 continue;
             }
+        } else if (arch == "videomae") {
+            // pure video tower: no tokenizer, no text side
+            tok.clear();
         } else {
             continue;   // vision/region side files and unknown archs stay unlisted
         }
@@ -814,7 +817,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         g_arch_placeholder = e->arch;
         serve_page(e->arch == "moondream3" ? "moondream.html"
                  : e->arch == "moss_vl" ? "moss.html"
-                 : "vc3.html");
+                 : "vc3.html");   // videochat3 / qwen3_5 / marlin / videomae
         return true;
     }
     send(c, "404 Not Found", "text/plain", "not found");

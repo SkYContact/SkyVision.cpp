@@ -15,6 +15,7 @@
 | **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
 | **Qwen3.5 系（含 Marlin-2B）** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
+| **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 
 ## 当前状态
 
@@ -42,6 +43,7 @@
 | MOSS-VL 多轮会话 | ✅ `--serve` 的 `/ask?session=<id>`（`reset=1` 清空）：server 维护最近 12 轮文本历史，引擎 prompt 重建（媒体缓存命中时视觉塔免重跑） |
 | MOSS-VL 实时流会话 | ✅ `/ask?session=<id>&rt=1`：官方 real_time_generate 的引擎侧实现——新帧/新问题增量追加到活跌 KV（文本 KV 续写 + cross-KV 行追加，不重建全上下文），位置按官方增量 MRoPE 公式；`<|silence|>` 作为闲置信号终止本轮。已验证：跨轮记忆（两张图分别在后续追问中正确引用） |
 | MOSS-VL 常驻推理流 | ✅ `rt/start?session=&src=&interval=`（src=文件/URL/`video=`摄像头）：ffmpeg 采集线程 + 常驻推理循环，模型按轮观察新帧并**主动发言**（`<|silence|>`=本轮无话可说）；`rt/say?q=` 流内提问（独立文本轮）、`rt/events?since=` 轮询 NDJSON 事件、`rt/stop` 停止 |
+| VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
 ## 快速开始
 
 ### 1. 构建
@@ -91,6 +93,10 @@ modelscope download NemoStation/Marlin-2B --local_dir models/Marlin-2B
 
 # Qwen3.5-2B（官方，通用图文/视频问答）
 modelscope download Qwen/Qwen3.5-2B --local_dir models/Qwen3.5-2B
+
+# VideoMAE：预训练版（只有嵌入）或带 Kinetics-400 分类头的 fine-tune
+hf download MCG-NJU/videomae-base --local-dir models/videomae-base
+hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae-base-ft
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
@@ -112,6 +118,10 @@ vqa-cli --model marlin-2b-q8_0.gguf --tokenizer models/Marlin-2B         --video
 vqa-cli --model moondream3.1-q6k.gguf --tokenizer tokenizer.json \
         --vision moondream3.1-vision.gguf --region moondream3.1-region.gguf \
         --image photo.jpg --ask "What is in this image?" --n-ctx 1024
+
+# VideoMAE：视频 → 动作标签（分类头版）/ 768 维嵌入（预训练版）
+vqa-cli --model videomae-base-ft.gguf --video clip.mp4 --ask x --mode 5
+vqa-cli --model videomae-base.gguf    --video clip.mp4 --ask x --mode embed
 
 # moondream3.1 独立二进制：技能、Web UI、批量
 moondream-cli -m moondream3.1-q6k.gguf -t tokenizer.json \
@@ -144,6 +154,7 @@ HTTP API：`POST /api/vision`，`mode=ask|caption|detect|point|gaze`
 | `convert_region.py` | `moondream3.1-region.gguf`（detect/point/gaze 头，~30MB） |
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf`（Qwen3 + VideoChat3 ViT，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
 | `convert_marlin.py` | `marlin-2b-<outtype>.gguf`（Qwen3.5 混合主干 + Qwen3-VL 视觉塔，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
+| `convert_videomae.py` | `videomae-<outtype>.gguf`（VideoMAE 视频塔，单文件，`--outtype f16\|q8_0\|q4_0`；分类头与 `id2label` 一起写进 GGUF） |
 
 ### moondream3.1
 
@@ -180,6 +191,43 @@ python convert/convert_videochat3.py --outtype q4_0   # → 2.95GB
 
 `q4_k` / `q5_k` / `q2_k` 目前不可用（上游 gguf-py 只实现了它们的解码），
 `q6_k` 走本仓库的 `convert/q6k.py`。Q8_0 及以上精度更高，Q6_K/Q4_0 更省显存与带宽。
+
+### VideoMAE
+
+读取任意 transformers `videomae` 检查点（`MCG-NJU/videomae-base`、`MCG-NJU/videomae-base-finetuned-kinetics` 等）：
+
+```bash
+python convert/convert_videomae.py --src models/videomae-base-ft   # → videomae-f16.gguf（约 190MB）
+```
+
+- Conv3d patch 嵌入折叠成一次 matmul（权重 `[dim, C*tubelet*patch*patch]`），
+  token 顺序 `(t', h', w')`、元素顺序 `(c, dt, dh, dw)`，与卷积权重展平顺序一致
+- **位置表不是权重**：VideoMAE 用的是原始实现里的固定 sin-cos 表（`get_sinusoid_encoding_table`，
+  一维序号 0..1567），转换器现场生成后以 F32 存入 GGUF
+- **没有 cls token**：`pooled` 取 token 0（`use_mean_pooling` 的 fine-tune 才做均值 + `fc_norm`）
+- q/k/v 三块权重在转换期拼成 `v.blk.{i}.wqkv.weight`，bias 是 `q_bias | 0 | v_bias`
+  （key 无 bias，这是 VideoMAE 特有的写法）
+- 池化分两种，跟着检查点走：预训练版 `use_mean_pooling=false` → 取 token 0 且**有**末尾
+  LayerNorm（`v.norm`）；`*-finetuned-kinetics` 这类 `use_mean_pooling=true` 的微调版 →
+  对全部 token 求均值、**没有**末尾 LayerNorm，改用 `fc_norm`（eps 1e-5）。转换器按张量
+  实际存在与否写 `videomae.has_final_norm` / `videomae.use_mean_pooling`
+- 分类头的 `id2label` 写成 `videomae.labels` 字符串数组，引擎按它打印标签名；
+  没有 `classifier.*` 的预训练检查点转换后只出嵌入
+- `--mode N` 打印 top-N（默认 5），`--mode embed` 输出 768 维 pooled 嵌入（JSON 数组）；
+  `--ask` 对这类模型没有意义，会被忽略
+- **图只建一次**：clip 形状固定（16 帧 → 1568 token），`load()` 里建好静态图后每次只回填输入
+  张量。这不只是省掉 per-clip 的建图/分配（实测 <0.5 ms，可忽略），更是 CUDA graph capture
+  的前提——ggml 的 capture key 是 `nodes[0]`，图对象必须跨调用存活
+- CPU 上想更快就量化权重：`--outtype q8_0`（~100 MB，i7-14700K 上 850 ms → 590 ms，
+  Kinetics-400 的 top-1 概率只差 4e-4）。f16 更省事、GPU 更快，所以仍是默认
+- 实测（i7-14700K，19 物理核，单 clip 1568 token × 12 层）：f16 约 0.85 s、q8_0 约 0.59 s
+
+对拍：`python scripts/ref_videomae.py --model <hf_dir> --video clip.mp4 --out ref_videomae`
+导出官方实现的 `v_patch_out / v_blk0_out / v_final / v_pooled / v_logits / v_probs`，
+再用 `vqa-cli --dump-dir ref_videomae` 跑同一段视频，逐级比 `cpp_*.bin`。
+本仓库提交前已用另一条独立通道（numpy 从 GGUF 权重复算整条前向，preprocess 用引擎自己的
+`patches` 导出）验证：12 层全长 maxdiff 8e-3（值域 ~13），patch 嵌入 3e-3，block0 注意力
+3e-4，Kinetics-400 分类头 400 个概率与引擎最大差 8.7e-6——都在 F16 权重噪声量级。
 
 模型权重遵循各自的许可证（moondream 为
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。
@@ -253,6 +301,7 @@ src/
                        图像与视频帧解码（stb_image 实现所在）、按架构发现后端
   models/moondream/    moondream3.1 后端（引擎 + 视觉塔 + 多 crop 预处理 + region 头 + 服务端/批量）
   models/videochat3/   VideoChat3-4B 后端（视觉预处理 + 计算图）
+  models/videomae/     VideoMAE 视频塔后端（clip 预处理 + 全时空注意力前向 + 分类/嵌入）
   cli/                 统一前端 vqa-cli
 convert/               HF 检查点 → GGUF 转换器
 scripts/               构建脚本、parity 与自检脚本
@@ -265,7 +314,18 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
 - **parity 脚本**：`scripts/ref_videochat3.py` 用 transformers 跑官方实现并导出中间张量，
   `scripts/compare_vc3.py` 与 C++ 侧的 dump 逐级比对（预处理 / patch 嵌入 / 每层输出 / logits）。
 - **调试开关**：`VC3_DUMP_DIR=<dir>` 导出中间张量，`VC3_MAX_LAYERS=N` 截断层数做分层对照，
-  `VC3_NO_FUSION=1` 退回未融合的 SwiGLU，`--dump-ids` 只跑分词。
+  `VC3_NO_FUSION=1` 退回未融合的 SwiGLU，  `--dump-ids` 只跑分词；VideoMAE 用
+  `VIDEOMAE_DUMP_DIR=<dir>`（或 `--dump-dir`）导出 `patches / v_patch_out / v_blk0_qkv /
+  v_blk0_attn_out / v_blk0_out / v_final / v_pooled / v_logits / v_probs`，
+  `VIDEOMAE_MAX_LAYERS=N` 只跑前 N 层做逐层漂移对照（本机实测 12 层全长相对差 ~1e-3，
+  约为 F16 权重噪声 + 线程归约顺序噪声）。
+- **共享层（`src/core`）**：后端之间不放重复实现——`vqa.hpp` 接口、`backend.hpp`（CUDA 优先 +
+  CPU 回退 + 线程数默认值，按**物理核**而不是逻辑核，SMT 对这类模型的 GEMV 是负收益）、
+  `gguf_util.hpp`（元数据读取 / 张量转 F32）、`vit_block.hpp`（所有 ViT 塔共用的 block 体，
+  moondream / VideoChat3 / VideoMAE 三家都用它，差异走 hooks）、`resample.hpp`（smart_resize、
+  PIL 语义 antialias bicubic 缩放、位置表双线性插值——原来寄居在 videochat3 目录里被另外三个
+  模型反向 include）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
+  `ggml_dump.hpp`（对拍导出）、`sampler.hpp`、`tokenizer.cpp`、`media_io.cpp`。
 - **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/unicode_ranges.inc`。
 
 ## License

@@ -33,11 +33,13 @@
 #   include "ggml-cuda.h"
 #endif
 #include "tokenizer.hpp"
+#include "backend.hpp"
 #include "ggml_dump.hpp"
+#include "gguf_util.hpp"
 #include "attention.hpp"
 #include "sampler.hpp"
 #include "vqa_util.hpp"
-#include "vc3_preprocess.hpp"
+#include "resample.hpp"   // vqa::img::smart_resize / resize_bicubic_antialias
 #include "moss_vl_preprocess.hpp"
 
 #include <algorithm>
@@ -294,43 +296,7 @@ private:
 };
 
 // ---------------------------------------------------------------- helpers
-static float gguf_f32(struct gguf_context * g, const char * key, float def) {
-    int64_t id = gguf_find_key(g, key);
-    return id >= 0 ? gguf_get_val_f32(g, id) : def;
-}
-static int gguf_u32(struct gguf_context * g, const char * key, int def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return def;
-    switch (gguf_get_kv_type(g, id)) {
-        case GGUF_TYPE_UINT32: return (int)gguf_get_val_u32(g, id);
-        case GGUF_TYPE_INT32:  return gguf_get_val_i32(g, id);
-        case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(g, id);
-        case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(g, id);
-        default: return def;
-    }
-}
-static std::vector<int> gguf_arr_u32(struct gguf_context * g, const char * key,
-                                     const std::vector<int> & def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) return def;
-    const int64_t n = gguf_get_arr_n(g, id);
-    if (n <= 0) return def;
-    const int32_t * arr = (const int32_t *)gguf_get_arr_data(g, id);
-    return std::vector<int>(arr, arr + n);
-}
 
-static void tensor_to_f32(ggml_tensor * t, float * dst) {
-    const int64_t n = ggml_nelements(t);
-    if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, t->data, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * s = (const ggml_fp16_t *)t->data;
-        for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
-    } else {
-        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-        tt->to_float(t->data, dst, n);
-    }
-}
 
 MossVL::~MossVL() {
     if (allocr) ggml_gallocr_free(allocr);
@@ -344,20 +310,8 @@ MossVL::~MossVL() {
 }
 
 bool MossVL::init_backend() {
-    if (use_gpu) {
-#ifdef GGML_USE_CUDA
-        backend = ggml_backend_cuda_init(0);
-#endif
-    }
-    if (backend) {
-        fprintf(stderr, "backend: %s\n", ggml_backend_name(backend));
-    } else {
-        backend = ggml_backend_cpu_init();
-        if (!backend) { fprintf(stderr, "no backend available\n"); return false; }
-        if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency() / 2);
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-        fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), n_threads);
-    }
+    backend = vqa::init_backend(use_gpu, n_threads);
+    if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return allocr != nullptr;
 }
@@ -406,40 +360,40 @@ bool MossVL::load_weights(const char * path) {
     struct gguf_context * gu = gguf_init_from_file(path, p);
     if (!gu) { fprintf(stderr, "gguf init failed\n"); return false; }
 
-    n_layer   = gguf_u32(gu, "moss_vl.block_count", n_layer);
-    n_embd    = gguf_u32(gu, "moss_vl.embedding_length", n_embd);
-    n_head    = gguf_u32(gu, "moss_vl.attention.head_count", n_head);
-    n_kv_head = gguf_u32(gu, "moss_vl.attention.head_count_kv", n_kv_head);
-    head_dim  = gguf_u32(gu, "moss_vl.attention.key_length", head_dim);
-    n_ff      = gguf_u32(gu, "moss_vl.feed_forward_length", n_ff);
-    n_vocab   = gguf_u32(gu, "moss_vl.vocab_size", n_vocab);
-    rms_eps   = gguf_f32(gu, "moss_vl.attention.layer_norm_rms_epsilon", rms_eps);
-    rope_theta = gguf_f32(gu, "moss_vl.rope.freq_base", rope_theta);
-    mrope_t   = gguf_u32(gu, "moss_vl.rope.mrope_section_t", mrope_t);
-    mrope_h   = gguf_u32(gu, "moss_vl.rope.mrope_section_h", mrope_h);
-    mrope_w   = gguf_u32(gu, "moss_vl.rope.mrope_section_w", mrope_w);
+    n_layer   = vqa::gguf::u32(gu, "moss_vl.block_count", n_layer);
+    n_embd    = vqa::gguf::u32(gu, "moss_vl.embedding_length", n_embd);
+    n_head    = vqa::gguf::u32(gu, "moss_vl.attention.head_count", n_head);
+    n_kv_head = vqa::gguf::u32(gu, "moss_vl.attention.head_count_kv", n_kv_head);
+    head_dim  = vqa::gguf::u32(gu, "moss_vl.attention.key_length", head_dim);
+    n_ff      = vqa::gguf::u32(gu, "moss_vl.feed_forward_length", n_ff);
+    n_vocab   = vqa::gguf::u32(gu, "moss_vl.vocab_size", n_vocab);
+    rms_eps   = vqa::gguf::f32(gu, "moss_vl.attention.layer_norm_rms_epsilon", rms_eps);
+    rope_theta = vqa::gguf::f32(gu, "moss_vl.rope.freq_base", rope_theta);
+    mrope_t   = vqa::gguf::u32(gu, "moss_vl.rope.mrope_section_t", mrope_t);
+    mrope_h   = vqa::gguf::u32(gu, "moss_vl.rope.mrope_section_h", mrope_h);
+    mrope_w   = vqa::gguf::u32(gu, "moss_vl.rope.mrope_section_w", mrope_w);
     {
         std::vector<int> def;
         for (int i = 2; i < n_layer; i += 4) def.push_back(i);
-        xlayers = gguf_arr_u32(gu, "moss_vl.cross_layer_indexes", def);
+        xlayers = vqa::gguf::arr_u32(gu, "moss_vl.cross_layer_indexes", def);
         std::sort(xlayers.begin(), xlayers.end());
     }
 
-    vc.n_layer = gguf_u32(gu, "moss_vl.vision.block_count", vc.n_layer);
-    vc.n_embd  = gguf_u32(gu, "moss_vl.vision.embedding_length", vc.n_embd);
-    vc.n_head  = gguf_u32(gu, "moss_vl.vision.attention.head_count", vc.n_head);
-    vc.n_ff    = gguf_u32(gu, "moss_vl.vision.feed_forward_length", vc.n_ff);
-    vc.patch   = gguf_u32(gu, "moss_vl.vision.patch_size", vc.patch);
-    vc.merge   = gguf_u32(gu, "moss_vl.vision.merge_size", vc.merge);
+    vc.n_layer = vqa::gguf::u32(gu, "moss_vl.vision.block_count", vc.n_layer);
+    vc.n_embd  = vqa::gguf::u32(gu, "moss_vl.vision.embedding_length", vc.n_embd);
+    vc.n_head  = vqa::gguf::u32(gu, "moss_vl.vision.attention.head_count", vc.n_head);
+    vc.n_ff    = vqa::gguf::u32(gu, "moss_vl.vision.feed_forward_length", vc.n_ff);
+    vc.patch   = vqa::gguf::u32(gu, "moss_vl.vision.patch_size", vc.patch);
+    vc.merge   = vqa::gguf::u32(gu, "moss_vl.vision.merge_size", vc.merge);
     {
-        int npe = gguf_u32(gu, "moss_vl.vision.num_position_embeddings", 2304);
+        int npe = vqa::gguf::u32(gu, "moss_vl.vision.num_position_embeddings", 2304);
         vc.pos_side = npe > 0 ? (int)std::lround(std::sqrt((double)npe)) : 48;
     }
-    vc.out_hidden = gguf_u32(gu, "moss_vl.vision.out_embedding_length", vc.out_hidden);
-    vc.layernorm_eps = gguf_f32(gu, "moss_vl.vision.layer_norm_epsilon", vc.layernorm_eps);
-    vc.rope_theta = gguf_f32(gu, "moss_vl.vision.rope_freq_base", vc.rope_theta);
-    ds_idx = gguf_arr_u32(gu, "moss_vl.vision.deepstack_indexes", {8, 16, 24});
-    if (gguf_u32(gu, "moss_vl.vision.rope_layout", 0) != 2) {
+    vc.out_hidden = vqa::gguf::u32(gu, "moss_vl.vision.out_embedding_length", vc.out_hidden);
+    vc.layernorm_eps = vqa::gguf::f32(gu, "moss_vl.vision.layer_norm_epsilon", vc.layernorm_eps);
+    vc.rope_theta = vqa::gguf::f32(gu, "moss_vl.vision.rope_freq_base", vc.rope_theta);
+    ds_idx = vqa::gguf::arr_u32(gu, "moss_vl.vision.deepstack_indexes", {8, 16, 24});
+    if (vqa::gguf::u32(gu, "moss_vl.vision.rope_layout", 0) != 2) {
         fprintf(stderr, "this build expects a rope_layout=2 GGUF (wqkv rows permuted + zero-padded for the fused vision rope); re-run convert/convert_moss_vl.py\n");
         return false;
     }
@@ -484,7 +438,7 @@ bool MossVL::load_weights(const char * path) {
             if (t->type == GGML_TYPE_F32) continue;
             const int64_t n = ggml_nelements(t);
             float * dst = (float *)(host_f32.data() + off);
-            tensor_to_f32(t, dst);
+            vqa::gguf::tensor_to_f32(t, dst);
             t->data = dst;
             t->type = GGML_TYPE_F32;
             t->nb[0] = sizeof(float);
@@ -500,7 +454,7 @@ bool MossVL::load_weights(const char * path) {
         ggml_tensor * pe = ggml_get_tensor(wctx, "v.pos_emb.weight");
         if (!pe) { fprintf(stderr, "missing v.pos_emb.weight\n"); return false; }
         pos_emb_host.resize(ggml_nelements(pe));
-        tensor_to_f32(pe, pos_emb_host.data());
+        vqa::gguf::tensor_to_f32(pe, pos_emb_host.data());
     }
 
     {
@@ -694,7 +648,7 @@ bool MossVL::prepare_media(const vqa::MediaInput & media, int token_budget,
     }
 
     int H = 0, W = 0;
-    if (!vc3::smart_resize(src_h, src_w, factor, 4096, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
+    if (!vqa::img::smart_resize(src_h, src_w, factor, 4096, (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
     }
@@ -706,7 +660,7 @@ bool MossVL::prepare_media(const vqa::MediaInput & media, int token_budget,
             const double scale = (double)n_max / (double)n_patches;
             max_pixels = (long long)(max_pixels * scale);
             int H2, W2;
-            if (!vc3::smart_resize(src_h, src_w, factor, 4096, (int)std::min(max_pixels, (long long)INT_MAX), &H2, &W2)) {
+            if (!vqa::img::smart_resize(src_h, src_w, factor, 4096, (int)std::min(max_pixels, (long long)INT_MAX), &H2, &W2)) {
                 fprintf(stderr, "image too small after guard\n");
                 return false;
             }
@@ -725,7 +679,7 @@ bool MossVL::prepare_media(const vqa::MediaInput & media, int token_budget,
     std::vector<float> rgb;
     std::vector<int> coords;
     for (int ti = 0; ti < T; ti++) {
-        vc3::resize_bicubic_antialias(media.frames[ti].rgb.data(), src_w, src_h, W, H, rgb);
+        vqa::img::resize_bicubic_antialias(media.frames[ti].rgb.data(), src_w, src_h, W, H, rgb);
         patchify_frame(rgb.data(), H, W, vc, pos_emb_host.data(), patches, pos, coords, gh, gw);
     }
     // fused vision rope positions, ggml mrope PLANAR layout: [row(N), col(N),
@@ -1502,26 +1456,7 @@ void MossVL::dump_host(const char * name, const void * data, size_t bytes,
 
 void MossVL::dump(const ggml_cgraph * gf, const char * name) {
     if (dump_dir.empty()) return;
-    ggml_tensor * t = vqa::dump::lookup((ggml_cgraph *)gf, name);
-    if (!t) t = ggml_graph_get_tensor((ggml_cgraph *)gf, name);
-    if (!t || !t->data) return;
-    std::string path = dump_dir + "/cpp_" + name + ".bin";
-    std::vector<float> tmp((size_t)ggml_nelements(t));
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, tmp.data(), 0, sizeof(float) * tmp.size());
-    } else {
-        std::vector<ggml_fp16_t> h(ggml_nelements(t));
-        ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
-        for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
-    }
-    FILE * f = fopen(path.c_str(), "wb");
-    if (f) { fwrite(tmp.data(), sizeof(float), tmp.size(), f); fclose(f); }
-    FILE * m = fopen((dump_dir + "/cpp_" + name + ".shape").c_str(), "w");
-    if (m) {
-        fprintf(m, "%lld %lld %lld %lld\n", (long long)t->ne[0], (long long)t->ne[1],
-                (long long)t->ne[2], (long long)t->ne[3]);
-        fclose(m);
-    }
+    vqa::dump::write((ggml_cgraph *)gf, dump_dir.c_str(), name);   // core/ggml_dump.hpp
 }
 
 bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,

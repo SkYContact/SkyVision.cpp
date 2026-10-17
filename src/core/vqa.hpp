@@ -113,6 +113,7 @@ Model * create_moondream();
 Model * create_videochat3();
 Model * create_qwen3_5();
 Model * create_moss_vl();
+Model * create_videomae();
 
 // Resolve a backend by GGUF architecture name; returns nullptr when unsupported.
 Model * vqa_create_model(const std::string & arch);

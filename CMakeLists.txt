@@ -34,6 +34,7 @@ set(CORE_INC ${CMAKE_SOURCE_DIR}/src/core)
 set(MD_INC   ${CMAKE_SOURCE_DIR}/src/models/moondream)
 set(VC3_INC  ${CMAKE_SOURCE_DIR}/src/models/videochat3)
 set(MV_INC   ${CMAKE_SOURCE_DIR}/src/models/moss_vl)
+set(VM_INC   ${CMAKE_SOURCE_DIR}/src/models/videomae)
 
 # shared layer. media_io.cpp is the single translation unit owning the stb_image
 # implementation; tokenizer.cpp owns the Unicode tables for the Qwen2
@@ -43,6 +44,8 @@ set(VQA_CORE_SRC
     src/core/vqa_registry.cpp
     src/core/media_io.cpp
     src/core/video_pipe.cpp
+    src/core/backend.cpp
+    src/core/resample.cpp
     src/core/tokenizer.cpp)
 
 set(MOONDREAM_SRC
@@ -55,6 +58,7 @@ set(MOONDREAM_SRC
 set(MOONDREAM_CORE_SRC
     src/core/media_io.cpp
     src/core/vqa_util.cpp
+    src/core/backend.cpp
     src/core/tokenizer.cpp)
 
 set(VIDEOCHAT3_SRC
@@ -71,6 +75,11 @@ set(MOSS_VL_SRC
     src/models/moss_vl/moss_vl_preprocess.cpp
     src/models/moss_vl/moss_vl_model.cpp)
 
+#   src/models/videomae/     VideoMAE video tower (label distribution or embedding)
+set(VIDEOMAE_SRC
+    src/models/videomae/videomae_preprocess.cpp
+    src/models/videomae/videomae_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -79,9 +88,10 @@ add_executable(vqa-cli
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC}
     ${QWEN35_SRC}
-    ${MOSS_VL_SRC})
+    ${MOSS_VL_SRC}
+    ${VIDEOMAE_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC})
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC})
 
 # --- moondream3.1 standalone binary (same engine, its own argument surface) ---
 add_executable(moondream-cli

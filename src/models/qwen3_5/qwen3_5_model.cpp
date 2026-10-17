@@ -29,9 +29,11 @@
 #include "attention.hpp"
 #include "sampler.hpp"
 #include "vqa_util.hpp"
+#include "backend.hpp"
 #include "ggml_dump.hpp"
+#include "gguf_util.hpp"
 #include "stage_buf.hpp"
-#include "../videochat3/vc3_preprocess.hpp"   // smart_resize / resize_bicubic_antialias
+#include "resample.hpp"   // vqa::img::smart_resize / resize_bicubic_antialias
 #include "qwen3_5_preprocess.hpp"
 
 #include <algorithm>
@@ -210,35 +212,6 @@ private:
 };
 
 // ---------------------------------------------------------------- helpers
-static float gguf_f32(struct gguf_context * g, const char * key, float def) {
-    int64_t id = gguf_find_key(g, key);
-    return id >= 0 ? gguf_get_val_f32(g, id) : def;
-}
-static int gguf_u32(struct gguf_context * g, const char * key, int def) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0) return def;
-    switch (gguf_get_kv_type(g, id)) {
-        case GGUF_TYPE_UINT32: return (int)gguf_get_val_u32(g, id);
-        case GGUF_TYPE_BOOL:   return gguf_get_val_bool(g, id) ? 1 : 0;
-        case GGUF_TYPE_INT32:  return (int)gguf_get_val_i32(g, id);
-        case GGUF_TYPE_UINT64: return (int)gguf_get_val_u64(g, id);
-        case GGUF_TYPE_INT64:  return (int)gguf_get_val_i64(g, id);
-        default: return def;
-    }
-}
-
-static void tensor_to_f32(ggml_tensor * t, float * dst) {
-    const int64_t n = ggml_nelements(t);
-    if (t->type == GGML_TYPE_F32) {
-        memcpy(dst, t->data, (size_t)n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * s = (const ggml_fp16_t *)t->data;
-        for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(s[i]);
-    } else {
-        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-        tt->to_float(t->data, dst, n);
-    }
-}
 
 static float randf_(uint64_t & s) {
     s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
@@ -264,20 +237,8 @@ Qwen3_5::~Qwen3_5() {
 }
 
 bool Qwen3_5::init_backend() {
-    if (use_gpu) {
-#ifdef GGML_USE_CUDA
-        backend = ggml_backend_cuda_init(0);
-#endif
-    }
-    if (backend) {
-        fprintf(stderr, "backend: %s\n", ggml_backend_name(backend));
-    } else {
-        backend = ggml_backend_cpu_init();
-        if (!backend) { fprintf(stderr, "no backend available\n"); return false; }
-        if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency() / 2);
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-        fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), n_threads);
-    }
+    backend = vqa::init_backend(use_gpu, n_threads);
+    if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return allocr != nullptr;
 }
@@ -323,44 +284,44 @@ bool Qwen3_5::load_weights(const char * path) {
     struct gguf_context * gu = gguf_init_from_file(path, p);
     if (!gu) { fprintf(stderr, "gguf init failed\n"); return false; }
 
-    n_layer   = gguf_u32(gu, "marlin.block_count", n_layer);
-    n_embd    = gguf_u32(gu, "marlin.embedding_length", n_embd);
-    n_head    = gguf_u32(gu, "marlin.attention.head_count", n_head);
-    n_kv_head = gguf_u32(gu, "marlin.attention.head_count_kv", n_kv_head);
-    head_dim  = gguf_u32(gu, "marlin.attention.key_length", head_dim);
-    n_ff      = gguf_u32(gu, "marlin.feed_forward_length", n_ff);
-    n_vocab   = gguf_u32(gu, "marlin.vocab_size", n_vocab);
-    rms_eps   = gguf_f32(gu, "marlin.attention.layer_norm_rms_epsilon", rms_eps);
-    rope_theta = gguf_f32(gu, "marlin.rope.freq_base", rope_theta);
-    rope_dim  = gguf_u32(gu, "marlin.rope.dimension_count", rope_dim);
-    mrope_sections[0] = gguf_u32(gu, "marlin.rope.dimension_section_0", mrope_sections[0]);
-    mrope_sections[1] = gguf_u32(gu, "marlin.rope.dimension_section_1", mrope_sections[1]);
-    mrope_sections[2] = gguf_u32(gu, "marlin.rope.dimension_section_2", mrope_sections[2]);
-    mrope_sections[3] = gguf_u32(gu, "marlin.rope.dimension_section_3", mrope_sections[3]);
-    ssm_d_conv = gguf_u32(gu, "marlin.ssm.conv_kernel", ssm_d_conv);
-    ssm_d_state = gguf_u32(gu, "marlin.ssm.state_size", ssm_d_state);
-    ssm_d_inner = gguf_u32(gu, "marlin.ssm.inner_size", ssm_d_inner);
-    ssm_n_group = gguf_u32(gu, "marlin.ssm.group_count", ssm_n_group);
-    ssm_dt_rank = gguf_u32(gu, "marlin.ssm.time_step_rank", ssm_dt_rank);
+    n_layer   = vqa::gguf::u32(gu, "marlin.block_count", n_layer);
+    n_embd    = vqa::gguf::u32(gu, "marlin.embedding_length", n_embd);
+    n_head    = vqa::gguf::u32(gu, "marlin.attention.head_count", n_head);
+    n_kv_head = vqa::gguf::u32(gu, "marlin.attention.head_count_kv", n_kv_head);
+    head_dim  = vqa::gguf::u32(gu, "marlin.attention.key_length", head_dim);
+    n_ff      = vqa::gguf::u32(gu, "marlin.feed_forward_length", n_ff);
+    n_vocab   = vqa::gguf::u32(gu, "marlin.vocab_size", n_vocab);
+    rms_eps   = vqa::gguf::f32(gu, "marlin.attention.layer_norm_rms_epsilon", rms_eps);
+    rope_theta = vqa::gguf::f32(gu, "marlin.rope.freq_base", rope_theta);
+    rope_dim  = vqa::gguf::u32(gu, "marlin.rope.dimension_count", rope_dim);
+    mrope_sections[0] = vqa::gguf::u32(gu, "marlin.rope.dimension_section_0", mrope_sections[0]);
+    mrope_sections[1] = vqa::gguf::u32(gu, "marlin.rope.dimension_section_1", mrope_sections[1]);
+    mrope_sections[2] = vqa::gguf::u32(gu, "marlin.rope.dimension_section_2", mrope_sections[2]);
+    mrope_sections[3] = vqa::gguf::u32(gu, "marlin.rope.dimension_section_3", mrope_sections[3]);
+    ssm_d_conv = vqa::gguf::u32(gu, "marlin.ssm.conv_kernel", ssm_d_conv);
+    ssm_d_state = vqa::gguf::u32(gu, "marlin.ssm.state_size", ssm_d_state);
+    ssm_d_inner = vqa::gguf::u32(gu, "marlin.ssm.inner_size", ssm_d_inner);
+    ssm_n_group = vqa::gguf::u32(gu, "marlin.ssm.group_count", ssm_n_group);
+    ssm_dt_rank = vqa::gguf::u32(gu, "marlin.ssm.time_step_rank", ssm_dt_rank);
 
-    vc.n_layer = gguf_u32(gu, "marlin.vision.block_count", vc.n_layer);
-    vc.n_embd  = gguf_u32(gu, "marlin.vision.embedding_length", vc.n_embd);
-    vc.n_head  = gguf_u32(gu, "marlin.vision.attention.head_count", vc.n_head);
-    vc.n_ff    = gguf_u32(gu, "marlin.vision.feed_forward_length", vc.n_ff);
-    vc.patch   = gguf_u32(gu, "marlin.vision.patch_size", vc.patch);
-    vc.temporal_patch = gguf_u32(gu, "marlin.vision.temporal_patch_size", vc.temporal_patch);
-    vc.merge   = gguf_u32(gu, "marlin.vision.merge_size", vc.merge);
-    vc.pos_side = (int)std::lround(sqrtf((float)gguf_u32(gu, "marlin.vision.pos_table_size", 2304)));
-    vc.layernorm_eps = gguf_f32(gu, "marlin.vision.layer_norm_epsilon", vc.layernorm_eps);
-    vc.rope_theta = gguf_f32(gu, "marlin.vision.rope_theta", vc.rope_theta);
-    vc.out_hidden = gguf_u32(gu, "marlin.vision.out_hidden_size", vc.out_hidden);
-    has_mtp = gguf_u32(gu, "marlin.has_mtp", 0) != 0;
-    marlin_skills = gguf_u32(gu, "marlin.skills", 0) != 0;
-    id_image_pad = gguf_u32(gu, "marlin.image_token_id", id_image_pad);
-    id_video_pad = gguf_u32(gu, "marlin.video_token_id", id_video_pad);
-    id_vision_start = gguf_u32(gu, "marlin.vision_start_token_id", id_vision_start);
-    id_vision_end = gguf_u32(gu, "marlin.vision_end_token_id", id_vision_end);
-    id_endoftext = gguf_u32(gu, "marlin.pad_token_id", id_endoftext);
+    vc.n_layer = vqa::gguf::u32(gu, "marlin.vision.block_count", vc.n_layer);
+    vc.n_embd  = vqa::gguf::u32(gu, "marlin.vision.embedding_length", vc.n_embd);
+    vc.n_head  = vqa::gguf::u32(gu, "marlin.vision.attention.head_count", vc.n_head);
+    vc.n_ff    = vqa::gguf::u32(gu, "marlin.vision.feed_forward_length", vc.n_ff);
+    vc.patch   = vqa::gguf::u32(gu, "marlin.vision.patch_size", vc.patch);
+    vc.temporal_patch = vqa::gguf::u32(gu, "marlin.vision.temporal_patch_size", vc.temporal_patch);
+    vc.merge   = vqa::gguf::u32(gu, "marlin.vision.merge_size", vc.merge);
+    vc.pos_side = (int)std::lround(sqrtf((float)vqa::gguf::u32(gu, "marlin.vision.pos_table_size", 2304)));
+    vc.layernorm_eps = vqa::gguf::f32(gu, "marlin.vision.layer_norm_epsilon", vc.layernorm_eps);
+    vc.rope_theta = vqa::gguf::f32(gu, "marlin.vision.rope_theta", vc.rope_theta);
+    vc.out_hidden = vqa::gguf::u32(gu, "marlin.vision.out_hidden_size", vc.out_hidden);
+    has_mtp = vqa::gguf::u32(gu, "marlin.has_mtp", 0) != 0;
+    marlin_skills = vqa::gguf::u32(gu, "marlin.skills", 0) != 0;
+    id_image_pad = vqa::gguf::u32(gu, "marlin.image_token_id", id_image_pad);
+    id_video_pad = vqa::gguf::u32(gu, "marlin.video_token_id", id_video_pad);
+    id_vision_start = vqa::gguf::u32(gu, "marlin.vision_start_token_id", id_vision_start);
+    id_vision_end = vqa::gguf::u32(gu, "marlin.vision_end_token_id", id_vision_end);
+    id_endoftext = vqa::gguf::u32(gu, "marlin.pad_token_id", id_endoftext);
 
     const size_t data_off = gguf_get_data_offset(gu);
     const int64_t nt = gguf_get_n_tensors(gu);
@@ -388,7 +349,7 @@ bool Qwen3_5::load_weights(const char * path) {
             if (t->type == GGML_TYPE_F32) continue;
             const int64_t n = ggml_nelements(t);
             float * dst = (float *)(host_f32.data() + off);
-            tensor_to_f32(t, dst);
+            vqa::gguf::tensor_to_f32(t, dst);
             t->data = dst;
             t->type = GGML_TYPE_F32;
             t->nb[0] = sizeof(float);
@@ -404,7 +365,7 @@ bool Qwen3_5::load_weights(const char * path) {
         ggml_tensor * pe = ggml_get_tensor(wctx, "v.pos_emb.weight");
         if (!pe) { fprintf(stderr, "missing v.pos_emb.weight\n"); return false; }
         pos_table_host.resize(ggml_nelements(pe));
-        tensor_to_f32(pe, pos_table_host.data());
+        vqa::gguf::tensor_to_f32(pe, pos_table_host.data());
     }
 
     {
@@ -690,7 +651,7 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
                     token_budget, gt, gt == 1 ? "" : "s", max_pixels / 1e6);
     }
     int H = 0, W = 0;
-    if (!vc3::smart_resize(src_h, src_w, factor, 4 * factor * factor,
+    if (!vqa::img::smart_resize(src_h, src_w, factor, 4 * factor * factor,
                            (int)std::min(max_pixels, (long long)INT_MAX), &H, &W)) {
         fprintf(stderr, "image too small (%dx%d, factor %d)\n", src_w, src_h, factor);
         return false;
@@ -704,7 +665,7 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
     // resize once, patchify per temporal step (block-major, with pos + rope coords)
     std::vector<std::vector<float>> rgb(T2);
     for (int i = 0; i < T2; i++)
-        vc3::resize_bicubic_antialias(frames[i]->rgb.data(), src_w, src_h, W, H, rgb[i]);
+        vqa::img::resize_bicubic_antialias(frames[i]->rgb.data(), src_w, src_h, W, H, rgb[i]);
 
     std::vector<float> patches, pos;         // per-step blocks appended
     std::vector<int> coords;                 // (h, w) per token, block-major
