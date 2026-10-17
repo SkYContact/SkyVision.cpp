@@ -301,7 +301,8 @@ ggml/                  the only third-party dependency (clone it, not tracked)
 - **Shared layer (`src/core`)**: no duplicated implementations across backends — `vqa.hpp`
   (interface), `backend.hpp` (CUDA-first bring-up + the thread default, which counts **physical**
   cores because SMT hurts these GEMV/small-GEMM shapes), `gguf_util.hpp` (metadata readers +
-  tensor→f32), `vit_block.hpp` (the one ViT block body, shared by moondream / VideoChat3 /
+  tensor→f32), `weight_load.hpp` (mmap binding, 1D→host-F32 promotion, and the CPU zero-copy /
+  GPU upload buffer assignment), `vit_block.hpp` (the one ViT block body, shared by moondream / VideoChat3 /
   VideoMAE, differences via hooks), `resample.hpp` (smart_resize, PIL-semantics antialias
   bicubic resize, bilinear position-table interpolation — these used to live inside the
   videochat3 directory and get include'd back out of it by three other backends),

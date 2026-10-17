@@ -321,7 +321,8 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
   约为 F16 权重噪声 + 线程归约顺序噪声）。
 - **共享层（`src/core`）**：后端之间不放重复实现——`vqa.hpp` 接口、`backend.hpp`（CUDA 优先 +
   CPU 回退 + 线程数默认值，按**物理核**而不是逻辑核，SMT 对这类模型的 GEMV 是负收益）、
-  `gguf_util.hpp`（元数据读取 / 张量转 F32）、`vit_block.hpp`（所有 ViT 塔共用的 block 体，
+  `gguf_util.hpp`（元数据读取 / 张量转 F32）、`weight_load.hpp`（mmap 绑定、1D 张量转
+  host F32、CPU 零拷贝/GPU 上传的 buffer 归属）、`vit_block.hpp`（所有 ViT 塔共用的 block 体，
   moondream / VideoChat3 / VideoMAE 三家都用它，差异走 hooks）、`resample.hpp`（smart_resize、
   PIL 语义 antialias bicubic 缩放、位置表双线性插值——原来寄居在 videochat3 目录里被另外三个
   模型反向 include）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
