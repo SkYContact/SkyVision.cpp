@@ -18,9 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-RUN git clone --depth 1 https://github.com/ggml-org/ggml ggml
 COPY . SkyVision
 WORKDIR /src/SkyVision
+
+# CMakeLists does `add_subdirectory(ggml)`, so ggml has to live *inside* the repo
+# tree (in a dev checkout it is a sibling git clone and .dockerignore drops it).
+# Fetch it here instead of relying on the build context.
+RUN test -d ggml || git clone --depth 1 https://github.com/ggml-org/ggml ggml
 
 # MSVC-style GGML_NATIVE does not exist here, but the x86 flags are what make the
 # difference: the CPU backend vectorises the fp32 matmuls through them.

@@ -14,3 +14,7 @@ ref_*/
 .venv/
 .git/
 *.log
+
+# ggml is fetched inside the image (add_subdirectory(ggml)); shipping a local
+# checkout would add ~100 MB to the context and make the build non-reproducible
+ggml/

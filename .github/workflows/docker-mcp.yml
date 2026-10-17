@@ -13,7 +13,6 @@ on:
       - 'CMakeLists.txt'
       - 'src/**'
       - 'convert/**'
-      - 'ggml/**'
       - 'tests/**'
       - '.github/workflows/docker-mcp.yml'
   pull_request:
@@ -50,6 +49,34 @@ jobs:
       - name: Image size
         run: docker images skyvision-mcp:ci --format '{{.Size}}'
 
+      # no binary assets in the repo: build a 320x240 test picture with the stdlib
+      - name: Make a test image
+        run: |
+          python3 - <<'PY'
+          import struct, zlib
+          w, h = 320, 240
+          raw = bytearray()
+          for y in range(h):
+              raw.append(0)                                  # PNG filter: none
+              for x in range(w):
+                  r = 40 + x * 200 // w
+                  g = 60 + y * 150 // h
+                  b = 180 if (60 <= x < 260 and 40 <= y < 200) else 30
+                  raw += bytes((r, g, b))
+
+          def chunk(tag, data):
+              return (struct.pack('>I', len(data)) + tag + data +
+                      struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+
+          png = (b'\x89PNG\r\n\x1a\n' +
+                 chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+                 chunk(b'IDAT', zlib.compress(bytes(raw), 9)) +
+                 chunk(b'IEND', b''))
+          open('/tmp/smoke.png', 'wb').write(png)
+          print('wrote', len(png), 'bytes')
+          PY
+          ls -l /tmp/smoke.png
+
       # 1) the "no weights at all" path every crawler hits: the server must still
       #    answer initialize / tools/list / list_models instead of failing
       - name: MCP smoke test without any models
@@ -59,8 +86,8 @@ jobs:
             '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
             '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_models","arguments":{}}}' \
-          | docker run --rm -i --entrypoint vqa-cli -v "$PWD/tests/data:/data:ro" \
-              skyvision-mcp:ci --mcp --models-dir /data/empty \
+          | docker run --rm -i --entrypoint vqa-cli -v /tmp:/data:ro \
+              skyvision-mcp:ci --mcp --models-dir /data/no-such-dir \
           > empty.out 2> empty.err
           echo '--- stderr'; cat empty.err
           python3 - <<'PY'
@@ -83,8 +110,8 @@ jobs:
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
             '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_models","arguments":{}}}' \
-            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_image","arguments":{"image":"/data/mcp-smoke.bmp","length":"short"}}}' \
-          | docker run --rm -i -v "$PWD/tests/data:/data:ro" skyvision-mcp:ci \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_image","arguments":{"image":"/data/smoke.png","length":"short"}}}' \
+          | docker run --rm -i -v /tmp:/data:ro skyvision-mcp:ci \
           > real.out 2> real.err
           echo '--- stderr'; tail -40 real.err
           python3 - <<'PY'
