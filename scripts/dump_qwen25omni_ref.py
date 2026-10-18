@@ -34,13 +34,17 @@ def main():
     ap.add_argument("--prompt", default="Describe this in detail.")
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--speaker", default="Chelsie")
+    ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"],
+                    help="float32 avoids the talker speaker-conditioning dtype clash "
+                         "(cond is force-cast .float() in HF, matmul fails under bf16)")
     args = ap.parse_args()
 
     from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
     os.makedirs(args.out, exist_ok=True)
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-        args.src, dtype=torch.bfloat16, device_map="cpu")
+        args.src, dtype=torch.bfloat16 if args.dtype == "bfloat16" else torch.float32,
+        device_map="cpu", low_cpu_mem_usage=True)
     processor = Qwen2_5OmniProcessor.from_pretrained(args.src)
 
     # ---------------------------------------------------------------- inputs

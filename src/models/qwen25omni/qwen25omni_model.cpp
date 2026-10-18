@@ -999,15 +999,16 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
 
     std::string text = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
-    if (n_aud > 0) {
-        text += "<|audio_bos|>";
-        for (int i = 0; i < n_aud; i++) text += "<|AUDIO|>";
-        text += "<|audio_eos|>";
-    }
+    // official chat template order: vision block first, then audio, then text
     if (n_img > 0) {
         text += "<|vision_bos|>";
         for (int i = 0; i < n_img; i++) text += "<|IMAGE|>";
         text += "<|vision_eos|>";
+    }
+    if (n_aud > 0) {
+        text += "<|audio_bos|>";
+        for (int i = 0; i < n_aud; i++) text += "<|AUDIO|>";
+        text += "<|audio_eos|>";
     }
     text += prompt;
     text += "<|im_end|>\n<|im_start|>assistant\n";

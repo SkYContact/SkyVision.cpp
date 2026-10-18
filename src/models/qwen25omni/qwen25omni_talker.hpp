@@ -15,15 +15,22 @@
 
 namespace qwen25omni {
 
-// read one row (dst[0..ne0)) of a weight tensor, decoding f16 weights
+// read one row (dst[0..ne0)) of a weight tensor, decoding f16 or quantized
+// weights (q8_0/q4_0 rows decoded via the type traits; rows are block-aligned)
 inline void read_emb_row(ggml_tensor * t, int row, float * dst) {
     const size_t n = (size_t)t->ne[0];
     if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, dst, (size_t)row * t->nb[1], n * sizeof(float));
-    } else {
+    } else if (t->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> raw(n);
         ggml_backend_tensor_get(t, raw.data(), (size_t)row * t->nb[1], n * sizeof(ggml_fp16_t));
         for (size_t i = 0; i < n; i++) dst[i] = ggml_fp16_to_fp32(raw[i]);
+    } else {
+        const size_t bs = t->nb[1];
+        std::vector<uint8_t> raw(bs);
+        ggml_backend_tensor_get(t, raw.data(), (size_t)row * bs, bs);
+        const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+        tt->to_float(raw.data(), dst, n);
     }
 }
 

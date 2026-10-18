@@ -123,7 +123,9 @@ void fft(float * in, int N, float * out) {
 // keeps the variable length (feature_attention_mask carries it).
 MelSpec AudioTower::log_mel(const float * pcm, int n_samples) const {
     const WhisperCache & c = whisper_cache();
-    const int n_len = 1 + n_samples / hop;              // center=True frames
+    // HF trims the centered stft to floor(L/hop) frames via the attention
+    // mask downsampled ::hop - keep the extra center=True tail frame out.
+    const int n_len = n_samples / hop;
     const int n_fft_bins = n_fft / 2 + 1;
     MelSpec mel;
     mel.n_mel = n_mel;

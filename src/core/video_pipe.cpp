@@ -59,7 +59,7 @@ static bool probe_metadata(const std::string & ffmpeg, const std::string & path,
 #else
     std::string cmd = "\"" + ffmpeg + "\" -i \"" + path + "\" -f null - 2>&1";
 #endif
-    FILE * p = popen(cmd.c_str(), "r");
+    FILE * p = popen(cmd.c_str(), _WIN32 ? "rb" : "r");
     if (!p) return false;
     std::string buf;
     char tmp[512];
@@ -122,7 +122,7 @@ bool load_video_file(const std::string & path, double fps, int max_frames, Media
                       " -frames:v " + std::to_string(n) +
                       " -pix_fmt rgb24 -f rawvideo -";
 #endif
-    FILE * p = popen(cmd.c_str(), "r");   // glibc popen rejects "rb" (EINVAL)
+    FILE * p = popen(cmd.c_str(), _WIN32 ? "rb" : "r");   // glibc popen rejects "rb" (EINVAL)
     if (!p) { fprintf(stderr, "cannot spawn ffmpeg (errno %d): %s\n", errno, cmd.c_str()); return false; }
 
     out.kind = MediaKind::Video;
@@ -170,7 +170,7 @@ bool load_audio(const std::string & path, MediaInput & out) {
     std::string cmd = "\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -i \"" + path +
                       "\" -ac 1 -ar 16000 -f f32le -";
 #endif
-    FILE * p = popen(cmd.c_str(), "r");
+    FILE * p = popen(cmd.c_str(), _WIN32 ? "rb" : "r");
     if (!p) { fprintf(stderr, "cannot spawn ffmpeg (errno %d)\n", errno); return false; }
     std::vector<float> pcm;
     float buf[8192];
