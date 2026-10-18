@@ -121,6 +121,7 @@ private:
     ggml_backend_buffer_t kvbuf = nullptr;
     std::vector<Kv> kv;
     int n_past = 0;
+    bool step_ready = false;   // static decode graph built & allocated
 };
 
 class Token2Wav {

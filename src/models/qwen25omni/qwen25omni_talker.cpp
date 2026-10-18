@@ -339,10 +339,17 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         history.push_back(cur);
     }
 
+    step_ready = false;   // the KV cache is cleared between utterances
     const int max_codec = 25 * 120;   // 2 minutes of speech
     for (int step = 0; cur != id_codec_end && cur != id_codec_pad &&
                        (int)codec_out.size() < max_codec; step++) {
-        if (!build_prefill(1, n_past + 1)) return false;
+        // one static decode graph over the whole KV window; per step only the
+        // inputs and the causal mask column change (no rebuild / realloc)
+        if (!step_ready) {
+            const int S = std::min(8192, T + max_codec + 1);
+            if (!build_prefill(1, S)) return false;
+            step_ready = true;
+        }
         std::vector<float> cemb;
         codec_row(cur, cemb);
         const std::vector<float> & rep =
