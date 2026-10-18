@@ -239,7 +239,7 @@ public:
         return true;
     }
 
-    int n_ctx = 2048;
+    int n_ctx = 8192;   // 32-frame video alone is ~3.9k tokens (encoder: masks are sized per actual T)
     bool use_gpu = false;
     int n_threads = 0;
     std::string dump_dir;
@@ -450,14 +450,9 @@ bool EmbedGemma2::load_weights(const char * path) {
     gguf_free(gu);
 
     vqa::weights::promote_1d_to_f32(wctx, host_f32);
-    // snapshot BEFORE backend binding (GPU binding nulls tensor data)
-    {
-        vqa::weights::Bound bound = vqa::weights::bind_to_backend(
-            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
-        if (!bound.ok) return false;
-        wbuf = bound.main_buf;
-        if (!ggml_backend_is_cpu(backend)) mm.release();
-    }
+    // NOTE: backend binding (which nulls host tensor pointers on GPU) is
+    // deliberately deferred to the END of this function - below, mm_proj is
+    // snapshotted to f32 and the audio clip scalars are read from host memory
 
     auto gt = [&](const char * n) {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -639,8 +634,16 @@ bool EmbedGemma2::load_weights(const char * path) {
         if (!vl[(size_t)i].attn_norm) fprintf(stderr, "load_weights: null vis layer %d\n", i);
     for (int i = 0; i < a_layer; i++)
         if (!al[(size_t)i].wq) fprintf(stderr, "load_weights: null audio layer %d\n", i);
-    return t_embed && t_norm && t_out_proj && t_ple_model_proj && v_patch_proj &&
-           v_mm_proj && a_sub_in_proj && a_out_proj && a_mm_proj && a_rel_pos;
+    const bool ok = t_embed && t_norm && t_out_proj && t_ple_model_proj && v_patch_proj &&
+                    v_mm_proj && a_sub_in_proj && a_out_proj && a_mm_proj && a_rel_pos;
+    if (ok) {
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(
+            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
+        if (!ggml_backend_is_cpu(backend)) mm.release();
+    }
+    return ok;
 }
 
 bool EmbedGemma2::load(const std::string & gguf_path, const std::string & tokenizer_path,
@@ -1276,8 +1279,28 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
         ggml_tensor * kf = ggml_cont(tctx, ggml_permute(tctx, k, 0, 2, 1, 3));
         ggml_tensor * vf = ggml_cont(tctx, ggml_permute(tctx, v, 0, 2, 1, 3));
         ggml_tensor * mask = full ? t_mask_full : t_mask_swa;
-        ggml_tensor * fa = ggml_flash_attn_ext(tctx, qf, kf, vf, mask, 1.0f, 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(tctx, ggml_cont(tctx, fa), nh * hd, T);
+        ggml_tensor * attn = nullptr;
+        if (full && !ggml_backend_is_cpu(backend)) {
+            // CUDA fattn has no kernel for head_dim 512 unless the KV length
+            // is a multiple of its KQ stride - explicit attention for those
+            // layers on GPU (flash attention stays on CPU where it is generic)
+            ggml_tensor * kh = ggml_new_tensor_3d(tctx, GGML_TYPE_F32, hd, T, nh);
+            ggml_tensor * ke = ggml_repeat(tctx, kf, kh);          // [hd, T_k, nh]
+            ggml_tensor * ve = ggml_repeat(tctx, vf, kh);
+            ggml_tensor * sc = ggml_mul_mat(tctx, ke, qf);         // [T_k, T_q, nh]
+            ggml_tensor * m3 = ggml_repeat(tctx,
+                ggml_reshape_3d(tctx, mask, T, T, 1),
+                ggml_new_tensor_3d(tctx, GGML_TYPE_F16, T, T, nh));
+            sc = ggml_add(tctx, sc, ggml_cast(tctx, m3, GGML_TYPE_F32));
+            ggml_tensor * prob = ggml_soft_max(tctx, sc);          // over T_k
+            ggml_tensor * v_t = ggml_cont(tctx, ggml_permute(tctx, ve, 1, 0, 2, 3));  // [T_k, hd, nh]
+            ggml_tensor * o3 = ggml_mul_mat(tctx, prob, v_t);      // [T_q, hd, nh]
+            attn = ggml_reshape_2d(tctx,
+                ggml_cont(tctx, ggml_permute(tctx, o3, 2, 0, 1, 3)), nh * hd, T);
+        } else {
+            ggml_tensor * fa = ggml_flash_attn_ext(tctx, qf, kf, vf, mask, 1.0f, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(tctx, ggml_cont(tctx, fa), nh * hd, T);
+        }
         attn = ggml_mul_mat(tctx, L.wo, attn);
         if (il == 0) ggml_set_name(attn, "l0_attn_proj");
 

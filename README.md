@@ -500,6 +500,11 @@ python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embedding
   （详见提交 7af56f7）；视频的坑是 rope 位置轴、预处理预算、占位块展开与跨帧注意力（1b8680a）
 - Matryoshka：`--embed-dim 512|256|128|64` 截断；`--embed-preset query|document|sts|
   classification|clustering` 套官方 sentence-transformers 任务前缀
+- **性能**（f16，3060 Laptop 6GB / i7 8 线程）：GPU 文本 1.3s、图像 1.4s、30s 音频 3.0s、
+  32 帧视频 5.6s（含 ~1.2s 权重上传）；CPU 图像 4.0s / 32 帧视频 39s——多模态走 GPU 收益 ~8×。
+  GPU 侧注意：full-attention 层 head_dim=512 在 CUDA fattn 无内核（KV 长度非 256 倍数时），
+  这些层在 GPU 上自动改用显式 attention（与 CPU 数值一致 0.999995+）；文本 n_ctx 默认 8192
+  （32 帧视频 ≈3.9k token）。CPU 上 q8_0 权重只快 ~8%（瓶颈在 f32 attention，不在权重带宽）
 
 ## 为什么做独立引擎？
 

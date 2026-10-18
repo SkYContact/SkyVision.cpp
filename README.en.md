@@ -485,6 +485,14 @@ vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
 - Matryoshka truncation via `--embed-dim 512|256|128|64`; sentence-transformers task
   prefixes via `--embed-preset query|document|sts|classification|clustering`; batch mode
   `--embed-file` (one input per line → JSONL)
+- **Performance** (f16, RTX 3060 Laptop 6GB / i7 8 threads): GPU text 1.3s, image 1.4s,
+  30s audio 3.0s, 32-frame video 5.6s wall (incl. ~1.2s weight upload); CPU image 4.0s /
+  32-frame video 39s — the multimodal path is ~8× faster on GPU. GPU notes: the
+  full-attention layers (head_dim 512) have no CUDA fattn kernel unless the KV length is a
+  multiple of the KQ stride, so those layers fall back to explicit attention on GPU
+  (agrees with CPU to 0.999995+); text n_ctx defaults to 8192 (32 frames ≈ 3.9k tokens).
+  On CPU, q8_0 weights are only ~8% faster — the bottleneck is f32 attention, not weight
+  bandwidth
 
 ## Why a standalone engine?
 
