@@ -278,6 +278,217 @@ void resize_tv_bicubic_aa(const uint8_t * src, int sw, int sh, int dw, int dh,
     }
 }
 
+// ---------------------------------------------------------------- PIL Lanczos
+// PIL Resample.c replication for 8-bit channels (was
+// models/moondream/moondream_preprocess.cpp's lanczos_resize - bit-exact
+// target Pillow 10.4).
+
+static const double MD_PI = 3.14159265358979323846;
+
+static inline double md_sinc(double x) {
+    if (x == 0.0) return 1.0;
+    x *= MD_PI;
+    return std::sin(x) / x;
+}
+
+static inline double md_lanczos_filter(double x) {  // support = 3.0
+    if (x < 0.0) x = -x;
+    if (x < 3.0) return md_sinc(x) * md_sinc(x / 3.0);
+    return 0.0;
+}
+
+static const int MD_PRECISION_BITS = 32 - 8 - 2;  // 22
+
+struct MdCoeffs {
+    int ksize = 0;
+    std::vector<int> bounds;        // [out*2]: xmin, count
+    std::vector<int32_t> kk;        // fixpoint 1<<22, PIL rounding
+};
+
+// box = (0, in) full axis; PIL in0/in1 defaults.
+static void md_precompute_coeffs(int in_size, int out_size, MdCoeffs & c) {
+    const double support_filter = 3.0;
+    double scale = (double)in_size / out_size;   // PIL: (in1-in0)/out
+    double filterscale = scale < 1.0 ? 1.0 : scale;
+    double support = support_filter * filterscale;
+    int ksize = (int)std::ceil(support) * 2 + 1;
+
+    c.ksize = ksize;
+    c.bounds.assign(out_size * 2, 0);
+    c.kk.assign((size_t)out_size * ksize, 0);
+
+    double inv_fs = 1.0 / filterscale;
+    for (int xx = 0; xx < out_size; xx++) {
+        double center = (xx + 0.5) * scale;
+        int xmin = (int)(center - support + 0.5);
+        int xmax = (int)(center + support + 0.5);
+        if (xmin < 0) xmin = 0;
+        if (xmax > in_size) xmax = in_size;
+        int count = xmax - xmin;
+        std::vector<double> w(count);
+        double ww = 0.0;
+        for (int x = 0; x < count; x++) {
+            w[x] = md_lanczos_filter((x + xmin - center + 0.5) * inv_fs);
+            ww += w[x];
+        }
+        int32_t * k = &c.kk[(size_t)xx * ksize];
+        if (ww != 0.0) {
+            for (int x = 0; x < count; x++) {
+                double v = w[x] / ww;
+                // PIL normalize_coeffs_8bpc rounding
+                k[x] = (int32_t)(v < 0 ? (-0.5 + v * (1 << MD_PRECISION_BITS))
+                                       : ( 0.5 + v * (1 << MD_PRECISION_BITS)));
+            }
+        }
+        c.bounds[xx * 2 + 0] = xmin;
+        c.bounds[xx * 2 + 1] = count;
+    }
+}
+
+static inline uint8_t md_clip8(int64_t v) {  // PIL clip8 lookup equivalent
+    v >>= MD_PRECISION_BITS;
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                           int dw, int dh, uint8_t * dst) {
+    if (sw == dw && sh == dh) {
+        std::memcpy(dst, src, (size_t)sw * sh * sc);
+        return;
+    }
+    bool need_h = dw != sw, need_v = dh != sh;
+    // Pillow 10.4 (the version the parity reference uses) always runs the
+    // horizontal pass first; the vertical-first heuristic is a newer-Pillow
+    // addition. Keep the exact order the reference resampler uses.
+    (void)0;
+
+    MdCoeffs ch, cv;
+    if (need_v) md_precompute_coeffs(sh, dh, cv);
+    if (need_h) md_precompute_coeffs(sw, dw, ch);
+
+    {
+        // pass 1: horizontal -> temp [dw, sh] (uint8 per channel, like PIL)
+        if (!need_h) {
+            // vertical only: src -> dst
+            for (int yy = 0; yy < dh; yy++) {
+                int ymin = cv.bounds[yy * 2], cnt = cv.bounds[yy * 2 + 1];
+                const int32_t * k = &cv.kk[(size_t)yy * cv.ksize];
+                uint8_t * out = dst + (size_t)yy * dw * sc;
+                for (int xx = 0; xx < dw; xx++) {
+                    for (int ci = 0; ci < sc; ci++) {
+                        int64_t ss = 1 << (MD_PRECISION_BITS - 1);
+                        for (int y = 0; y < cnt; y++)
+                            ss += (int64_t)src[(size_t)(y + ymin) * sw * sc +
+                                               (size_t)xx * sc + ci] * k[y];
+                        out[(size_t)xx * sc + ci] = md_clip8(ss);
+                    }
+                }
+            }
+            return;
+        }
+        std::vector<uint8_t> tmp((size_t)dw * sh * sc);
+        for (int y = 0; y < sh; y++) {
+            const uint8_t * in = src + (size_t)y * sw * sc;
+            uint8_t * out = tmp.data() + (size_t)y * dw * sc;
+            for (int xx = 0; xx < dw; xx++) {
+                int xmin = ch.bounds[xx * 2], cnt = ch.bounds[xx * 2 + 1];
+                const int32_t * k = &ch.kk[(size_t)xx * ch.ksize];
+                for (int ci = 0; ci < sc; ci++) {
+                    // PIL accumulates per channel into int with round bias
+                    int64_t ss = 1 << (MD_PRECISION_BITS - 1);
+                    for (int x = 0; x < cnt; x++)
+                        ss += (int64_t)in[(size_t)(x + xmin) * sc + ci] * k[x];
+                    out[(size_t)xx * sc + ci] = md_clip8(ss);
+                }
+            }
+        }
+        if (!need_v) { std::memcpy(dst, tmp.data(), tmp.size()); return; }
+        // pass 2: vertical tmp -> dst
+        for (int yy = 0; yy < dh; yy++) {
+            int ymin = cv.bounds[yy * 2], cnt = cv.bounds[yy * 2 + 1];
+            const int32_t * k = &cv.kk[(size_t)yy * cv.ksize];
+            uint8_t * out = dst + (size_t)yy * dw * sc;
+            for (int xx = 0; xx < dw; xx++) {
+                for (int ci = 0; ci < sc; ci++) {
+                    int64_t ss = 1 << (MD_PRECISION_BITS - 1);
+                    for (int y = 0; y < cnt; y++)
+                        ss += (int64_t)tmp[(size_t)(y + ymin) * dw * sc +
+                                           (size_t)xx * sc + ci] * k[y];
+                    out[(size_t)xx * sc + ci] = md_clip8(ss);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- torch bicubic
+// bicubic interpolation of (sh,sw,C) -> (dh,dw,C), torch F.interpolate
+// semantics (was models/videochat3/vc3_preprocess.cpp's
+// interpolate_bicubic_torch). Keys kernel a = -0.75, align_corners = false.
+static inline double vc3_cubic_torch(double x, double A) {
+    x = std::fabs(x);
+    if (x <= 1.0) return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
+    return 0.0;
+}
+
+void resize_bicubic_torch(const float * src, int sh, int sw, int dh, int dw, int C,
+                          std::vector<float> & out) {
+    static const double A = -0.75;
+    out.assign((size_t)dh * dw * C, 0.0f);
+    if (sh == dh && sw == dw) { memcpy(out.data(), src, sizeof(float) * (size_t)sh * sw * C); return; }
+
+    const double rh = (double)sh / (double)dh;
+    const double rw = (double)sw / (double)dw;
+
+    // precompute tap indices + weights per output row / column
+    struct Taps { int i0[4]; double w[4]; };
+    auto make_taps = [](int in, int out, double ratio) {
+        std::vector<Taps> ts(out);
+        for (int o = 0; o < out; o++) {
+            double real = ((double)o + 0.5) * ratio - 0.5;
+            int i0 = (int)std::floor(real);
+            double lam = real - i0;
+            Taps & t = ts[o];
+            for (int k = 0; k < 4; k++) {
+                int idx = i0 - 1 + k;
+                int c = std::min(std::max(idx, 0), in - 1);     // clamped read
+                t.i0[k] = c;
+                t.w[k] = vc3_cubic_torch((double)idx - real, A);
+            }
+        }
+        return ts;
+    };
+    std::vector<Taps> th = make_taps(sh, dh, rh);
+    std::vector<Taps> tw = make_taps(sw, dw, rw);
+
+    std::vector<float> tmp((size_t)dh * sw * C);
+    for (int y = 0; y < dh; y++) {
+        const Taps & t = th[y];
+        for (int x = 0; x < sw; x++) {
+            for (int c = 0; c < C; c++) {
+                double acc = 0;
+                for (int k = 0; k < 4; k++)
+                    acc += t.w[k] * (double)src[((size_t)t.i0[k] * sw + x) * C + c];
+                tmp[((size_t)y * sw + x) * C + c] = (float)acc;
+            }
+        }
+    }
+    for (int y = 0; y < dh; y++) {
+        for (int x = 0; x < dw; x++) {
+            const Taps & t = tw[x];
+            for (int c = 0; c < C; c++) {
+                double acc = 0;
+                for (int k = 0; k < 4; k++)
+                    acc += t.w[k] * (double)tmp[((size_t)y * sw + t.i0[k]) * C + c];
+                out[((size_t)y * dw + x) * C + c] = (float)acc;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- pos table
 void interp_pos_grid(const float * table, int side, int dim, int gh, int gw,
                      std::vector<float>& out) {

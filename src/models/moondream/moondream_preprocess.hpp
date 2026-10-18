@@ -25,10 +25,8 @@ namespace mdprep {
 void select_tiling(int height, int width, int crop_window, int max_crops,
                    int * th, int * tw);
 
-// PIL-equivalent Lanczos resize of an 8-bit RGB image (interleaved HWC).
-// dst must hold dw*dh*3 bytes.
-void lanczos_resize(const uint8_t * src, int sw, int sh, int sc,
-                    int dw, int dh, uint8_t * dst);
+// PIL-equivalent Lanczos resize lives in core/resample now:
+// vqa::img::resize_lanczos_coeffs (see src/core/resample.hpp).
 
 // Full official prepare_crops. rgb: interleaved RGB8 [h*w*3].
 // Returns n_crops*3*crop*crop float32 (CHW, normalized); *th/*tw get the

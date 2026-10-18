@@ -35,6 +35,19 @@ void resize_tv_bicubic_aa(const uint8_t * src, int sw, int sh, int dw, int dh,
 void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                       std::vector<float>& out, int pil_resample = 3, bool round_u8 = false);
 
+// PIL Resample.c Lanczos replication for 8-bit channels (moondream crops
+// parity, Pillow 10): filter support 3.0, per-output normalized weights,
+// fixpoint 1<<22 coefficients, uint8 intermediate between the horizontal and
+// vertical passes, horizontal pass always first. `dst` holds dw*dh*sc bytes.
+void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                           int dw, int dh, uint8_t * dst);
+
+// torch F.interpolate(mode="bicubic", align_corners=False) semantics
+// (Keys a = -0.75, 4-tap clamped reads) of an interleaved float (sh,sw,C)
+// buffer -> (dh,dw,C). What VideoChat3 uses for its learned pos table.
+void resize_bicubic_torch(const float * src, int sh, int sw, int dh, int dw, int C,
+                          std::vector<float>& out);
+
 // Bilinear interpolation of a learned (side, side, dim) position table onto a
 // (gh, gw) grid: torch.linspace(0, side-1, g) endpoints, floor/ceil clipping.
 // Writes (gh*gw, dim) row-major. Qwen2-VL / MOSS-VL semantic (VideoChat3 uses the

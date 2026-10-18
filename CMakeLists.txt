@@ -187,7 +187,7 @@ target_link_libraries(moondream-region-test PRIVATE ggml ggml-cpu)
 target_include_directories(moondream-region-test PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
 
 # --- multi-crop Lanczos preprocess test target (milestone 6 follow-up) ---
-add_executable(moondream-preprocess-test src/models/moondream/moondream_preprocess.cpp)
+add_executable(moondream-preprocess-test src/models/moondream/moondream_preprocess.cpp src/core/resample.cpp)
 target_compile_definitions(moondream-preprocess-test PRIVATE PREPROCESS_TEST_MAIN)
 target_link_libraries(moondream-preprocess-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-preprocess-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC})
+target_include_directories(moondream-preprocess-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC} ${CORE_INC})

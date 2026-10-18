@@ -42,6 +42,12 @@ struct MoondreamModel : vqa::Model {
         rm_ok = rm.load(rp.c_str());
         caps_.image = true;
         caps_.video = false;
+        // skill surface is known once the side heads load: caption needs the
+        // vision tower, the spatial skills need the region head
+        caps_.caption = vm_ok;
+        caps_.detect = rm_ok;
+        caps_.point = rm_ok;
+        caps_.gaze = rm_ok;
         return true;
     }
 

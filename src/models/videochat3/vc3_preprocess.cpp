@@ -7,14 +7,7 @@
 namespace vc3 {
 
 // smart_resize + resize_bicubic_antialias live in core/resample.cpp now.
-
-// torch F.interpolate(mode="bicubic", align_corners=False) kernel (a = -0.75)
-static inline double cubic_torch(double x, double A) {
-    x = std::fabs(x);
-    if (x <= 1.0) return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
-    if (x < 2.0) return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
-    return 0.0;
-}
+// interpolate_bicubic_torch also moved to core (vqa::img::resize_bicubic_torch).
 
 // ---------------------------------------------------------------- patchify
 void patchify(const float * rgb, int h, int w, const VisConfig & vc,
@@ -58,60 +51,11 @@ void patchify(const float * rgb, int h, int w, const VisConfig & vc,
 }
 
 // ---------------------------------------------------------------- pos embedding
-// bicubic interpolation of (sh,sw,C) -> (dh,dw,C), torch F.interpolate semantics
+// bicubic interpolation of (sh,sw,C) -> (dh,dw,C), torch F.interpolate semantics:
+// vqa::img::resize_bicubic_torch in core/resample.cpp.
 static void interpolate_bicubic_torch(const float * src, int sh, int sw, int dh, int dw, int C,
                                       std::vector<float> & out) {
-    static const double A = -0.75;
-    out.assign((size_t)dh * dw * C, 0.0f);
-    if (sh == dh && sw == dw) { memcpy(out.data(), src, sizeof(float) * (size_t)sh * sw * C); return; }
-
-    const double rh = (double)sh / (double)dh;
-    const double rw = (double)sw / (double)dw;
-
-    // precompute tap indices + weights per output row / column
-    struct Taps { int i0[4]; double w[4]; };
-    auto make_taps = [](int in, int out, double ratio) {
-        std::vector<Taps> ts(out);
-        for (int o = 0; o < out; o++) {
-            double real = ((double)o + 0.5) * ratio - 0.5;
-            int i0 = (int)std::floor(real);
-            double lam = real - i0;
-            Taps & t = ts[o];
-            for (int k = 0; k < 4; k++) {
-                int idx = i0 - 1 + k;
-                int c = std::min(std::max(idx, 0), in - 1);     // clamped read
-                t.i0[k] = c;
-                t.w[k] = cubic_torch((double)idx - real, A);
-            }
-        }
-        return ts;
-    };
-    std::vector<Taps> th = make_taps(sh, dh, rh);
-    std::vector<Taps> tw = make_taps(sw, dw, rw);
-
-    std::vector<float> tmp((size_t)dh * sw * C);
-    for (int y = 0; y < dh; y++) {
-        const Taps & t = th[y];
-        for (int x = 0; x < sw; x++) {
-            for (int c = 0; c < C; c++) {
-                double acc = 0;
-                for (int k = 0; k < 4; k++)
-                    acc += t.w[k] * (double)src[((size_t)t.i0[k] * sw + x) * C + c];
-                tmp[((size_t)y * sw + x) * C + c] = (float)acc;
-            }
-        }
-    }
-    for (int y = 0; y < dh; y++) {
-        for (int x = 0; x < dw; x++) {
-            const Taps & t = tw[x];
-            for (int c = 0; c < C; c++) {
-                double acc = 0;
-                for (int k = 0; k < 4; k++)
-                    acc += t.w[k] * (double)tmp[((size_t)y * sw + t.i0[k]) * C + c];
-                out[((size_t)y * dw + x) * C + c] = (float)acc;
-            }
-        }
-    }
+    vqa::img::resize_bicubic_torch(src, sh, sw, dh, dw, C, out);
 }
 
 void pos_embed_for_grid(const float * weight, const float * time_weight, const VisConfig & vc,
