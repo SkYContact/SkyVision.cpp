@@ -826,8 +826,19 @@ bool Qwen25Omni::encode_vision(const vqa::MediaInput & media, std::vector<float>
     const int gh = rh / v_patch, gw = rw / v_patch;
 
     std::vector<float> resized;
-    vqa::img::resize_antialias(media.frames[0].rgb.data(), media.width, media.height, rw, rh,
-                               resized, /*pil_resample=*/3);
+    const uint8_t * src_rgb = media.frames[0].rgb.data();
+    std::vector<uint8_t> raw_img;
+    if (const char * lp = getenv("QOMNI_RAWIMG_LOAD")) {  // parity: PIL-decoded
+        FILE * f = fopen(lp, "rb");                          // source pixels
+        if (f) {
+            const size_t n = (size_t)media.width * media.height * 3;
+            raw_img.resize(n);
+            if (fread(raw_img.data(), 1, n, f) == n) src_rgb = raw_img.data();
+            else fprintf(stderr, "rawimg size mismatch\n");
+            fclose(f);
+        }
+    }
+    vqa::img::resize_tv_bicubic_aa(src_rgb, media.width, media.height, rw, rh, resized);
     const int N = gh * gw, P = v_patch;
     const int C3 = 3 * v_temporal * P * P;
     std::vector<float> patches((size_t)C3 * N, 0.0f);

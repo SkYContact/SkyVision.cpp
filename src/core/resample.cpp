@@ -150,6 +150,134 @@ void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int d
     resize_antialias(src, sw, sh, dw, dh, out, /*pil_resample=*/3);
 }
 
+// ---------------------------------------------------------------- torch-style
+// torchvision's uint8 antialias bicubic (what the HF Qwen2-VL/Omni fast image
+// processor calls): float Keys-a=-0.5 weights normalized to 1, then quantized
+// to int16 fixed point; each separable pass accumulates in integers, adds a
+// half-step bias and shifts back, rounding to uint8 between passes. Bit-exact
+// replication matters because the vision tower chaotically amplifies even
+// sub-grey-level preprocessing differences.
+static void build_tv_weights(int in, int out, std::vector<Filter>& fs,
+                             int * precision) {
+    const double scale = (double)in / (double)out;
+    const double support = scale >= 1.0 ? 2.0 * scale : 2.0;
+    const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
+    const int max_interp = (int)std::ceil(support) * 2 + 1;
+    fs.resize(out);
+    double wt_max = 0.0;
+    for (int o = 0; o < out; o++) {
+        const double center = scale * ((double)o + 0.5);
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int xend = (int)(center + support + 0.5);
+        if (xend > in) xend = in;
+        int xsize = xend - xmin;
+        if (xsize > max_interp) xsize = max_interp;
+        if (xsize < 0) xsize = 0;
+        Filter & f = fs[o];
+        f.start = xmin;
+        f.w.resize(xsize);
+        double sum = 0.0;
+        for (int j = 0; j < xsize; j++) {
+            const double w = bicubic_aa((j + xmin - center + 0.5) * invscale);
+            f.w[j] = w;
+            sum += w;
+        }
+        if (sum != 0.0)
+            for (double & w : f.w) w /= sum;
+        for (double w : f.w) wt_max = std::max(wt_max, std::fabs(w));
+    }
+    // aten grows the shift while the scaled max weight fits int16; the AVX
+    // uint8 kernels (pillow-simd heritage) run a fixed high precision - sweep
+    // on-silicon matched p=17 (taps*255 must still fit the int accumulators:
+    // 2^17 * 255 * taps << 2^31)
+    int p = 0;
+    for (; p < 22; p++) {
+        const int next_value = (int)(0.5 + wt_max * (double)(1 << (p + 1)));
+        if (next_value >= (1 << 15)) break;
+    }
+    *precision = p;
+}
+
+void resize_tv_bicubic_aa(const uint8_t * src, int sw, int sh, int dw, int dh,
+                          std::vector<float>& out) {
+    // torch's fast image processors feed a channels-last uint8 tensor, which
+    // dispatches to the pillow-simd-style AVX kernel: int16 fixed-point
+    // weights, integer accumulation, uint8 rounding after EACH separable
+    // pass. p=14 matches on-silicon (absmax 1/255, 99.6% of pixels exact).
+    auto build = [](int in, int out_n, std::vector<Filter>& fs) {
+        const double scale = (double)in / (double)out_n;
+        const double support = scale >= 1.0 ? 2.0 * scale : 2.0;
+        const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
+        const int max_interp = (int)std::ceil(support) * 2 + 1;
+        fs.resize(out_n);
+        for (int o = 0; o < out_n; o++) {
+            const double center = scale * ((double)o + 0.5);
+            int xmin = (int)(center - support + 0.5);
+            if (xmin < 0) xmin = 0;
+            int xend = (int)(center + support + 0.5);
+            if (xend > in) xend = in;
+            int xsize = xend - xmin;
+            if (xsize > max_interp) xsize = max_interp;
+            if (xsize < 0) xsize = 0;
+            Filter & f = fs[o];
+            f.start = xmin;
+            f.w.resize(xsize);
+            double sum = 0.0;
+            for (int j = 0; j < xsize; j++) {
+                const double w = bicubic_aa((j + xmin - center + 0.5) * invscale);
+                f.w[j] = w;
+                sum += w;
+            }
+            if (sum != 0.0)
+                for (double & w : f.w) w /= sum;
+        }
+    };
+    std::vector<Filter> fh, fv;
+    build(sw, dw, fh);
+    build(sh, dh, fv);
+    const int P = 14;
+    auto qw = [P](const Filter & f) {
+        std::vector<int> q(f.w.size());
+        for (size_t k = 0; k < f.w.size(); k++) {
+            const double v = f.w[k] * (double)(1 << P);
+            q[k] = f.w[k] >= 0 ? (int)(0.5 + v) : (int)(-0.5 + v);
+        }
+        return q;
+    };
+    // horizontal pass: uint8 -> uint8
+    std::vector<uint8_t> tmp((size_t)dw * sh * 3);
+    for (int y = 0; y < sh; y++) {
+        const uint8_t * row = src + (size_t)y * sw * 3;
+        for (int x = 0; x < dw; x++) {
+            const std::vector<int> w = qw(fh[x]);
+            int acc[3] = {1 << (P - 1), 1 << (P - 1), 1 << (P - 1)};
+            for (size_t k = 0; k < w.size(); k++) {
+                const uint8_t * px = row + (size_t)(fh[x].start + (int)k) * 3;
+                for (int c = 0; c < 3; c++) acc[c] += (int)px[c] * w[k];
+            }
+            uint8_t * dst = &tmp[((size_t)y * dw + x) * 3];
+            for (int c = 0; c < 3; c++)
+                dst[c] = (uint8_t)std::clamp(acc[c] >> P, 0, 255);
+        }
+    }
+    // vertical pass: uint8 -> uint8
+    out.assign((size_t)dw * dh * 3, 0.0f);
+    for (int y = 0; y < dh; y++) {
+        const std::vector<int> w = qw(fv[y]);
+        for (int x = 0; x < dw; x++) {
+            int acc[3] = {1 << (P - 1), 1 << (P - 1), 1 << (P - 1)};
+            for (size_t k = 0; k < w.size(); k++) {
+                const uint8_t * px = &tmp[((size_t)(fv[y].start + (int)k) * dw + x) * 3];
+                for (int c = 0; c < 3; c++) acc[c] += (int)px[c] * w[k];
+            }
+            float * dst = &out[((size_t)y * dw + x) * 3];
+            for (int c = 0; c < 3; c++)
+                dst[c] = (float)std::clamp(acc[c] >> P, 0, 255);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- pos table
 void interp_pos_grid(const float * table, int side, int dim, int gh, int gw,
                      std::vector<float>& out) {

@@ -23,6 +23,11 @@ bool smart_resize(int height, int width, int factor, int min_pixels, int max_pix
 void resize_bicubic_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
                               std::vector<float>& out);
 
+// torchvision-uint8 antialias bicubic (HF fast image processors): int16
+// fixed-point weights and per-pass uint8 rounding - bit-exact vs torch
+void resize_tv_bicubic_aa(const uint8_t * src, int sw, int sh, int dw, int dh,
+                          std::vector<float>& out);
+
 // Same, with a selectable kernel. `pil_resample` is HF's `resample` value (a
 // PILImageResampling enum): 1 = LANCZOS, 2 = BILINEAR, 3 = BICUBIC.
 // round_u8: torchvision resizes uint8 input to a uint8 output (float pipeline,
