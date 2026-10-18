@@ -995,6 +995,23 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     if (getenv("QOMNI_DBG_IDX"))
         fprintf(stderr, "dbg ask: n_img=%d n_aud=%d T=%zu grid=%d,%d,%d\n",
                 n_img, n_aud, toks.size(), grid[0], grid[1], grid[2]);
+    // A wrong-but-loadable tokenizer can hand back ids at or past this model's
+    // embedding table (a moss-family tokenizer.json parked next to the gguf
+    // maps <|im_start|> to 248045): the prefill gather then asserts in the CPU
+    // get_rows kernel and reads out of bounds silently on CUDA. Text-only asks
+    // never hit the soft-token placeholder guard below, so police the id range
+    // itself, right where the tokens are produced.
+    {
+        const int lim = std::min(n_vocab, (int)tok_embd->ne[1]);
+        for (int t : toks) {
+            if (t < 0 || t >= lim) {
+                fprintf(stderr, "qwen25omni: token id %d outside [0,%d) - the loaded "
+                                "tokenizer.json does not belong to this model "
+                                "(pass --tokenizer <Qwen2.5-Omni-3B dir>)\n", t, lim);
+                return false;
+            }
+        }
+    }
     if ((int)toks.size() + gp.max_tokens + 8 > n_ctx) {
         fprintf(stderr, "prompt %zu + %d tokens exceed n_ctx %d\n", toks.size(), gp.max_tokens, n_ctx);
         return false;
