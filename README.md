@@ -29,6 +29,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
 | **Qwen2.5-Omni（3B）** | `qwen25omni` | 图像 + 音频输入，文本 + 语音输出 | 全功能 thinker-talker：Qwen2.5 文本主干（untied lm_head）+ Qwen2.5-VL 视觉塔（与 `qwen2vl` 同款窗口注意力图）+ Whisper 系音频塔（128-bin log-mel、**n_window=100 分块卷积+分块注意力**、25 token/s）→ **Talker**（24 层双轨 LM：文本轨吃 thinker 隐状态，输出 25Hz codec token）→ **Token2Wav**（flow-matching DiT，RK4×10 步 + CFG + sway 采样；BigVGAN v2 抗锯齿激活，纯 C++ 宿主实现）。音频输入走 `--audio`（ffmpeg 解码 16k mono）。参考实现：llama.cpp PR #13784（thinker）+ HF transformers 5.20 官方源码（全部语义基准），mel/音频塔与官方逐位对齐 |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
+| **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
 
 ## 当前状态
 
@@ -62,6 +63,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | Mage-VL 视频问答 | ✅ `--video`（ffmpeg 帧采样后端，逐帧 `<X.X seconds>` 标签 + 每帧独立注意力块）：双图案拼接测试视频的前/后半段区分描述正确；1800 视觉 token prefill 2416 tok/s
 | MOSS-VL 常驻推理流 | ✅ `rt/start?session=&src=&interval=`（src=文件/URL/`video=`摄像头）：ffmpeg 采集线程 + 常驻推理循环，模型按轮观察新帧并**主动发言**（`<|silence|>`=本轮无话可说）；`rt/say?q=` 流内提问（独立文本轮）、`rt/events?since=` 轮询 NDJSON 事件、`rt/stop` 停止 |
 | VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
+| EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
 ## 快速开始
 
 ### 1. 构建
@@ -154,6 +156,16 @@ vqa-cli --model videojev-4b-q8_0.gguf --video clip.mp4 --fps 2 --score qs.json
 # VideoMAE：视频 → 动作标签（分类头版）/ 768 维嵌入（预训练版）
 vqa-cli --model videomae-base-ft.gguf --video clip.mp4 --ask x --mode 5
 vqa-cli --model videomae-base.gguf    --video clip.mp4 --ask x --mode embed
+
+# EmbeddingGemma-2：多模态嵌入（图像/视频/音频/文本 → 768 维，不生成文本）
+vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
+        --image photo.jpg --embed "describe" --embed-preset query          # JSON 输出嵌入向量
+vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
+        --video clip.mp4 --embed "summarize"                               # 1 fps 均匀采样 ≤32 帧
+vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
+        --audio clip.wav --embed "what is said" --embed-dim 256            # Matryoshka 截断
+vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
+        --embed-file docs.txt                                              # 批量：一行一条 → JSONL
 
 # moondream3.1 就是一个普通后端：技能、批量、Web UI 全在 vqa-cli 上
 vqa-cli --model models/moondream3.1-q6k.gguf --image photo.jpg --ask "What is in this image?"
@@ -289,6 +301,7 @@ CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mo
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf`（Qwen3 + VideoChat3 ViT，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
 | `convert_marlin.py` | `marlin-2b-<outtype>.gguf`（Qwen3.5 混合主干 + Qwen3-VL 视觉塔，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
 | `convert_videomae.py` | `videomae-<outtype>.gguf`（VideoMAE 视频塔，单文件，`--outtype f16\|q8_0\|q4_0`；分类头与 `id2label` 一起写进 GGUF） |
+| `convert_embedgemma2.py` | `embeddinggemma2-<outtype>.gguf`（四模态嵌入，单文件，`--outtype f16\|q8_0\|q4_0`；f16 约 1.5GB） |
 
 ### moondream3.1
 
@@ -461,6 +474,32 @@ vqa-cli --model smolvlm-256m-f16.gguf --tokenizer models/smolvlm-256m \
 [Moondream Model License 1.0](https://moondream.ai/licenses/model/1.0)），**不在本仓库分发**。
 该许可明确允许量化、转换、再分发、自托管与商用集成；仅对公众开放的通用 moondream API
 转售需要单独授权——那是部署者的义务，与本引擎无关。
+
+### EmbeddingGemma-2（四模态嵌入）
+
+```bash
+modelscope download google/embeddinggemma-2 --local_dir models/embeddinggemma-2   # 或 hf download
+python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embeddinggemma2-f16.gguf
+```
+
+740M（文本 270M + 视觉 170M + 音频 300M），不生成文本，只出嵌入。要点（都是对拍实测的）：
+
+- **文本塔**是 Gemma3 风格编码器：24 层 d=512、GQA 4:1、SWA(1024)/full 交错、**逐层 PLE**
+  （per-layer embedding：12288→512 投影 + RMSNorm，每层一份加到隐状态上）、末尾均值池化 + 投影到 768
+- **视觉塔** Gemma4 ViT：16 层 patch16、轴向 2D RoPE（x/y 各 32 维，theta 100）、3×3 位置池化；
+  图像预算 280 soft、**视频预算 140/帧**（`vision.video_max_soft_tokens`）；帧间注意力严格不跨帧
+- **音频塔** USM conformer：128-bin log-mel → 双 3×3 stride-2 卷积子采样 → 12 层
+  （macaron FFN×2 + LightConv1d(GLU + 因果深度卷积) + chunk=12 局部注意力 + softcap 50），
+  相对位置偏置是 Transformer-XL 式 rel-shift（每头独立的 rel-k 投影），
+  **所有线性层都是 ClippableLinear**（检查点里带 finite input/output clamp 标量，转换器逐个导出）
+- **占位块**：`<|image|>`/`<|video|>`/`<|audio|>` 展开成 `<|image>` + N×soft + `<image|>`，
+  prompt 里没写标记时媒体块追加在文本后
+- **四模态 parity**（fp32 HF 参考，f16 权重）：文本 0.9999999 / 图像 0.99999 /
+  音频 0.99999 / 视频 0.9999998。音频塔曾长期停在 0.84——公式（全矩阵 + 13 条对角线 mask 等价
+  rel-shift）先用 numpy 验证过是对的，真凶是 5 个 ggml 图实现 bug，逐层 hook dump 定位
+  （详见提交 7af56f7）；视频的坑是 rope 位置轴、预处理预算、占位块展开与跨帧注意力（1b8680a）
+- Matryoshka：`--embed-dim 512|256|128|64` 截断；`--embed-preset query|document|sts|
+  classification|clustering` 套官方 sentence-transformers 任务前缀
 
 ## 为什么做独立引擎？
 

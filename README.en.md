@@ -49,6 +49,7 @@ with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
 | SmolVLM-256M (Idefics3) | ✅ arch `smolvlm`, the smallest backend here: SigLIP-base tower (12L, patch 16, 512², learned positions, LayerNorm/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30L, no biases, GQA 9:3, rope 1e5). Idefics3 preprocessing: longest edge 2048 → pad to multiples of 512 → 512² tiles + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8. Logits corr 0.99991 and byte-identical answers |
+| EmbeddingGemma-2 (740M) | ✅ arch `embgemma2`, multimodal **embedding** (no text generation): Gemma3 text tower (24L d=512, GQA 4:1, interleaved SWA/full, per-layer PLE) + Gemma4 ViT (16L patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / chunk-12 local attention with Transformer-XL rel-shift bias; every linear is a ClippableLinear with finite clamps from the checkpoint). `--embed` emits 768-d vectors (Matryoshka truncation `--embed-dim`, official task prefixes `--embed-preset`, batch `--embed-file`). All four modalities vs the fp32 HF reference: text 0.9999999 / image 0.99999 / audio 0.99999 / video 0.9999998 |
 
 ## Quick start
 
@@ -249,6 +250,7 @@ re-opened and its tensor table verified.
 | `convert_region.py` | `moondream3.1-region.gguf` (detect/point/gaze head, ~30 MB) |
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf` (Qwen3 + VideoChat3 ViT, single file, `--outtype f16\|q8_0\|q6_k\|q4_0`) |
 | `convert_videomae.py` | `videomae-<outtype>.gguf` (VideoMAE video tower, single file, `--outtype f16\|q8_0\|q4_0`; the classifier and its `id2label` table travel inside the GGUF) |
+| `convert_embedgemma2.py` | `embeddinggemma2-<outtype>.gguf` (four-modality embedder, single file, `--outtype f16\|q8_0\|q4_0`; ~1.5 GB at f16) |
 
 ### moondream3.1
 
@@ -450,6 +452,39 @@ distributed from this repository. The license explicitly allows quantization, co
 redistribution, self-hosting and commercial integration; only reselling a public
 general-purpose Moondream inference API requires a separate license — that obligation falls on
 the operator, not on this engine.
+
+### EmbeddingGemma-2 (four-modality embeddings)
+
+```bash
+hf download google/embeddinggemma-2 --local-dir models/embeddinggemma-2
+python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embeddinggemma2-f16.gguf
+vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
+        --image photo.jpg --embed "describe" --embed-preset query     # JSON embedding
+```
+
+740M (text 270M + vision 170M + audio 300M); embeddings only, no generation. Highlights
+(all measured against the reference, not inferred from docs):
+
+- **Text tower**: Gemma3-style encoder — 24L d=512, GQA 4:1, interleaved sliding/full attention,
+  **per-layer embeddings (PLE)** (12288→512 projection + RMSNorm per layer), mean pooling +
+  projection to 768
+- **Vision tower**: Gemma4 ViT, 16L patch 16, axial 2D RoPE (32 dims per axis, theta 100),
+  3×3 position pooling. Soft budget: 280 for images, **140 per frame for video**; attention
+  never crosses frames (frames run through the single-frame graph one at a time)
+- **Audio tower**: USM conformer — 128-bin log-mel → dual 3×3 stride-2 conv subsampling →
+  12 layers (macaron FFN ×2, LightConv1d with GLU + causal depthwise conv, chunk-12 local
+  attention, softcap 50). Relative bias is the Transformer-XL rel-shift with a **per-head**
+  rel-k projection; every linear is a **ClippableLinear** (finite input/output clamps travel
+  in the GGUF)
+- **Parity** (fp32 HF reference, f16 weights): text 0.9999999 / image 0.99999 /
+  audio 0.99999 / video 0.9999998. The audio tower sat at 0.84 for a long time — the math
+  (full-matrix + 13 diagonal masks, provably equivalent to rel-shift) was right; the real
+  culprits were five ggml graph bugs found via per-layer hook dumps (commit 7af56f7), and the
+  video path needed the rope position axis, the video preprocessing budget, the placeholder
+  expansion and per-frame attention fixed (commit 1b8680a)
+- Matryoshka truncation via `--embed-dim 512|256|128|64`; sentence-transformers task
+  prefixes via `--embed-preset query|document|sts|classification|clustering`; batch mode
+  `--embed-file` (one input per line → JSONL)
 
 ## Why a standalone engine?
 
