@@ -850,12 +850,14 @@ bool Qwen25Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, int n_
     if (for_talker) {
         g.embed_out = ggml_get_rows(g.ctx, tok_embd, g.tok_in);
         ggml_set_name(g.embed_out, "t_embed_out");
-        // HF reply track: hidden_states[-1]; the 5.x capture machinery may or
-        // may not include the final norm - switchable for parity bisecting
-        // HF 5.x capture: hidden_states[-1] = last-layer output, final norm NOT
-        // included - the talker reply track is the pre-norm hidden
-        // (QOMNI_TALK_POSTNORM=1 switches back for bisecting)
-        const bool pre = getenv("QOMNI_TALK_POSTNORM") == nullptr;
+        // HF reply track: hidden_states[-1] of each thinker step. In
+        // transformers 5.x that last tuple element is the FINAL-NORMED output
+        // (the model appends the post-norm hidden after the layer loop), so
+        // the talker reply track is post-norm. Verified against an HF talker
+        // oracle: with the pre-norm track the codec logits come out flipped
+        // (corr -1) and the speech is unintelligible. QOMNI_TALK_PRENORM=1
+        // switches back for bisecting.
+        const bool pre = getenv("QOMNI_TALK_PRENORM") != nullptr;
         if (for_talker) fprintf(stderr, "text: hidden track %s" "\n", pre ? "PRENORM" : "POSTNORM");
         // dup: without it gallocr reuses x's buffer for the final-norm result
         g.hidden_out = pre ? ggml_dup(g.ctx, x) : nullptr;
@@ -863,7 +865,10 @@ bool Qwen25Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, int n_
     x = ggml_rms_norm(g.ctx, x, rms_eps);
     x = ggml_mul(g.ctx, x, out_norm);
     ggml_set_name(x, "t_final_norm");
-    if (for_talker && !g.hidden_out) g.hidden_out = x;
+    // the sink must be a dup in BOTH modes: without it gallocr reuses the
+    // final-norm result's buffer for the logits mul_mat and clobbers every
+    // row but the last, silently destroying the talker's prompt hidden track
+    if (for_talker && !g.hidden_out) g.hidden_out = ggml_dup(g.ctx, x);
 
     if (T > 1) {
         ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);

@@ -207,6 +207,7 @@ private:
 
     // speaker embedding of the reference mel, cached (the mel never changes)
     std::vector<float> cond_cached;
+    std::vector<float> cond_zero;   // ECAPA over a zero reference mel (CFG null)
     bool cond_ready = false;
     bool dit_masks_ready = false;   // block masks uploaded for the current graph
     bool dit_inputs_ready = false;  // constant codec/spk/cond tracks uploaded

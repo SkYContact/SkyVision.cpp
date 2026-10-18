@@ -406,6 +406,8 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
     std::vector<float> cur((size_t)80 * T);
     memcpy(cur.data(), mel, (size_t)80 * T * sizeof(float));
     int cc = 80;
+    // HF TimeDelayNetBlock = Conv1d(padding="same", padding_mode="reflect")
+    // followed by ReLU - every TDNN-style conv in the encoder applies BOTH.
     auto conv = [&](std::vector<float> & x, int ic, const float * wt, const std::vector<float> & bt,
                     int oc, int kw, int dil) {
         const int pad = (kw * dil - dil) / 2;
@@ -413,6 +415,23 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
         // bt may live in a temp; decode biases to f32 once per call site
         conv1d_full(x.data(), ic, T, wt, bt.empty() ? nullptr : bt.data(), oc, kw, dil, pad,
                     y.data(), T);
+        if (pad > 0) {   // redo with reflect padding like the reference
+            const int Tp = T + 2 * pad;
+            std::vector<float> xp((size_t)ic * Tp), yp((size_t)oc * Tp);
+            for (int c = 0; c < ic; c++) {
+                const float * xc = x.data() + (size_t)c * T;
+                float * dst = xp.data() + (size_t)c * Tp;
+                for (int i = 0; i < pad; i++) dst[i] = xc[pad - i];
+                memcpy(dst + pad, xc, (size_t)T * sizeof(float));
+                for (int i = 0; i < pad; i++) dst[pad + T + i] = xc[T - 2 - i];
+            }
+            conv1d_full(xp.data(), ic, Tp, wt, bt.empty() ? nullptr : bt.data(), oc, kw, dil, 0,
+                        yp.data(), Tp);
+            for (int o = 0; o < oc; o++)
+                memcpy(y.data() + (size_t)o * T, yp.data() + (size_t)o * Tp + pad,
+                       (size_t)T * sizeof(float));
+        }
+        for (auto & v : y) v = std::max(0.0f, v);   // TimeDelayNetBlock ReLU
         x.swap(y);
         cc = oc;
     };
@@ -453,14 +472,30 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
         if (getenv("T2W_DEBUG") && bi == 0) fprintf(stderr, "t2w: blk0 in |x|=%.2f\n", mx(cur));
         conv(cur, cc, w1.data(), b1, 256, kw1, dil);
         if (getenv("T2W_DEBUG") && bi == 0) fprintf(stderr, "t2w: blk0 tdnn1 |x|=%.2f\n", mx(cur));
-        // res2net scale=2: branch0 identity, branch1 conv, concat on channels
+        // res2net scale=2: branch0 identity, branch1 TimeDelayNetBlock, concat
         const int half = cc / 2;
         std::vector<float> y((size_t)cc * T);
         memcpy(y.data(), cur.data(), (size_t)half * T * sizeof(float));
         {
-            std::vector<float> branch((size_t)half * T);
-            conv1d_full(cur.data() + (size_t)half * T, half, T, wr.data(), br.data(),
-                        half, 1, 1, 0, branch.data(), T);
+            // wr is res2net_block.blocks[0].conv: [half][half][k], reflect+ReLU
+            const int kwr = (int)(wr.size() / ((size_t)half * half));
+            const int pr = (kwr * dil - dil) / 2;
+            const int Tpr = T + 2 * pr;
+            std::vector<float> xp((size_t)half * Tpr), branch((size_t)half * T),
+                yp((size_t)half * Tpr);
+            for (int c = 0; c < half; c++) {
+                const float * xc = cur.data() + ((size_t)half + c) * T;
+                float * dst = xp.data() + (size_t)c * Tpr;
+                for (int i = 0; i < pr; i++) dst[i] = xc[pr - i];
+                memcpy(dst + pr, xc, (size_t)T * sizeof(float));
+                for (int i = 0; i < pr; i++) dst[pr + T + i] = xc[T - 2 - i];
+            }
+            conv1d_full(xp.data(), half, Tpr, wr.data(), br.data(), half, kwr, dil, 0,
+                        yp.data(), Tpr);
+            for (int o = 0; o < half; o++)
+                for (int n = 0; n < T; n++)
+                    branch[(size_t)o * T + n] =
+                        std::max(0.0f, yp[(size_t)o * Tpr + pr + n]);
             memcpy(y.data() + (size_t)half * T, branch.data(), (size_t)half * T * sizeof(float));
         }
         cur.swap(y);
@@ -513,9 +548,31 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
     const int ac = 64;   // enc_attention_channels
     std::vector<float> att((size_t)768 * T);
     {
+        // HF ASP feeds [h | uniform mean | uniform std] (3*768 channels) into
+        // tdnn (conv+ReLU, k1) -> tanh -> conv -> softmax over time
+        std::vector<float> stats((size_t)768 * 2);
+        for (int c = 0; c < 768; c++) {
+            const float * xc = mfa_in.data() + (size_t)c * T;
+            double m = 0;
+            for (int n = 0; n < T; n++) m += xc[n];
+            m /= T;
+            double v = 0;
+            for (int n = 0; n < T; n++) { const double dd = xc[n] - m; v += dd * dd; }
+            stats[(size_t)c] = (float)m;
+            stats[(size_t)768 + c] = sqrtf(std::max(1e-12f, (float)(v / T)));
+        }
+        std::vector<float> asp_in((size_t)2304 * T);
+        memcpy(asp_in.data(), mfa_in.data(), (size_t)768 * T * sizeof(float));
+        for (int n = 0; n < T; n++) {
+            for (int c = 0; c < 768; c++) {
+                asp_in[(size_t)(768 + c) * T + n] = stats[(size_t)c];
+                asp_in[(size_t)(1536 + c) * T + n] = stats[(size_t)768 + c];
+            }
+        }
         std::vector<float> t1((size_t)ac * T);
-        conv1d_full(mfa_in.data(), 768, T, wattn.data(), battn.data(), ac, 1, 1, 0,
+        conv1d_full(asp_in.data(), 2304, T, wattn.data(), battn.data(), ac, 1, 1, 0,
                     t1.data(), T);
+        for (auto & v : t1) v = std::max(0.0f, v);   // TimeDelayNetBlock ReLU
         for (auto & v : t1) v = tanhf(v);
         conv1d_full(t1.data(), ac, T, wconv.data(), bconv.data(), 768, 1, 1, 0, att.data(), T);
         for (int c = 0; c < 768; c++) {
@@ -631,10 +688,25 @@ bool Token2Wav::build_dit_graph(int T) {
         k = ggml_add(gctx, k, L.bk);
         ggml_tensor * v = ggml_mul_mat(gctx, L.wv, h);
         v = ggml_add(gctx, v, L.bv);
-        ggml_tensor * q3 = ggml_rope_ext(gctx, ggml_reshape_3d(gctx, q, HD, NH, T), g_pos, nullptr,
-                                         HD, 0, 8192, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        ggml_tensor * k3 = ggml_rope_ext(gctx, ggml_reshape_3d(gctx, k, HD, NH, T), g_pos, nullptr,
-                                         HD, 0, 8192, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // HF applies RoPE to the FIRST HEAD ONLY, interleaved (GPT-J style)
+        // pairing - see DiTAttention.forward in the reference modeling code.
+        ggml_tensor * qr = ggml_reshape_3d(gctx, q, HD, NH, T);
+        ggml_tensor * kr = ggml_reshape_3d(gctx, k, HD, NH, T);
+        ggml_tensor * qh0 = ggml_view_3d(gctx, qr, HD, 1, T, qr->nb[1], qr->nb[2], 0);
+        ggml_tensor * kh0 = ggml_view_3d(gctx, kr, HD, 1, T, kr->nb[1], kr->nb[2], 0);
+        qh0 = ggml_rope_ext(gctx, qh0, g_pos, nullptr,
+                            HD, 0, 8192, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        kh0 = ggml_rope_ext(gctx, kh0, g_pos, nullptr,
+                            HD, 0, 8192, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * q3 = qh0, * k3 = kh0;
+        if (NH > 1) {   // heads 1..N-1 stay unrotated: concat back after head 0
+            ggml_tensor * qrest = ggml_view_3d(gctx, qr, HD, NH - 1, T, qr->nb[1], qr->nb[2],
+                                               qr->nb[1]);
+            ggml_tensor * krest = ggml_view_3d(gctx, kr, HD, NH - 1, T, kr->nb[1], kr->nb[2],
+                                               kr->nb[1]);
+            q3 = ggml_concat(gctx, qh0, qrest, 1);
+            k3 = ggml_concat(gctx, kh0, krest, 1);
+        }
         ggml_tensor * qf = ggml_cont(gctx, ggml_permute(gctx, q3, 0, 2, 1, 3));
         ggml_tensor * kf = ggml_cont(gctx, ggml_permute(gctx, k3, 0, 2, 1, 3));
         ggml_tensor * vf = ggml_cont(gctx, ggml_permute(gctx, ggml_reshape_3d(gctx, v, HD, NH, T),
@@ -655,7 +727,15 @@ bool Token2Wav::build_dit_graph(int T) {
         h2 = ggml_add(gctx, ggml_add(gctx, h2, ggml_mul(gctx, h2, scale_m)), shift_m);
         ggml_tensor * ff = ggml_mul_mat(gctx, L.w_gate, h2);
         ff = ggml_add(gctx, ff, L.b_gate);
-        ff = ggml_gelu(gctx, ff);                    // GELU(tanh) like HF
+        // GELU tanh approximation (HF: nn.GELU(approximate="tanh"))
+        {
+            ggml_tensor * g3 = ggml_mul(gctx, ggml_mul(gctx, ff, ff), ff);
+            g3 = ggml_scale(gctx, g3, 0.044715f);
+            g3 = ggml_add(gctx, g3, ff);
+            g3 = ggml_scale(gctx, g3, 0.7978845608028654f);
+            g3 = ggml_tanh(gctx, g3);
+            ff = ggml_add(gctx, ggml_scale(gctx, ff, 0.5f), ggml_scale(gctx, ggml_mul(gctx, g3, ff), 0.5f));
+        }
         ff = ggml_mul_mat(gctx, L.w_down, ff);
         ff = ggml_add(gctx, ff, L.b_down);
         x = ggml_add(gctx, x, ggml_mul(gctx, ff, gate_m));
@@ -666,11 +746,12 @@ bool Token2Wav::build_dit_graph(int T) {
             g_sinks.push_back(snk);
         }
     }
-    // final adaLN + projection
+    // final adaLN + projection. HF AdaLayerNormZero_Final chunks (scale, shift)
+    // in that order - mind the ordering difference vs the block-level norms.
     ggml_tensor * mod = ggml_mul_mat(gctx, norm_out_w, g_t_in);
     mod = ggml_add(gctx, mod, norm_out_b);
-    ggml_tensor * shift = ggml_view_2d(gctx, mod, d_dim, 1, mod->nb[1], 0);
-    ggml_tensor * scale = ggml_view_2d(gctx, mod, d_dim, 1, mod->nb[1],
+    ggml_tensor * scale = ggml_view_2d(gctx, mod, d_dim, 1, mod->nb[1], 0);
+    ggml_tensor * shift = ggml_view_2d(gctx, mod, d_dim, 1, mod->nb[1],
                                        (size_t)d_dim * sizeof(float));
     ggml_tensor * h = ggml_norm(gctx, x, 1e-6f);
     h = ggml_add(gctx, ggml_add(gctx, h, ggml_mul(gctx, h, scale)), shift);
@@ -691,8 +772,10 @@ bool Token2Wav::build_dit_graph(int T) {
     return true;
 }
 
-bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_emb, bool drop_code,
+bool Token2Wav::dit_eval(const float * x, int T0h, float t, const float * codec_emb, bool drop_code,
                          const float * spk, const float * cond_vec, std::vector<float> & out) {  // spk: baked cond (192), cond_vec: ECAPA (128)
+    const int T0 = T0h;
+    const int T = T0 * 2;   // CFG batch
     // host time embedding: sinus(256) -> mlp0 -> silu -> mlp1 -> [d_dim]
     static std::vector<float> w0, b0, w1, b1;
     if (w0.empty()) { host_vec(time_mlp0_w, w0); host_vec(time_mlp0_b, b0);
@@ -709,17 +792,24 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
         for (auto & v : h0) v = v / (1.0f + expf(-v));
         linear_host(w1, b1, d_dim, d_dim, h0.data(), th.data());
     }
-    // codec embedding rows for the CFG batch (cond real, uncond zeroed when
-    // drop_code; both halves share the real one here - the caller decides)
-    const int T0 = T / 2;
+    // HF AdaLayerNormZero mods with linear(silu(emb)): the modulation input is
+    // silu of the time-MLP output, for both the blocks and the final norm.
+    for (auto & v : th) v = v / (1.0f + expf(-v));
+    // codec embedding rows for the CFG batch: conditioned half = real codes,
+    // unconditioned half = embedding row 0 (HF drop_code zeroes the token ids
+    // and row 0 of the 8194-row table is that "null code" embedding)
+    // (T0 already set from the caller; the uncond half follows below)
+    static std::vector<float> null_row;
+    if (null_row.empty()) {
+        null_row.resize((size_t)d_emb);
+        read_emb_row(codec_embd, 0, null_row.data());
+    }
     std::vector<float> cemb((size_t)d_emb * T);
     for (int i = 0; i < T; i++) {
-        if (drop_code && i >= T0) continue;
-        const int code_row = (i % T0) / d_repeats;   // repeated code indices
-        (void)code_row;
-        memcpy(cemb.data() + (size_t)i * d_emb, codec_emb + (size_t)(i % T0) * d_emb,
-               (size_t)d_emb * sizeof(float));
+        const float * row = (i < T0) ? codec_emb + (size_t)i * d_emb : null_row.data();
+        memcpy(cemb.data() + (size_t)i * d_emb, row, (size_t)d_emb * sizeof(float));
     }
+    (void)drop_code;
     if (!g_x_in || g_x_in->ne[1] != T) {
         dit_masks_ready = false;
         dit_inputs_ready = false;
@@ -733,16 +823,28 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
         if (cond_vec) memcpy(cond_in.data() + (size_t)i * enc_dim, cond_vec,
                              (size_t)enc_dim * sizeof(float));
     }
+    // HF zeroes the reference mel for the unconditioned CFG half and still runs
+    // ECAPA on those zeros - the biases make it a nonzero "null speaker" vector
+    for (int i = T0; i < T; i++)
+        if (!cond_zero.empty())
+            memcpy(cond_in.data() + (size_t)i * enc_dim, cond_zero.data(),
+                   (size_t)enc_dim * sizeof(float));
     auto has_nan = [](const float * v, size_t n) {
         for (size_t i = 0; i < n; i++) if (std::isnan(v[i])) return true;
         return false;
     };
     if (getenv("T2W_DEBUG"))
         fprintf(stderr, "t2w: inputs nan x=%d cemb=%d spk=%d cond=%d t=%d\n",
-                (int)has_nan(x, (size_t)d_mel * T), (int)has_nan(cemb.data(), cemb.size()),
+                (int)has_nan(x, (size_t)d_mel * T0), (int)has_nan(cemb.data(), cemb.size()),
                 (int)has_nan(spk_in.data(), spk_in.size()), (int)has_nan(cond_in.data(), cond_in.size()),
                 (int)has_nan(th.data(), th.size()));
-    ggml_backend_tensor_set(g_x_in, x, 0, sizeof(float) * d_mel * T);
+    // the graph input is frame-major [T][mel]; the RK4 state x is [mel][T0]
+    // and both CFG halves share it - transpose while tiling into the batch
+    std::vector<float> xb((size_t)d_mel * T);
+    for (int t = 0; t < T; t++)
+        for (int m = 0; m < d_mel; m++)
+            xb[(size_t)t * d_mel + m] = x[(size_t)m * T0 + (t % T0)];
+    ggml_backend_tensor_set(g_x_in, xb.data(), 0, sizeof(float) * d_mel * T);
     if (!dit_inputs_ready) {   // codec/spk/cond tracks are identical per eval
         ggml_backend_tensor_set(g_code_emb, cemb.data(), 0, sizeof(float) * d_emb * T);
         ggml_backend_tensor_set(g_spk_in, spk_in.data(), 0, sizeof(float) * enc_emb_dim * T);
@@ -802,7 +904,18 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
         for (float v : sv) { if (std::isnan(v)) nan = true; if (v < mn) mn = v; if (v > mx) mx = v; }
         fprintf(stderr, "t2w: dit sink %zu nan=%d [%.3f..%.3f]\n", si, (int)nan, mn, mx);
     }
-    ggml_backend_tensor_get(g_out, out.data(), 0, sizeof(float) * out.size());
+    // graph output is frame-major [T][mel]; hand back [cond|uncond], each
+    // [mel][T0], matching the RK4 state layout the caller works in
+    {
+        std::vector<float> ob((size_t)d_mel * T);
+        ggml_backend_tensor_get(g_out, ob.data(), 0, sizeof(float) * ob.size());
+        out.assign((size_t)d_mel * T, 0.0f);
+        for (int h = 0; h < 2; h++)
+            for (int m = 0; m < d_mel; m++)
+                for (int tt = 0; tt < T0; tt++)
+                    out[((size_t)h * d_mel + m) * T0 + tt] =
+                        ob[((size_t)(h * T0 + tt)) * d_mel + m];
+    }
     if (getenv("T2W_DEBUG")) {
         float mn = out[0], mx = out[0];
         bool nan = false;
@@ -823,6 +936,10 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
                 cm[(size_t)mbin * L + t] = spk_ref_mel[(size_t)t * d_mel + mbin];
         fprintf(stderr, "t2w: ecapa on %d frames\n", L);
         if (!ecapa_embed(cm.data(), L, cond_cached)) return false;
+        // null-speaker track: ECAPA over an all-zero reference mel (the
+        // unconditioned CFG half in HF runs the encoder on zeros)
+        std::vector<float> zm((size_t)d_mel * L, 0.0f);
+        if (!ecapa_embed(zm.data(), L, cond_zero)) return false;
         float ec_mn = cond_cached[0], ec_mx = cond_cached[0];
         for (float v : cond_cached) { if (v < ec_mn) ec_mn = v; if (v > ec_mx) ec_mx = v; }
         fprintf(stderr, "t2w: ecapa done cond [%.4f..%.4f] n=%zu\n", ec_mn, ec_mx, cond_cached.size());
@@ -907,11 +1024,9 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
         fprintf(stderr, "t2w: rk4 SKIPPED (T2W_MEL_LOAD)\n");
     } else {
     auto evalf = [&](float t, const std::vector<float> & v, std::vector<float> & o) {
-        // v is [mel][T0] per batch half; build the [mel][2*T0] batch
-        std::vector<float> batch((size_t)d_mel * T);
-        for (int i = 0; i < 2; i++)   // two CFG halves
-            memcpy(batch.data() + (size_t)i * d_mel * T0, v.data(), (size_t)d_mel * T0 * sizeof(float));
-        if (!dit_eval(batch.data(), T, t, cemb.data(), false, spk_cond.data(),
+        // v is the RK4 state as [mel][T0]; dit_eval tiles it into the CFG
+        // batch and returns [cond-half | uncond-half], each [mel][T0]
+        if (!dit_eval(v.data(), T0, t, cemb.data(), false, spk_cond.data(),
                       cond_cached.data(), o)) return false;
         // guided = cond + g*(cond - uncond), computed over the first half
         for (int i = 0; i < d_mel * T0; i++) {

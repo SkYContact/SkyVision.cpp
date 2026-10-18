@@ -243,10 +243,10 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         for (int d = 0; d < embw; d++)
             etrack[(size_t)embw * (Tp + 1) + d] =
                 gen_hidden[0][(size_t)d] + gen_embed[0][(size_t)d] + cbos[(size_t)d];
-        // codec track: zeros for the prompt, pad/bos on the last two rows
+        // codec track: zeros for the whole prefill. HF folds the codec pad /
+        // bos embeddings into the (e+h) track with "+=" on the last two rows,
+        // so adding them here as well would count them twice.
         std::vector<float> ctrack((size_t)embw * T, 0.0f);
-        memcpy(ctrack.data() + (size_t)embw * Tp, cpad.data(), (size_t)embw * sizeof(float));
-        memcpy(ctrack.data() + (size_t)embw * (Tp + 1), cbos.data(), (size_t)embw * sizeof(float));
 
         if (getenv("QOMNI_TALK_DEBUG")) {
             double hn = 0, en = 0;
@@ -272,8 +272,11 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         std::vector<int> pos(prompt_pos4);                    // MRoPE of the prompt
         pos.resize((size_t)4 * T);
         for (int a = 0; a < 4; a++) {
-            pos[(size_t)a * T + Tp] = next_pos;
-            pos[(size_t)a * T + Tp + 1] = next_pos + 1;
+            // HF continues the talker positions right after the PROMPT (the
+            // tie rows are prompt + bos + first reply row -> arange over T);
+            // the thinker's generated tokens do NOT advance the rope index
+            pos[(size_t)a * T + Tp] = Tp;
+            pos[(size_t)a * T + Tp + 1] = Tp + 1;
         }
         ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
         std::vector<int> slots((size_t)T);
@@ -362,7 +365,7 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         ggml_backend_tensor_set(g_emb_in, in.data(), 0, sizeof(float) * embw);
         ggml_backend_tensor_set(g_reply_in, zero.data(), 0, sizeof(float) * embw);
         ggml_backend_tensor_set(g_codec_emb, cemb.data(), 0, sizeof(float) * embw);
-        std::vector<int> pos((size_t)4, next_pos + 2 + step);
+        std::vector<int> pos((size_t)4, Tp + 2 + step);   // continues the tie rows
         ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
         std::vector<int> slot = { n_past };
         ggml_backend_tensor_set(g_slot_in, slot.data(), 0, sizeof(int));
