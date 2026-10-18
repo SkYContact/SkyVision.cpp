@@ -86,6 +86,33 @@ public:
                     float temperature, int top_k, float top_p, float rep_penalty,
                     uint64_t & rng, std::vector<int> & codec_out);
 
+    // Streaming interface for thinker-talker interleaving: numerically the
+    // same stream as synthesize(), but the talker decode steps are driven one
+    // at a time while the thinker is still generating.
+    //   stream_begin: prefill over the prompt + speaker bos + the FIRST reply
+    //     row (gen0_hidden/gen0_embed = the thinker's first generated hidden
+    //     and embedding), then sample the first codec token.
+    //   stream_step(reply_row): one decode step; reply_row = h_k + e_k of the
+    //     k-th reply row (k >= 1), exactly the batched path's `stream[k-1]`.
+    //     nullptr = feed the text-pad row (post-eos padding).
+    //   stream_finish: feed the thinker-eos row then text-pad rows until the
+    //     codec stream ends (codec_end / codec_pad / 2 min cap).
+    bool stream_begin(const std::vector<int> & prompt_toks, const std::vector<int> & prompt_pos4,
+                      const std::vector<float> & prompt_hidden,
+                      const std::vector<float> & prompt_embed, int next_pos,
+                      ggml_tensor * thinker_embed, int thinker_eos, int thinker_pad,
+                      const std::vector<float> & spk_bos_embed,
+                      const float * gen0_hidden, const float * gen0_embed,
+                      float temperature, int top_k, float top_p, float rep_penalty,
+                      uint64_t & rng);
+    bool stream_step(const float * reply_row, uint64_t & rng);
+    bool stream_finish(uint64_t & rng);
+    bool stream_on() const { return strm_on; }
+    bool stream_active() const {
+        return strm_on && !strm_end && (int)strm_codec.size() < strm_max;
+    }
+    const std::vector<int> & stream_codec() const { return strm_codec; }
+
     int codec_vocab() const { return n_vocab; }
     int codec_eos() const { return id_codec_end; }
     int codec_pad() const { return id_codec_pad; }
@@ -109,6 +136,15 @@ public:
 private:
     bool build_prefill(int T, int S);
     bool build_step(int S);
+    int sample_codec(std::vector<float> & lg, uint64_t & rng);
+
+    // streaming state (live between stream_begin and stream_finish)
+    bool strm_on = false, strm_end = false;
+    int strm_Tp = 0, strm_max = 25 * 120, strm_cur = 0;
+    float s_temp = 0.9f, s_topp = 0.8f, s_rep = 1.05f;
+    int s_topk = 40;
+    std::vector<float> strm_logits, strm_pad_row, strm_eos_row;
+    std::vector<int> strm_codec, strm_hist;
 
     ggml_context * tctx = nullptr;
     ggml_cgraph * tgf = nullptr;

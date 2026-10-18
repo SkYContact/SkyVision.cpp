@@ -171,20 +171,59 @@ bool TalkerLM::build_prefill(int T, int S) {
     return true;
 }
 
-bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vector<int> & prompt_pos4,
-                          const std::vector<float> & prompt_hidden,
-                          const std::vector<float> & prompt_embed,
-                          const std::vector<int> & mm_rows, int next_pos,
-                          const std::vector<int> & gen_toks,
-                          const std::vector<std::vector<float>> & gen_hidden,
-                          const std::vector<std::vector<float>> & gen_embed,
-                          ggml_tensor * thinker_embed, int thinker_eos, int thinker_pad,
-                          const std::vector<float> & spk_bos_embed,
-                          float temperature, int top_k, float top_p, float rep_penalty,
-                          uint64_t & rng, std::vector<int> & codec_out) {
-    codec_out.clear();
-    const int m = (int)gen_hidden.size();
-    if (m < 2) { fprintf(stderr, "talker: need >=2 reply tokens\n"); return false; }
+// temp/top-k/top-p sampling with repetition penalty, codec_bos suppressed
+int TalkerLM::sample_codec(std::vector<float> & lg, uint64_t & rng) {
+    for (int t : strm_hist) {
+        if (t < 0 || t >= n_vocab) continue;
+        float & v = lg[(size_t)t];
+        v = v > 0 ? v / s_rep : v * s_rep;
+    }
+    lg[(size_t)id_codec_start] = -INFINITY;
+    std::vector<std::pair<float, int>> cand((size_t)n_vocab);
+    for (int i = 0; i < n_vocab; i++) cand[(size_t)i] = { lg[(size_t)i], i };
+    std::sort(cand.begin(), cand.end(),
+              [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
+                  return a.first > b.first;
+              });
+    int keep = s_topk > 0 ? std::min(n_vocab, s_topk) : n_vocab;
+    const float inv_t = 1.0f / std::max(s_temp, 1e-4f);
+    std::vector<float> p((size_t)keep);
+    float mx = cand[0].first, sum = 0.0f;
+    for (int i = 0; i < keep; i++) {
+        p[(size_t)i] = expf((cand[(size_t)i].first - mx) * inv_t);
+        sum += p[(size_t)i];
+    }
+    for (int i = 0; i < keep; i++) p[(size_t)i] /= sum;
+    if (s_topp < 1.0f) {
+        float acc = 0.0f;
+        int n = 0;
+        while (n < keep && acc < s_topp) { acc += p[(size_t)n]; n++; }
+        keep = std::max(1, n);
+    }
+    rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+    const float r = (float)(((rng * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0));
+    float acc = 0.0f;
+    for (int i = 0; i < keep; i++) {
+        acc += p[(size_t)i];
+        if (r <= acc) return cand[(size_t)i].second;
+    }
+    return cand[(size_t)keep - 1].second;
+}
+
+bool TalkerLM::stream_begin(const std::vector<int> & prompt_toks,
+                            const std::vector<int> & prompt_pos4,
+                            const std::vector<float> & prompt_hidden,
+                            const std::vector<float> & prompt_embed, int next_pos,
+                            ggml_tensor * thinker_embed, int thinker_eos, int thinker_pad,
+                            const std::vector<float> & spk_bos_embed,
+                            const float * gen0_hidden, const float * gen0_embed,
+                            float temperature, int top_k, float top_p, float rep_penalty,
+                            uint64_t & rng) {
+    (void)next_pos;
+    strm_on = false; strm_end = false;
+    strm_codec.clear(); strm_hist.clear();
+    step_ready = false;   // the decode graph is rebuilt per utterance
+    s_temp = temperature; s_topk = top_k; s_topp = top_p; s_rep = rep_penalty;
 
     // codec embedding rows (host copies)
     auto codec_row = [&](int tok, std::vector<float> & out) {
@@ -195,36 +234,23 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         out.resize((size_t)embw);
         read_emb_row(thinker_embed, tok, out.data());
     };
-
-    // reply stream: prefill consumes row A0; decode step k consumes row A_{k+1};
-    // after the reply runs out: thinker-eos row, then text-pad rows
-    std::vector<std::vector<float>> stream;
-    for (int i = 1; i < m; i++) {
-        std::vector<float> v((size_t)embw);
-        for (int d = 0; d < embw; d++)
-            v[(size_t)d] = gen_hidden[(size_t)i][(size_t)d] + gen_embed[(size_t)i][(size_t)d];
-        stream.push_back(std::move(v));
-    }
-    std::vector<float> pad_row;
-    {
-        std::vector<float> e;
-        thinker_row(thinker_eos, e);
-        stream.push_back(e);
-        thinker_row(thinker_pad, e);
-        stream.push_back(e);
-        pad_row = e;   // HF keeps feeding the text-pad embedding after the reply
-                       // stream runs out; speech ends on codec_end, not text end
-    }
+    thinker_row(thinker_eos, strm_eos_row);
+    thinker_row(thinker_pad, strm_pad_row);   // HF keeps feeding the text-pad
+                                              // embedding after the reply stream
+                                              // runs out; speech ends on
+                                              // codec_end, not text end
 
     // ---- prefill over the full prompt, HF semantics ----
     // [prompt h+e (embed track zeroed at image/audio rows)] +
     //   [bos + codec_pad] + [h(A1)+e(A1) + codec_bos]
     const int Tp = (int)prompt_toks.size();
     if (Tp == 0 || prompt_hidden.size() != (size_t)embw * Tp ||
-        prompt_embed.size() != (size_t)embw * Tp || prompt_pos4.size() != (size_t)4 * Tp) {
+        prompt_embed.size() != (size_t)embw * Tp || prompt_pos4.size() != (size_t)4 * Tp ||
+        !gen0_hidden || !gen0_embed) {
         fprintf(stderr, "talker: bad prompt tracks\n");
         return false;
     }
+    strm_Tp = Tp;
     const int T = Tp + 2;
     if (!build_prefill(T, T)) return false;
     {
@@ -242,7 +268,7 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         // position Tp+1: first reply row + codec_bos
         for (int d = 0; d < embw; d++)
             etrack[(size_t)embw * (Tp + 1) + d] =
-                gen_hidden[0][(size_t)d] + gen_embed[0][(size_t)d] + cbos[(size_t)d];
+                gen0_hidden[(size_t)d] + gen0_embed[(size_t)d] + cbos[(size_t)d];
         // codec track: zeros for the whole prefill. HF folds the codec pad /
         // bos embeddings into the (e+h) track with "+=" on the last two rows,
         // so adding them here as well would count them twice.
@@ -285,105 +311,111 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         vqa::set_causal_mask(g_mask_in, 0, T);
     }
 
-    // temp/top-k/top-p sampling with repetition penalty, codec_bos suppressed
-    auto sample = [&](std::vector<float> & lg, std::vector<int> & history) {
-        for (int t : history) {
-            if (t < 0 || t >= n_vocab) continue;
-            float & v = lg[(size_t)t];
-            v = v > 0 ? v / rep_penalty : v * rep_penalty;
-        }
-        lg[(size_t)id_codec_start] = -INFINITY;
-        std::vector<std::pair<float, int>> cand((size_t)n_vocab);
-        for (int i = 0; i < n_vocab; i++) cand[(size_t)i] = { lg[(size_t)i], i };
-        std::sort(cand.begin(), cand.end(),
-                  [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
-                      return a.first > b.first;
-                  });
-        int keep = top_k > 0 ? std::min(n_vocab, top_k) : n_vocab;
-        const float inv_t = 1.0f / std::max(temperature, 1e-4f);
-        std::vector<float> p((size_t)keep);
-        float mx = cand[0].first, sum = 0.0f;
-        for (int i = 0; i < keep; i++) {
-            p[(size_t)i] = expf((cand[(size_t)i].first - mx) * inv_t);
-            sum += p[(size_t)i];
-        }
-        for (int i = 0; i < keep; i++) p[(size_t)i] /= sum;
-        if (top_p < 1.0f) {
-            float acc = 0.0f;
-            int n = 0;
-            while (n < keep && acc < top_p) { acc += p[(size_t)n]; n++; }
-            keep = std::max(1, n);
-        }
-        rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
-        const float r = (float)(((rng * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0));
-        float acc = 0.0f;
-        for (int i = 0; i < keep; i++) {
-            acc += p[(size_t)i];
-            if (r <= acc) return cand[(size_t)i].second;
-        }
-        return cand[(size_t)keep - 1].second;
-    };
-
-    std::vector<float> logits((size_t)n_vocab);
+    strm_logits.resize((size_t)n_vocab);
     if (ggml_backend_graph_compute(backend, tgf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "talker: prefill compute failed\n");
         return false;
     }
-    ggml_backend_tensor_get(g_logits, logits.data(), 0, sizeof(float) * n_vocab);
+    ggml_backend_tensor_get(g_logits, strm_logits.data(), 0, sizeof(float) * n_vocab);
     if (getenv("QOMNI_TALK_LOGITS_DUMP")) {
         FILE * f = fopen(getenv("QOMNI_TALK_LOGITS_DUMP"), "wb");
-        if (f) { fwrite(logits.data(), sizeof(float), logits.size(), f); fclose(f); }
+        if (f) { fwrite(strm_logits.data(), sizeof(float), strm_logits.size(), f); fclose(f); }
     }
     n_past = T;
 
-    std::vector<int> history;
-    int cur = sample(logits, history);
-    if (cur != id_codec_end && cur != id_codec_pad) {
-        codec_out.push_back(cur);
-        history.push_back(cur);
+    strm_cur = sample_codec(strm_logits, rng);
+    if (strm_cur != id_codec_end && strm_cur != id_codec_pad) {
+        strm_codec.push_back(strm_cur);
+        strm_hist.push_back(strm_cur);
     }
+    strm_on = true;
+    return true;
+}
 
-    step_ready = false;   // the KV cache is cleared between utterances
-    const int max_codec = 25 * 120;   // 2 minutes of speech
-    for (int step = 0; cur != id_codec_end && cur != id_codec_pad &&
-                       (int)codec_out.size() < max_codec; step++) {
-        // one static decode graph over the whole KV window; per step only the
-        // inputs and the causal mask column change (no rebuild / realloc)
-        if (!step_ready) {
-            const int S = std::min(8192, T + max_codec + 1);
-            if (!build_prefill(1, S)) return false;
-            step_ready = true;
-        }
-        std::vector<float> cemb;
-        codec_row(cur, cemb);
-        const std::vector<float> & rep =
-            step < (int)stream.size() ? stream[(size_t)step] : pad_row;
-        std::vector<float> in((size_t)embw, 0.0f);
-        std::vector<float> zero((size_t)embw, 0.0f);
-        // decode: e track = reply row, codec track = embed(cur), h track empty
-        for (int d = 0; d < embw; d++) in[(size_t)d] = rep[(size_t)d];
-        ggml_backend_tensor_set(g_emb_in, in.data(), 0, sizeof(float) * embw);
-        ggml_backend_tensor_set(g_reply_in, zero.data(), 0, sizeof(float) * embw);
-        ggml_backend_tensor_set(g_codec_emb, cemb.data(), 0, sizeof(float) * embw);
-        std::vector<int> pos((size_t)4, Tp + 2 + step);   // continues the tie rows
-        ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
-        std::vector<int> slot = { n_past };
-        ggml_backend_tensor_set(g_slot_in, slot.data(), 0, sizeof(int));
-        vqa::set_causal_mask(g_mask_in, n_past, 1);
-
-        if (ggml_backend_graph_compute(backend, tgf) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "talker: step compute failed\n");
-            return false;
-        }
-        ggml_backend_tensor_get(g_logits, logits.data(), 0, sizeof(float) * n_vocab);
-        n_past++;
-        cur = sample(logits, history);
-        if (cur == id_codec_end || cur == id_codec_pad) break;
-        codec_out.push_back(cur);
-        history.push_back(cur);
+bool TalkerLM::stream_step(const float * reply_row, uint64_t & rng) {
+    if (!stream_active()) { strm_end = true; return true; }
+    // one static decode graph over the whole KV window; per step only the
+    // inputs and the causal mask column change (no rebuild / realloc)
+    if (!step_ready) {
+        const int S = std::min(8192, strm_Tp + 2 + strm_max + 1);
+        if (!build_prefill(1, S)) return false;
+        step_ready = true;
     }
-    fprintf(stderr, "talker: %d codec tokens (%.1f s)\n", (int)codec_out.size(),
-            codec_out.size() / 25.0);
+    std::vector<float> cemb((size_t)embw);
+    read_emb_row(embed, strm_cur, cemb.data());
+    std::vector<float> in((size_t)embw, 0.0f);
+    std::vector<float> zero((size_t)embw, 0.0f);
+    // decode: e track = reply row, codec track = embed(cur), h track empty
+    if (reply_row)
+        for (int d = 0; d < embw; d++) in[(size_t)d] = reply_row[(size_t)d];
+    else
+        for (int d = 0; d < embw; d++) in[(size_t)d] = strm_pad_row[(size_t)d];
+    ggml_backend_tensor_set(g_emb_in, in.data(), 0, sizeof(float) * embw);
+    ggml_backend_tensor_set(g_reply_in, zero.data(), 0, sizeof(float) * embw);
+    ggml_backend_tensor_set(g_codec_emb, cemb.data(), 0, sizeof(float) * embw);
+    const int step = n_past - (strm_Tp + 2);
+    std::vector<int> pos((size_t)4, strm_Tp + 2 + step);   // continues the tie rows
+    ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
+    std::vector<int> slot = { n_past };
+    ggml_backend_tensor_set(g_slot_in, slot.data(), 0, sizeof(int));
+    vqa::set_causal_mask(g_mask_in, n_past, 1);
+
+    if (ggml_backend_graph_compute(backend, tgf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "talker: step compute failed\n");
+        return false;
+    }
+    ggml_backend_tensor_get(g_logits, strm_logits.data(), 0, sizeof(float) * n_vocab);
+    n_past++;
+    strm_cur = sample_codec(strm_logits, rng);
+    if (strm_cur == id_codec_end || strm_cur == id_codec_pad) { strm_end = true; return true; }
+    strm_codec.push_back(strm_cur);
+    strm_hist.push_back(strm_cur);
+    return true;
+}
+
+bool TalkerLM::stream_finish(uint64_t & rng) {
+    if (!strm_on) return true;
+    // thinker-eos row once the reply runs out, then text-pad rows
+    if (stream_active()) {
+        if (!stream_step(strm_eos_row.data(), rng)) return false;
+    }
+    while (stream_active()) {
+        if (!stream_step(nullptr, rng)) return false;
+    }
+    fprintf(stderr, "talker: %d codec tokens (%.1f s)\n", (int)strm_codec.size(),
+            strm_codec.size() / 25.0);
+    return !strm_codec.empty();
+}
+
+bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vector<int> & prompt_pos4,
+                          const std::vector<float> & prompt_hidden,
+                          const std::vector<float> & prompt_embed,
+                          const std::vector<int> & mm_rows, int next_pos,
+                          const std::vector<int> & gen_toks,
+                          const std::vector<std::vector<float>> & gen_hidden,
+                          const std::vector<std::vector<float>> & gen_embed,
+                          ggml_tensor * thinker_embed, int thinker_eos, int thinker_pad,
+                          const std::vector<float> & spk_bos_embed,
+                          float temperature, int top_k, float top_p, float rep_penalty,
+                          uint64_t & rng, std::vector<int> & codec_out) {
+    codec_out.clear();
+    (void)mm_rows; (void)gen_toks;
+    const int m = (int)gen_hidden.size();
+    if (m < 2) { fprintf(stderr, "talker: need >=2 reply tokens\n"); return false; }
+    if (!stream_begin(prompt_toks, prompt_pos4, prompt_hidden, prompt_embed, next_pos,
+                      thinker_embed, thinker_eos, thinker_pad, spk_bos_embed,
+                      gen_hidden[0].data(), gen_embed[0].data(),
+                      temperature, top_k, top_p, rep_penalty, rng))
+        return false;
+    // reply row k of the batched stream = gen_hidden[k+1] + gen_embed[k+1]
+    for (int k = 1; k < m && stream_active(); k++) {
+        std::vector<float> row((size_t)embw);
+        for (int d = 0; d < embw; d++)
+            row[(size_t)d] = gen_hidden[(size_t)k][(size_t)d] + gen_embed[(size_t)k][(size_t)d];
+        if (!stream_step(row.data(), rng)) return false;
+    }
+    if (!stream_finish(rng)) return false;
+    codec_out = strm_codec;
     return !codec_out.empty();
 }
 

@@ -191,6 +191,8 @@ private:
                             const std::vector<std::vector<float>> & gen_hidden,
                             const std::vector<std::vector<float>> & gen_embed,
                             int next_pos, const char * wav_path);
+    bool finish_speech(std::vector<int> & codec, const char * wav_path,
+                       double talker_seconds);
 
     int id_audio = 151646, id_audio_start = 151647, id_audio_end = 151648;
     int id_image_pad = 151655, id_video_pad = 151656;
@@ -1064,6 +1066,32 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
 
     std::vector<int> out;
     std::vector<std::vector<float>> gen_hidden, gen_embed;
+    // ---- thinker-talker interleaving ----
+    // QOMNI_SERIAL_TALKER=1 keeps the old fully-serial path (parity oracle):
+    // the whole reply is generated first, then the talker runs in one batch.
+    const bool serial_talker = getenv("QOMNI_SERIAL_TALKER") != nullptr;
+    bool strm_ok = false;
+    std::vector<float> prompt_embed, bos_emb;
+    float t_temp = 0.9f; int t_topk = 40; float t_topp = 0.8f, t_rep = 1.05f;
+    if (want_talker && !serial_talker) {
+        if (const char * e = getenv("QOMNI_TALK_TEMP")) t_temp = atof(e);
+        if (const char * e = getenv("QOMNI_TALK_TOPK")) t_topk = atoi(e);
+        if (const char * e = getenv("QOMNI_TALK_TOPP")) t_topp = atof(e);
+        if (const char * e = getenv("QOMNI_TALK_REP")) t_rep = atof(e);
+        // HF feeds the talker the prompt's post-norm hidden plus the plain
+        // token embedding, with the image/audio rows of the embed track zeroed
+        prompt_embed.assign((size_t)n_embd * T, 0.0f);
+        if (prompt_hidden_all.size() == (size_t)n_embd * T) {
+            for (int i = 0; i < T; i++) {
+                if (toks[(size_t)i] == id_image_pad || toks[(size_t)i] == id_audio) continue;
+                read_emb_row(tok_embd, toks[(size_t)i],
+                             prompt_embed.data() + (size_t)n_embd * i);
+            }
+        }
+        bos_emb.resize((size_t)n_embd);
+        read_emb_row(tok_embd, spk_bos_token, bos_emb.data());
+    }
+    const auto t_gen0 = std::chrono::steady_clock::now();
     int cur = vqa::sample_logits(logits, gp, rng_state);
     auto emit = [&](int t) {
         std::string piece = tok_.decode({ t });
@@ -1073,7 +1101,16 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     if (cur != id_eos) emit(cur);
 
     for (int i = 1; i < gp.max_tokens && cur != id_eos; i++) {
-        const int S = n_past + 1;
+        // Bucket the KV window so the decode graph keeps a CONSTANT shape
+        // across steps (LOAD-BEARING for CUDA graphs: ggml-cuda keys its
+        // graph cache on cgraph->nodes[0] and only replays a capture when
+        // every node prop - including ne[] - matches; with the exact
+        // S = n_past + 1 the shape changes every step and graphs never
+        // warm up). Unused rows are pre-zeroed in the KV cache and masked
+        // -inf by set_causal_mask, so widening S is exact.
+        int S = n_past + 1;
+        if (S <= 1024) { int b = 128; while (b < S) b <<= 1; S = b; }
+        else           { S = ((S + 1023) / 1024) * 1024; }
         TextGraph d;
         if (!build_text_graph(d, 1, S, 0, 0, want_talker)) { ggml_free(d.ctx); return false; }
         vqa::set_causal_mask(d.mask_in, n_past, 1);
@@ -1090,24 +1127,57 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         if (want_talker) {
             gen_hidden.push_back(std::move(hid));
             gen_embed.push_back(std::move(emb));
+            if (!serial_talker) {
+                // drive the talker in lockstep with the thinker: the first
+                // reply row arms the prefill, every later row advances the
+                // talker decode by one step, so the codec stream is done when
+                // the text is (total = max(thinker, talker), not the sum)
+                if (!strm_ok) {
+                    strm_ok = talker.stream_begin(toks, pos, prompt_hidden_all, prompt_embed,
+                                                  next_pos, tok_embd, id_eos, 151859, bos_emb,
+                                                  gen_hidden.back().data(), gen_embed.back().data(),
+                                                  t_temp, t_topk, t_topp, t_rep, rng_state);
+                } else if (talker.stream_active()) {
+                    const std::vector<float> & h = gen_hidden.back();
+                    const std::vector<float> & e = gen_embed.back();
+                    std::vector<float> row((size_t)talker.embw);
+                    for (int d = 0; d < talker.embw; d++)
+                        row[(size_t)d] = h[(size_t)d] + e[(size_t)d];
+                    if (!talker.stream_step(row.data(), rng_state)) { strm_ok = false; break; }
+                }
+            }
         }
         cur = vqa::sample_logits(lg, gp, rng_state);
         if (cur == id_eos) break;
         emit(cur);
     }
     if (want_talker) {
-        // HF feeds the talker the prompt's post-norm hidden plus the plain
-        // token embedding, with the image/audio rows of the embed track zeroed
-        std::vector<float> prompt_embed((size_t)n_embd * T, 0.0f);
-        if (prompt_hidden_all.size() == (size_t)n_embd * T) {
-            for (int i = 0; i < T; i++) {
-                if (toks[(size_t)i] == id_image_pad || toks[(size_t)i] == id_audio) continue;
-                read_emb_row(tok_embd, toks[(size_t)i],
-                             prompt_embed.data() + (size_t)n_embd * i);
+        if (serial_talker) {
+            // HF feeds the talker the prompt's post-norm hidden plus the plain
+            // token embedding, with the image/audio rows of the embed track zeroed
+            std::vector<float> pe((size_t)n_embd * T, 0.0f);
+            if (prompt_hidden_all.size() == (size_t)n_embd * T) {
+                for (int i = 0; i < T; i++) {
+                    if (toks[(size_t)i] == id_image_pad || toks[(size_t)i] == id_audio) continue;
+                    read_emb_row(tok_embd, toks[(size_t)i],
+                                 pe.data() + (size_t)n_embd * i);
+                }
             }
+            synthesize_speech(toks, pos, prompt_hidden_all, pe, out,
+                              gen_hidden, gen_embed, next_pos, gp.speak_wav);
+        } else if (strm_ok && gen_hidden.size() >= 2) {
+            const auto t_tk1 = std::chrono::steady_clock::now();
+            const bool ok = talker.stream_finish(rng_state);
+            const auto t_tk2 = std::chrono::steady_clock::now();
+            std::vector<int> codec = talker.stream_codec();
+            if (ok) finish_speech(codec, gp.speak_wav,
+                                  std::chrono::duration<double>(t_tk2 - t_tk1).count());
+            fprintf(stderr, "timing: interleaved think+talk %.2f s | drain %.2f s "
+                            "(%d text toks, %d codes)\n",
+                    std::chrono::duration<double>(t_tk1 - t_gen0).count(),
+                    std::chrono::duration<double>(t_tk2 - t_tk1).count(),
+                    (int)out.size(), (int)codec.size());
         }
-        synthesize_speech(toks, pos, prompt_hidden_all, prompt_embed, out,
-                          gen_hidden, gen_embed, next_pos, gp.speak_wav);
     }
     out_text = tok_.decode(out);
     return true;
@@ -1143,6 +1213,15 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
         fprintf(stderr, "talker: synthesis failed\n");
         return false;
     }
+    const auto t_tk1 = std::chrono::steady_clock::now();
+    return finish_speech(codec, wav_path,
+                         std::chrono::duration<double>(t_tk1 - t_tk0).count());
+}
+
+// codec dump/load + t2w vocoding + wav write, shared by the serial and the
+// interleaved (streamed) talker paths
+bool Qwen25Omni::finish_speech(std::vector<int> & codec, const char * wav_path,
+                               double talker_seconds) {
     if (const char * dp = getenv("QOMNI_CODEC_DUMP")) {
         FILE * f = fopen(dp, "wb");
         if (f) { int n = (int)codec.size(); fwrite(&n, 4, 1, f);
@@ -1160,7 +1239,7 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
             fprintf(stderr, "t2w: loaded %d reference codec tokens\n", (int)codec.size());
         }
     }
-    const auto t_tk1 = std::chrono::steady_clock::now();
+    const auto t_t2w0 = std::chrono::steady_clock::now();
     std::vector<float> pcm;
     if (!t2w.run(codec, pcm)) {
         fprintf(stderr, "token2wav: synthesis failed\n");
@@ -1168,8 +1247,8 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
     }
     const auto t_t2w1 = std::chrono::steady_clock::now();
     fprintf(stderr, "timing: talker %.2f s | t2w %.2f s (%d codes)\n",
-            std::chrono::duration<double>(t_tk1 - t_tk0).count(),
-            std::chrono::duration<double>(t_t2w1 - t_tk1).count(), (int)codec.size());
+            talker_seconds,
+            std::chrono::duration<double>(t_t2w1 - t_t2w0).count(), (int)codec.size());
     // write a 24 kHz mono s16 wav
     FILE * f = fopen(wav_path, "wb");
     if (!f) { fprintf(stderr, "cannot open %s\n", wav_path); return false; }
