@@ -24,6 +24,7 @@
 // 102 - n_out are gap garbage.
 #include "qwen25omni_model.hpp"
 
+#include "audio_feats.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -43,78 +44,6 @@
 
 namespace qwen25omni {
 
-namespace {
-
-#define SIN_COS_N_COUNT 400
-
-struct WhisperCache {
-    float sin_vals[SIN_COS_N_COUNT];
-    float cos_vals[SIN_COS_N_COUNT];
-    float hann_window[SIN_COS_N_COUNT];
-
-    WhisperCache() {
-        for (int i = 0; i < SIN_COS_N_COUNT; i++) {
-            const double theta = (2 * M_PI * i) / SIN_COS_N_COUNT;
-            sin_vals[i] = sinf(theta);
-            cos_vals[i] = cosf(theta);
-            hann_window[i] = 0.5f * (1.0f - cosf((2.0f * M_PI * i) / SIN_COS_N_COUNT));
-        }
-    }
-};
-
-const WhisperCache & whisper_cache() {
-    static WhisperCache c;
-    return c;
-}
-
-// naive DFT (odd sizes), Cooley-Tukey otherwise - whisper.cpp's portable FFT
-void fft(float * in, int N, float * out) {
-    const WhisperCache & c = whisper_cache();
-    if (N == 1) {
-        out[0] = in[0];
-        out[1] = 0;
-        return;
-    }
-    const int half_N = N / 2;
-    if (N - half_N * 2 == 1) {
-        const int sin_cos_step = SIN_COS_N_COUNT / N;
-        for (int k = 0; k < N; k++) {
-            float re = 0, im = 0;
-            for (int n = 0; n < N; n++) {
-                const int idx = (k * n * sin_cos_step) % SIN_COS_N_COUNT;
-                re += in[n] * c.cos_vals[idx];
-                im -= in[n] * c.sin_vals[idx];
-            }
-            out[k * 2 + 0] = re;
-            out[k * 2 + 1] = im;
-        }
-        return;
-    }
-
-    float * even = in + N;
-    for (int i = 0; i < half_N; ++i) even[i] = in[2 * i];
-    float * even_fft = out + 2 * N;
-    fft(even, half_N, even_fft);
-
-    float * odd = even;
-    for (int i = 0; i < half_N; ++i) odd[i] = in[2 * i + 1];
-    float * odd_fft = even_fft + N;
-    fft(odd, half_N, odd_fft);
-
-    const int sin_cos_step = SIN_COS_N_COUNT / N;
-    for (int k = 0; k < half_N; k++) {
-        const int idx = k * sin_cos_step;
-        const float re = c.cos_vals[idx], im = -c.sin_vals[idx];
-        const float re_odd = odd_fft[2 * k + 0], im_odd = odd_fft[2 * k + 1];
-        out[2 * k + 0] = even_fft[2 * k + 0] + re * re_odd - im * im_odd;
-        out[2 * k + 1] = even_fft[2 * k + 1] + re * im_odd + im * re_odd;
-        out[2 * (k + half_N) + 0] = even_fft[2 * k + 0] - re * re_odd + im * im_odd;
-        out[2 * (k + half_N) + 1] = even_fft[2 * k + 1] - re * im_odd - im * re_odd;
-    }
-}
-
-}  // namespace
-
 // ---------------------------------------------------------------- mel
 //
 // transformers' WhisperFeatureExtractor: reflect-pad n_fft/2 samples at both
@@ -122,59 +51,16 @@ void fft(float * in, int N, float * out) {
 // [max - 8, max], then (x + 4) / 4. No 30 s zero padding - the Omni processor
 // keeps the variable length (feature_attention_mask carries it).
 MelSpec AudioTower::log_mel(const float * pcm, int n_samples) const {
-    const WhisperCache & c = whisper_cache();
-    // HF trims the centered stft to floor(L/hop) frames via the attention
-    // mask downsampled ::hop - keep the extra center=True tail frame out.
-    const int n_len = n_samples / hop;
-    const int n_fft_bins = n_fft / 2 + 1;
     MelSpec mel;
     mel.n_mel = n_mel;
-    mel.n_len = n_len;
-    mel.data.assign((size_t)n_mel * n_len, 0.0f);
+    mel.n_len = n_samples / hop;
 
     const float * filt = mel_filters_host.empty()
                               ? (const float *)mel_filters->data
                               : mel_filters_host.data();
 
-    std::vector<float> fft_in(n_fft * 2, 0.0f);
-    std::vector<float> fft_out(n_fft * 2 * 2 * 2);
-    std::vector<float> power(n_fft_bins);
-
-    const int pad = n_fft / 2;
-    auto sample_at = [&](int i) {
-        if (n_samples == 0) return 0.0f;
-        if (i < 0) i = std::min(-i, n_samples - 1);      // reflect at the start
-        if (i >= n_samples) return 0.0f;                 // torch.stft zero-pads the tail
-        return pcm[i];
-    };
-
-    for (int t = 0; t < n_len; t++) {
-        const int off = t * hop - pad;
-        for (int j = 0; j < n_fft; j++) fft_in[j] = c.hann_window[j] * sample_at(off + j);
-        fft(fft_in.data(), n_fft, fft_out.data());
-        for (int j = 0; j < n_fft_bins; j++)
-            power[j] = fft_out[2 * j + 0] * fft_out[2 * j + 0] +
-                       fft_out[2 * j + 1] * fft_out[2 * j + 1];
-        for (int m = 0; m < n_mel; m++) {
-            double sum = 0.0;
-            int k = 0;
-            for (; k < n_fft_bins - 3; k += 4)
-                sum += power[k + 0] * filt[m * n_fft_bins + k + 0] +
-                       power[k + 1] * filt[m * n_fft_bins + k + 1] +
-                       power[k + 2] * filt[m * n_fft_bins + k + 2] +
-                       power[k + 3] * filt[m * n_fft_bins + k + 3];
-            for (; k < n_fft_bins; k++) sum += power[k] * filt[m * n_fft_bins + k];
-            mel.data[(size_t)m * n_len + t] = log10(std::max(sum, 1e-10));
-        }
-    }
-
-    double mmax = -1e20;
-    for (size_t i = 0; i < mel.data.size(); i++) mmax = std::max(mmax, (double)mel.data[i]);
-    mmax -= 8.0;
-    for (size_t i = 0; i < mel.data.size(); i++) {
-        mel.data[i] = (float)std::max((double)mel.data[i], mmax);
-        mel.data[i] = (mel.data[i] + 4.0f) / 4.0f;
-    }
+    vqa::audio::log_mel_whisper(pcm, n_samples, n_fft, hop, n_mel, filt, mel.data);
+    vqa::audio::normalize_log_mel_whisper(mel.data);
     return mel;
 }
 

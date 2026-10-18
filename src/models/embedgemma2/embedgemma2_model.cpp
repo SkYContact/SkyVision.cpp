@@ -42,6 +42,7 @@
 #include "vqa.hpp"
 
 #include "attention.hpp"
+#include "audio_feats.hpp"
 #include "backend.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -116,104 +117,6 @@ struct AudLayer {
     ggml_tensor *lconv_start = nullptr, *lconv_end = nullptr, *lconv_dw = nullptr;
     AudClip cs, ce;
 };
-
-// --------------------------------------------------------------- mel + fft
-
-// in-place iterative radix-2 complex FFT (n = power of 2)
-static void fft_radix2(float * re, float * im, int n) {
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        float ang = -2.0f * (float)M_PI / (float)len;
-        float wr = cosf(ang), wi = sinf(ang);
-        for (int i = 0; i < n; i += len) {
-            float cr = 1.0f, ci = 0.0f;
-            for (int k = 0; k < len / 2; k++) {
-                int a = i + k, b = i + k + len / 2;
-                float tr = re[b] * cr - im[b] * ci;
-                float ti = re[b] * ci + im[b] * cr;
-                re[b] = re[a] - tr; im[b] = im[a] - ti;
-                re[a] += tr;        im[a] += ti;
-                float nr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr; cr = nr;
-            }
-        }
-    }
-}
-
-// HTK mel scale, matching transformers.audio_utils (2595*log10(1 + f/700))
-static inline float hz_to_mel(float f) { return 2595.0f * log10f(1.0f + f / 700.0f); }
-static inline float mel_to_hz(float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); }
-
-// Gemma4AudioFeatureExtractor: waveform (16 kHz mono) -> log-mel [128, T] and
-// the per-frame validity mask (a frame is valid when its window end lands on
-// real audio - mirrors the padded raw-waveform mask the HF processor builds).
-static bool compute_mel(const std::vector<float> & wav, int fft_n, int frame_len, int hop,
-                        int n_bins, float floor_, float min_f, float max_f, int sr,
-                        std::vector<float> & mel, std::vector<uint8_t> & valid,
-                        int & T) {
-    const int pad_left = frame_len / 2;                    // semicausal time padding
-    const int unfold = frame_len + 1;
-    const int total = pad_left + (int)wav.size();
-    const int n_frames = (total - unfold) / hop + 1;
-    if (n_frames <= 0) return false;
-    T = n_frames;
-    mel.assign((size_t)n_frames * n_bins, 0.0f);
-    valid.assign((size_t)n_frames, 0);
-
-    // periodic Hann over frame_len
-    std::vector<float> win(frame_len);
-    for (int n = 0; n < frame_len; n++) win[n] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * n / frame_len);
-
-    // HTK triangular filterbank, no norm (transformers mel_filter_bank norm=None)
-    std::vector<float> fb((size_t)n_bins * (fft_n / 2 + 1), 0.0f);
-    {
-        const float m_min = hz_to_mel(min_f), m_max = hz_to_mel(max_f);
-        const int n_pts = n_bins + 2;
-        std::vector<float> pts(n_pts);
-        for (int i = 0; i < n_pts; i++) pts[i] = mel_to_hz(m_min + (m_max - m_min) * i / (n_pts - 1));
-        std::vector<float> bins(fft_n / 2 + 1);
-        for (int i = 0; i <= fft_n / 2; i++) bins[i] = (float)sr * 0.5f * i / (fft_n / 2);
-        for (int b = 0; b <= fft_n / 2; b++) {
-            for (int j = 0; j < n_bins; j++) {
-                const float lo = pts[j], mid = pts[j + 1], hi = pts[j + 2];
-                float w = 0.0f;
-                if (bins[b] >= lo && bins[b] <= hi) {
-                    if (bins[b] <= mid) w = lo == mid ? 1.0f : (bins[b] - lo) / (mid - lo);
-                    else                w = mid == hi ? 1.0f : (hi - bins[b]) / (hi - mid);
-                }
-                fb[(size_t)j * (fft_n / 2 + 1) + b] = w;
-            }
-        }
-    }
-
-    std::vector<float> re(fft_n), im(fft_n);
-    for (int f = 0; f < n_frames; f++) {
-        std::fill(re.begin(), re.end(), 0.0f);
-        std::fill(im.begin(), im.end(), 0.0f);
-        const int base = f * hop;
-        for (int n = 0; n < frame_len; n++) {          // unfold size 321, drop the last sample
-            const int idx = base + n;
-            float s = (idx >= pad_left && idx < total) ? wav[idx - pad_left] : 0.0f;
-            re[n] = s * win[n];
-        }
-        fft_radix2(re.data(), im.data(), fft_n);
-        for (int b = 0; b <= fft_n / 2; b++) {
-            const float mag = sqrtf(re[b] * re[b] + im[b] * im[b]);
-            for (int j = 0; j < n_bins; j++)
-                mel[(size_t)f * n_bins + j] += mag * fb[(size_t)j * (fft_n / 2 + 1) + b];
-        }
-        // frame validity: padded-mask index i*hop + unfold - 1 must be real audio
-        const int mask_idx = base + unfold - 1;
-        valid[f] = (mask_idx >= pad_left && mask_idx < total) ? 1 : 0;
-    }
-    for (auto & v : mel) v = logf(v + floor_);
-    return true;
-}
 
 // --------------------------------------------------------------- model
 
@@ -660,6 +563,7 @@ bool EmbedGemma2::load(const std::string & gguf_path, const std::string & tokeni
 
     caps_.image = true;
     caps_.video = true;
+    caps_.audio = true;   // conformer tower consumes audio tracks
     fprintf(stderr, "embgemma2: ready (%dL d=%d ple=%d out=%d | vision %dL d=%d hd=%d | "
                     "audio %dL d=%d heads=%d chunk=%d)\n",
             n_layer, n_embd, ple_dim, out_dim, v_layer, v_embd, v_head_dim,
@@ -890,8 +794,9 @@ bool EmbedGemma2::run_vision(const std::vector<float> & patches, const std::vect
             orow[o] = acc;
         }
     }
-    if (getenv("EMBG2_DEBUG")) {
-        FILE * f = fopen("/tmp/eg2_engine_soft.bin", "wb");
+    if (!dump_dir.empty() && getenv("EMBG2_DEBUG")) {
+        std::string p = dump_dir + "/eg2_engine_soft.bin";
+        FILE * f = fopen(p.c_str(), "wb");
         if (f) { fwrite(soft.data(), sizeof(float), soft.size(), f); fclose(f); }
     }
     return true;
@@ -1208,8 +1113,9 @@ bool EmbedGemma2::run_audio(const std::vector<float> & mel, const std::vector<ui
         if (ok) memcpy(soft.data() + (size_t)u * D, raw.data() + (size_t)i * D, sizeof(float) * D);
         if (ok) u++;
     }
-    if (getenv("EMBG2_DEBUG")) {
-        FILE * f = fopen("/tmp/eg2_engine_asoft.bin", "wb");
+    if (!dump_dir.empty() && getenv("EMBG2_DEBUG")) {
+        std::string p = dump_dir + "/eg2_engine_asoft.bin";
+        FILE * f = fopen(p.c_str(), "wb");
         if (f) { fwrite(soft.data(), sizeof(float), soft.size(), f); fclose(f); }
     }
     return true;
@@ -1474,7 +1380,7 @@ bool EmbedGemma2::embed(const vqa::MediaInput & media, const std::string & text,
         std::vector<float> mel;
         std::vector<uint8_t> valid;
         int T = 0;
-        if (!compute_mel(media.audio, mel_fft, mel_frame, mel_hop, mel_bins, mel_floor,
+        if (!vqa::audio::log_mel_gemma(media.audio, mel_fft, mel_frame, mel_hop, mel_bins, mel_floor,
                          mel_min_f, mel_max_f, mel_sr, mel, valid, T)) {
             fprintf(stderr, "audio too short for mel extraction\n");
             return false;
@@ -1491,8 +1397,9 @@ bool EmbedGemma2::embed(const vqa::MediaInput & media, const std::string & text,
         if (!run_audio(mel, valid, T, aud_soft_n, aud_soft)) return false;
         fprintf(stderr, "audio: %.1fs -> %d mel frames, %d soft tokens\n",
                 (double)media.audio.size() / mel_sr, T, aud_soft_n);
-        if (getenv("EMBG2_DEBUG")) {
-            FILE * f = fopen("/tmp/eg2_engine_mel.bin", "wb");
+        if (!dump_dir.empty() && getenv("EMBG2_DEBUG")) {
+            std::string p = dump_dir + "/eg2_engine_mel.bin";
+            FILE * f = fopen(p.c_str(), "wb");
             if (f) { fwrite(mel.data(), sizeof(float), mel.size(), f); fclose(f); }
         }
     }
