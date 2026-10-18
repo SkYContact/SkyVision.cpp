@@ -12,6 +12,30 @@
 //     (block 24; look-ahead on layer 10, look-back on layers 0 and 20) + RoPE;
 //   * BigVGAN: mel -> exp -> dB(-115) - 20 -> normalize to [-1, 1], conv_pre,
 //     6x [ConvTranspose1d + mean of 3 AMP res-blocks], snake, conv_post, clamp.
+#include <chrono>
+#include <thread>
+#include <atomic>
+
+// minimal work-stealing parallel-for for the host-side vocoder loops; the
+// per-index writes are disjoint in every call site (channels or positions)
+template <typename F>
+static void par_for(int n, F f) {
+    unsigned nt = std::thread::hardware_concurrency();
+    if (nt > 16) nt = 16;
+    if (n <= 1 || nt <= 1) {
+        for (int i = 0; i < n; i++) f(i);
+        return;
+    }
+    std::atomic<int> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(nt);
+    for (unsigned t = 0; t < nt; t++)
+        pool.emplace_back([&] {
+            int i;
+            while ((i = next.fetch_add(1)) < n) f(i);
+        });
+    for (auto & th : pool) th.join();
+}
 #include "qwen25omni_talker.hpp"
 
 #include "ggml-alloc.h"
@@ -57,7 +81,7 @@ namespace {
 
 void conv1d_full(const float * x, int ic, int T, const float * w, const float * b,
                  int oc, int kw, int dil, int pad, float * y, int Ty) {
-    for (int o = 0; o < oc; o++) {
+    par_for(oc, [&](int o) {
         float * yo = y + (size_t)o * Ty;
         for (int n = 0; n < Ty; n++) yo[n] = b ? b[(size_t)o] : 0.0f;
         for (int i = 0; i < ic; i++) {
@@ -74,25 +98,26 @@ void conv1d_full(const float * x, int ic, int T, const float * w, const float * 
                 }
             }
         }
-    }
+    });
 }
 
 void conv_transpose1d_full(const float * x, int ic, int T, const float * w, const float * b,
                            int oc, int kw, int stride, int pad, float * y, int Ty) {
     std::fill(y, y + (size_t)oc * Ty, 0.0f);
-    for (int i = 0; i < ic; i++) {
-        const float * xc = x + (size_t)i * T;
-        for (int n = 0; n < T; n++) {
-            const float xv = xc[n];
-            for (int kk = 0; kk < kw; kk++) {
-                const int idx = n * stride - pad + kk;
-                if (idx < 0 || idx >= Ty) continue;
-                float * yo = y + (size_t)idx;
-                const float * wo = w + ((size_t)i * oc) * kw + kk;
-                for (int o = 0; o < oc; o++) yo[(size_t)o * Ty] += wo[(size_t)o * kw] * xv;
+    par_for(oc, [&](int o) {
+        float * yrow = y + (size_t)o * Ty;
+        for (int i = 0; i < ic; i++) {
+            const float * xc = x + (size_t)i * T;
+            const float * wo = w + ((size_t)i * oc) * kw;
+            for (int n = 0; n < T; n++) {
+                const float xv = xc[n];
+                for (int kk = 0; kk < kw; kk++) {
+                    const int idx = n * stride - pad + kk;
+                    if (idx >= 0 && idx < Ty) yrow[idx] += wo[(size_t)o * kw + kk] * xv;
+                }
             }
         }
-    }
+    });
     if (b)
         for (int o = 0; o < oc; o++) {
             float * yo = y + (size_t)o * Ty;
@@ -184,38 +209,34 @@ void aa_snake_act(const float * x, int C, int T, const std::vector<float> & alph
     const int pad_r = pad * 2 + (K - 2 + 1) / 2;  // 16
     const int Tu = 2 * T - 1;
     std::vector<float> up((size_t)C * Tu);
-    for (int c = 0; c < C; c++) {
+    par_for(C, [&](int c) {   // C is small late in the stack; the inner loops
+                              // are long enough that channel-level split works
         const float * xc = x + (size_t)c * T;
-        float * yc = up.data() + (size_t)c * Tu;
+        float * yu = up.data() + (size_t)c * Tu;
         auto at = [&](int i) { return xc[i < 0 ? 0 : (i >= T ? T - 1 : i)]; };
         for (int n = -pad; n < T + pad; n++) {          // padded input positions
             const float xv = at(n);
             for (int kk = 0; kk < K; kk++) {
                 const int idx = (n + pad) * 2 + kk;      // full transposed-conv index
                 const int o = idx - pad_l;
-                if (o >= 0 && o < Tu) yc[o] += 2.0f * filter[(size_t)kk] * xv;
+                if (o >= 0 && o < Tu) yu[o] += 2.0f * filter[(size_t)kk] * xv;
             }
         }
-    }
-    // snake on the upsampled grid
-    for (int c = 0; c < C; c++) {
+        // snake on the upsampled grid
         const float a = expf(alpha[(size_t)c]);
         const float b = expf(beta[(size_t)c]) + 1e-9f;
-        float * xc = up.data() + (size_t)c * Tu;
-        for (int n = 0; n < Tu; n++) xc[n] += sinf(xc[n] * a) * sinf(xc[n] * a) / b;
-    }
-    // down2: replicate pad left 5 / right 6, strided depthwise conv
-    const int dl = K / 2 - 1, dr = K / 2;
-    for (int c = 0; c < C; c++) {
-        const float * xc = up.data() + (size_t)c * Tu;
+        float * xu = up.data() + (size_t)c * Tu;
+        for (int n = 0; n < Tu; n++) xu[n] += sinf(xu[n] * a) * sinf(xu[n] * a) / b;
+        // down2: replicate pad left 5 / right 6, strided depthwise conv
+        const int dl = K / 2 - 1, dr = K / 2;
         float * yc = y + (size_t)c * T;
-        auto at = [&](int i) { return xc[i < 0 ? 0 : (i >= Tu ? Tu - 1 : i)]; };
+        auto at2 = [&](int i) { return xu[i < 0 ? 0 : (i >= Tu ? Tu - 1 : i)]; };
         for (int n = 0; n < T; n++) {
-            float s = 0.0f;
-            for (int kk = 0; kk < K; kk++) s += filter[(size_t)kk] * at(n * 2 - dl + kk);
-            yc[n] = s;
+            float sm = 0.0f;
+            for (int kk = 0; kk < K; kk++) sm += filter[(size_t)kk] * at2(n * 2 - dl + kk);
+            yc[n] = sm;
         }
-    }
+    });
 }
 
 void snake_act(const float * x, int C, int T, const std::vector<float> & alpha,
@@ -676,7 +697,11 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
         memcpy(cemb.data() + (size_t)i * d_emb, codec_emb + (size_t)(i % T0) * d_emb,
                (size_t)d_emb * sizeof(float));
     }
-    if (!g_x_in || g_x_in->ne[1] != T) { if (!build_dit_graph(T)) return false; }
+    if (!g_x_in || g_x_in->ne[1] != T) {
+        dit_masks_ready = false;
+        dit_inputs_ready = false;
+        if (!build_dit_graph(T)) return false;
+    }
     std::vector<float> spk_in((size_t)enc_emb_dim * T, 0.0f);
     std::vector<float> cond_in((size_t)enc_dim * T, 0.0f);
     for (int i = 0; i < T0; i++) {
@@ -695,37 +720,54 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
                 (int)has_nan(spk_in.data(), spk_in.size()), (int)has_nan(cond_in.data(), cond_in.size()),
                 (int)has_nan(th.data(), th.size()));
     ggml_backend_tensor_set(g_x_in, x, 0, sizeof(float) * d_mel * T);
-    ggml_backend_tensor_set(g_code_emb, cemb.data(), 0, sizeof(float) * d_emb * T);
-    ggml_backend_tensor_set(g_spk_in, spk_in.data(), 0, sizeof(float) * enc_emb_dim * T);
-    ggml_backend_tensor_set(g_cond_in, cond_in.data(), 0, sizeof(float) * enc_dim * T);
+    if (!dit_inputs_ready) {   // codec/spk/cond tracks are identical per eval
+        ggml_backend_tensor_set(g_code_emb, cemb.data(), 0, sizeof(float) * d_emb * T);
+        ggml_backend_tensor_set(g_spk_in, spk_in.data(), 0, sizeof(float) * enc_emb_dim * T);
+        ggml_backend_tensor_set(g_cond_in, cond_in.data(), 0, sizeof(float) * enc_dim * T);
+        dit_inputs_ready = true;
+    }
     ggml_backend_tensor_set(g_t_in, th.data(), 0, sizeof(float) * d_dim);
-    {
+    // block-diff masks are identical for every RK4 eval - upload them once
+    // right after the graph is (re)built, not per eval (22 x T^2 fp16 per
+    // eval used to dominate the whole vocoder)
+    // block masks are identical for every eval - build the host copies once
+    // (the T^2 loop dominated) and only re-upload per eval; uploading only
+    // once is NOT safe: the pool behind the shared gallocr can move the
+    // buffers between graphs, and a stale mask silently NaNs the RK4 mel
+    if (dit_mask_cache.empty()) {
+        const int T0b = T0;   // blocks live on the un-batched frame index
+        dit_mask_cache.resize(layers.size());
+        for (size_t il = 0; il < layers.size(); il++) {
+            const bool ahead = std::find(look_ahead_layers.begin(), look_ahead_layers.end(),
+                                         (int)il) != look_ahead_layers.end();
+            const bool behind = std::find(look_backward_layers.begin(), look_backward_layers.end(),
+                                          (int)il) != look_backward_layers.end();
+            dit_mask_cache[il].assign((size_t)T * T, ggml_fp32_to_fp16(-INFINITY));
+            for (int i = 0; i < T; i++)
+                for (int j = 0; j < T; j++) {
+                    const int bi = (i % T0b) / d_block, bj = (j % T0b) / d_block;
+                    const int diff = bj - bi;
+                    if (diff == 0 || (ahead && diff == 1) || (behind && diff == -1))
+                        dit_mask_cache[il][(size_t)i * T + j] = ggml_fp32_to_fp16(0.0f);
+                }
+        }
         std::vector<int> p((size_t)T);
         for (int i = 0; i < T; i++) p[(size_t)i] = i;
-        ggml_backend_tensor_set(g_pos, p.data(), 0, sizeof(int) * T);
+        dit_pos_cache = std::move(p);
     }
-    // block-diff masks
-    for (size_t il = 0; il < layers.size(); il++) {
-        const bool ahead = std::find(look_ahead_layers.begin(), look_ahead_layers.end(),
-                                     (int)il) != look_ahead_layers.end();
-        const bool behind = std::find(look_backward_layers.begin(), look_backward_layers.end(),
-                                      (int)il) != look_backward_layers.end();
-        const int T0b = T0;   // blocks live on the un-batched frame index
-        std::vector<ggml_fp16_t> mv((size_t)T * T, ggml_fp32_to_fp16(-INFINITY));
-        for (int i = 0; i < T; i++) {
-            for (int j = 0; j < T; j++) {
-                const int bi = (i % T0b) / d_block, bj = (j % T0b) / d_block;
-                const int diff = bj - bi;
-                if (diff == 0 || (ahead && diff == 1) || (behind && diff == -1))
-                    mv[(size_t)i * T + j] = ggml_fp32_to_fp16(0.0f);
-            }
-        }
-        ggml_backend_tensor_set(g_masks[il], mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
-    }
+    for (size_t il = 0; il < layers.size(); il++)
+        ggml_backend_tensor_set(g_masks[il], dit_mask_cache[il].data(), 0,
+                                sizeof(ggml_fp16_t) * dit_mask_cache[il].size());
+    ggml_backend_tensor_set(g_pos, dit_pos_cache.data(), 0, sizeof(int) * dit_pos_cache.size());
+    const auto tc0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(backend, ggf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "t2w: dit compute failed\n");
         return false;
     }
+    static int eval_no = 0;
+    if ((eval_no++ % 12) == 0 || getenv("T2W_DEBUG"))
+        fprintf(stderr, "t2w: dit eval %d (T=%d) compute %.2f s\n", eval_no, T,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tc0).count());
     out.resize((size_t)d_mel * T);
     for (size_t si = 0; si < g_sinks.size(); si++) {
         std::vector<float> sv((size_t)ggml_nelements(g_sinks[si]));
@@ -795,6 +837,8 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
         tgrid[(size_t)i] = t + sway * (cosf((float)M_PI / 2.0f * t) - 1.0f + t);
     }
     std::vector<float> val = x0;
+    static std::chrono::steady_clock::time_point g_rk4_t0;
+    g_rk4_t0 = std::chrono::steady_clock::now();
     std::vector<float> k1, k2, k3, k4, tmp;
     if (getenv("T2W_DEBUG")) fprintf(stderr, "t2w: rk4 T0=%d (%d evals)\n", T0, (num_steps - 1) * 4);
     auto evalf = [&](float t, const std::vector<float> & v, std::vector<float> & o) {
@@ -844,7 +888,12 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
         }
     }
     // val: [mel][T0] mel spectrogram -> BigVGAN
+    const auto tb0 = std::chrono::steady_clock::now();
+    fprintf(stderr, "t2w: rk4 loop %.2f s\n",
+            std::chrono::duration<double>(tb0 - g_rk4_t0).count());
     bigvgan_run(val, T0, pcm);
+    fprintf(stderr, "t2w: bigvgan %.2f s\n",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count());
     return !pcm.empty();
 }
 
@@ -972,7 +1021,7 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
     {
         // post_w is [1, cc, 7] torch layout
         const int kw = 7;
-        for (int n = 0; n < L; n++) {
+        par_for(L, [&](int n) {
             float s = 0.0f;
             for (int c = 0; c < cc; c++) {
                 const float * xc = sf.data() + (size_t)c * L;
@@ -983,7 +1032,7 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
                 }
             }
             pcm[(size_t)n] = std::max(-1.0f, std::min(1.0f, s));
-        }
+        });
     }
     return true;
 }

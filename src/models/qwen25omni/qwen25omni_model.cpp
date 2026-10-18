@@ -1158,6 +1158,7 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
     if (const char * e = getenv("QOMNI_TALK_TOPP")) t_topp = atof(e);
     if (const char * e = getenv("QOMNI_TALK_REP")) t_rep = atof(e);
     std::vector<int> codec;
+    const auto t_tk0 = std::chrono::steady_clock::now();
     if (!talker.synthesize(toks, pos, prompt_hidden, prompt_embed, std::vector<int>(),
                            next_pos, gen_toks, gen_hidden, gen_embed, tok_embd, id_eos,
                            151859, bos_emb, t_temp, t_topk, t_topp, t_rep, rng_state, codec)) {
@@ -1181,11 +1182,16 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
             fprintf(stderr, "t2w: loaded %d reference codec tokens\n", (int)codec.size());
         }
     }
+    const auto t_tk1 = std::chrono::steady_clock::now();
     std::vector<float> pcm;
     if (!t2w.run(codec, pcm)) {
         fprintf(stderr, "token2wav: synthesis failed\n");
         return false;
     }
+    const auto t_t2w1 = std::chrono::steady_clock::now();
+    fprintf(stderr, "timing: talker %.2f s | t2w %.2f s (%d codes)\n",
+            std::chrono::duration<double>(t_tk1 - t_tk0).count(),
+            std::chrono::duration<double>(t_t2w1 - t_tk1).count(), (int)codec.size());
     // write a 24 kHz mono s16 wav
     FILE * f = fopen(wav_path, "wb");
     if (!f) { fprintf(stderr, "cannot open %s\n", wav_path); return false; }
