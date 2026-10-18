@@ -1,8 +1,9 @@
 // qwen25omni_t2w.cpp - Token2Wav: flow-matching DiT (codec tokens -> mel)
-// running as a ggml graph, plus the ECAPA speaker encoder and the BigVGAN
-// vocoder as plain host code (their depthwise convs / grouped FIR filters have
-// no ggml equivalent, and at vocoder scale the host loops cost seconds, not
-// minutes, per reply).
+// and the BigVGAN vocoder (mel -> PCM), both as static ggml graphs on the
+// compute backend. The ECAPA speaker encoder stays host code (runs once per
+// process). The original host BigVGAN implementation is kept as an oracle /
+// fallback: T2W_HOST=1. Parity hooks: T2W_MEL_DUMP / T2W_MEL_LOAD feed a
+// reference mel to the vocoder, T2W_PCM_DUMP saves the PCM.
 //
 // Semantics follow transformers' Qwen2_5OmniToken2Wav* exactly:
 //   * one flow-matching trajectory over the WHOLE reply (no chunking): mel
@@ -51,6 +52,7 @@ static void par_for(int n, F f) {
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <random>
 #include <numeric>
 
@@ -272,6 +274,7 @@ void linear_host(const std::vector<float> & w, const std::vector<float> & b, int
 
 bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
     backend = backend_;
+    wctx_ref = wctx;
     allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     auto gt = [&](const char * n) {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -548,20 +551,33 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
 
 bool Token2Wav::build_dit_graph(int T) {
     if (gctx) { ggml_free(gctx); gctx = nullptr; }
+    g_masks.clear();   // stale pointers from the freed ctx
+    g_sinks.clear();
+    // The per-run-constant inputs (masks / pos / codec / spk / cond) live in
+    // their own context + backend buffer, OUTSIDE the gallocr pool: gallocr
+    // shares memory between tensors with non-overlapping liveness inside one
+    // graph, so a mid-graph input (a per-layer mask) gets clobbered by later
+    // intermediates before the next eval reads it. A dedicated buffer never
+    // moves and is uploaded exactly once per (re)build.
+    if (ibuf) { ggml_backend_buffer_free(ibuf); ibuf = nullptr; }
+    if (ictx) { ggml_free(ictx); ictx = nullptr; }
+    struct ggml_init_params iip = { 64ull * 1024 * 1024, NULL, true };
+    ictx = ggml_init(iip);
+    if (!ictx) return false;
     struct ggml_init_params ip = { 128ull * 1024 * 1024, NULL, true };
     gctx = ggml_init(ip);
     if (!gctx) return false;
     ggf = ggml_new_graph_custom(gctx, 16384, false);
 
-    g_x_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_mel, T);
+    g_x_in = ggml_new_tensor_2d(ictx, GGML_TYPE_F32, d_mel, T);
     ggml_set_name(g_x_in, "dit_x");
-    g_cond_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, enc_dim, T);      // ECAPA out
+    g_cond_in = ggml_new_tensor_2d(ictx, GGML_TYPE_F32, enc_dim, T);      // ECAPA out
     ggml_set_name(g_cond_in, "dit_cond");
-    g_code_emb = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_emb, T);
+    g_code_emb = ggml_new_tensor_2d(ictx, GGML_TYPE_F32, d_emb, T);
     ggml_set_name(g_code_emb, "dit_code");
-    g_spk_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, enc_emb_dim, T);   // baked cond
+    g_spk_in = ggml_new_tensor_2d(ictx, GGML_TYPE_F32, enc_emb_dim, T);   // baked cond
     ggml_set_name(g_spk_in, "dit_spk");
-    g_t_in = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, d_dim);
+    g_t_in = ggml_new_tensor_1d(ictx, GGML_TYPE_F32, d_dim);
     ggml_set_name(g_t_in, "dit_t");
 
     // input projection: [x | ecapa(cond) | code | speaker] -> d_dim
@@ -581,7 +597,7 @@ bool Token2Wav::build_dit_graph(int T) {
         g_sinks.push_back(snk2);  // sink 1: input projection
     }
 
-    g_pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
+    g_pos = ggml_new_tensor_1d(ictx, GGML_TYPE_I32, T);
     ggml_set_name(g_pos, "dit_pos");
     const int HD = d_hd, NH = d_head;
     for (int il = 0; il < d_depth; il++) {
@@ -590,9 +606,9 @@ bool Token2Wav::build_dit_graph(int T) {
                                != look_ahead_layers.end();
         const bool behind = std::find(look_backward_layers.begin(), look_backward_layers.end(), il)
                                 != look_backward_layers.end();
-        ggml_tensor * amask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, T, T);
+        ggml_tensor * amask = ggml_new_tensor_2d(ictx, GGML_TYPE_F16, T, T);
         ggml_set_name(amask, "dit_mask");
-g_masks.push_back(amask);
+        g_masks.push_back(amask);
 
         // AdaLN-zero modulation vectors from the (host-computed) time embedding
         if (il == 0) fprintf(stderr, "dit: mm mod w=[%lld,%lld]\n", (long long)L.attn_norm_w->ne[0], (long long)L.attn_norm_w->ne[1]);
@@ -663,6 +679,11 @@ g_masks.push_back(amask);
     ggml_set_name(out, "dit_out");
     g_out = out;
     ggml_build_forward_expand(ggf, out);
+    ibuf = ggml_backend_alloc_ctx_tensors(ictx, backend);
+    if (!ibuf) {
+        fprintf(stderr, "t2w: input tensor alloc failed\n");
+        return false;
+    }
     if (!ggml_gallocr_alloc_graph(allocr, ggf)) {
         fprintf(stderr, "t2w: dit graph alloc failed\n");
         return false;
@@ -732,13 +753,15 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
     // block-diff masks are identical for every RK4 eval - upload them once
     // right after the graph is (re)built, not per eval (22 x T^2 fp16 per
     // eval used to dominate the whole vocoder)
-    // block masks are identical for every eval - build the host copies once
-    // (the T^2 loop dominated) and only re-upload per eval; uploading only
-    // once is NOT safe: the pool behind the shared gallocr can move the
-    // buffers between graphs, and a stale mask silently NaNs the RK4 mel
-    if (dit_mask_cache.empty()) {
+    // block-diff masks are identical for every RK4 eval - build and upload
+    // them exactly once per (re)built graph. This is safe now that the t2w
+    // graph has its own dedicated gallocr: nothing else allocates on that
+    // pool, so the mask buffers cannot move between computations. (When the
+    // pool was shared with the talker, buffers moved and we had to re-upload
+    // 22 x T^2 fp16 per eval, which dominated the whole vocoder.)
+    if (!dit_masks_ready) {
         const int T0b = T0;   // blocks live on the un-batched frame index
-        dit_mask_cache.resize(layers.size());
+        dit_mask_cache.assign(layers.size(), {});
         for (size_t il = 0; il < layers.size(); il++) {
             const bool ahead = std::find(look_ahead_layers.begin(), look_ahead_layers.end(),
                                          (int)il) != look_ahead_layers.end();
@@ -756,11 +779,12 @@ bool Token2Wav::dit_eval(const float * x, int T, float t, const float * codec_em
         std::vector<int> p((size_t)T);
         for (int i = 0; i < T; i++) p[(size_t)i] = i;
         dit_pos_cache = std::move(p);
+        for (size_t il = 0; il < layers.size(); il++)
+            ggml_backend_tensor_set(g_masks[il], dit_mask_cache[il].data(), 0,
+                                    sizeof(ggml_fp16_t) * dit_mask_cache[il].size());
+        ggml_backend_tensor_set(g_pos, dit_pos_cache.data(), 0, sizeof(int) * dit_pos_cache.size());
+        dit_masks_ready = true;
     }
-    for (size_t il = 0; il < layers.size(); il++)
-        ggml_backend_tensor_set(g_masks[il], dit_mask_cache[il].data(), 0,
-                                sizeof(ggml_fp16_t) * dit_mask_cache[il].size());
-    ggml_backend_tensor_set(g_pos, dit_pos_cache.data(), 0, sizeof(int) * dit_pos_cache.size());
     const auto tc0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(backend, ggf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "t2w: dit compute failed\n");
@@ -832,6 +856,8 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
                        (size_t)d_emb * sizeof(float));
         }
     }
+    // new turn: the codec embedding track changes even when T is unchanged
+    dit_inputs_ready = false;
     // RK4 over t in [0, 1] with the sway-corrected grid
     std::vector<float> tgrid((size_t)num_steps);
     for (int i = 0; i < num_steps; i++) {
@@ -843,6 +869,25 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
     g_rk4_t0 = std::chrono::steady_clock::now();
     std::vector<float> k1, k2, k3, k4, tmp;
     if (getenv("T2W_DEBUG")) fprintf(stderr, "t2w: rk4 T0=%d (%d evals)\n", T0, (num_steps - 1) * 4);
+    bool mel_loaded = false;
+    if (const char * mp = getenv("T2W_MEL_LOAD")) {   // parity: feed the vocoder
+        FILE * f = fopen(mp, "rb");                     // a reference mel
+        if (f) {                                        // [t][bin] row-major
+            std::vector<float> ref((size_t)d_mel * T0);
+            if (fread(ref.data(), 4, ref.size(), f) == ref.size()) {
+                std::vector<float> tr((size_t)d_mel * T0);
+                for (int t = 0; t < T0; t++)
+                    for (int b = 0; b < d_mel; b++)
+                        tr[(size_t)b * T0 + t] = ref[(size_t)t * d_mel + b];
+                val = tr;
+                mel_loaded = true;
+            } else fprintf(stderr, "t2w: mel load size mismatch\n");
+            fclose(f);
+        }
+    }
+    if (mel_loaded) {
+        fprintf(stderr, "t2w: rk4 SKIPPED (T2W_MEL_LOAD)\n");
+    } else {
     auto evalf = [&](float t, const std::vector<float> & v, std::vector<float> & o) {
         // v is [mel][T0] per batch half; build the [mel][2*T0] batch
         std::vector<float> batch((size_t)d_mel * T);
@@ -875,17 +920,15 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
     fprintf(stderr, "t2w: rk4 done mel [%.3f..%.3f] mean %.3f\n",
             *std::min_element(val.begin(), val.end()), *std::max_element(val.begin(), val.end()),
             std::accumulate(val.begin(), val.end(), 0.0) / val.size());
-    if (const char * mp = getenv("T2W_MEL_LOAD")) {   // parity: feed the vocoder
-        FILE * f = fopen(mp, "rb");                     // a reference mel [t][bin]
-        if (f) {                                        // row-major, stored as [bin][t]
-            std::vector<float> ref((size_t)d_mel * T0);
-            if (fread(ref.data(), 4, ref.size(), f) == ref.size()) {
-                std::vector<float> tr((size_t)d_mel * T0);
-                for (int t = 0; t < T0; t++)
-                    for (int b = 0; b < d_mel; b++)
-                        tr[(size_t)b * T0 + t] = ref[(size_t)t * d_mel + b];
-                val = tr;
-            } else fprintf(stderr, "t2w: mel load size mismatch\n");
+    }
+    if (const char * dp = getenv("T2W_MEL_DUMP")) {   // parity hook: the mel
+        FILE * f = fopen(dp, "wb");                   // actually fed to the vocoder
+        if (f) {                                      // as [t][bin] row-major
+            std::vector<float> tr((size_t)d_mel * T0);
+            for (int t = 0; t < T0; t++)
+                for (int b = 0; b < d_mel; b++)
+                    tr[(size_t)t * d_mel + b] = val[(size_t)b * T0 + t];
+            fwrite(tr.data(), 4, tr.size(), f);
             fclose(f);
         }
     }
@@ -893,9 +936,20 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
     const auto tb0 = std::chrono::steady_clock::now();
     fprintf(stderr, "t2w: rk4 loop %.2f s\n",
             std::chrono::duration<double>(tb0 - g_rk4_t0).count());
-    bigvgan_run(val, T0, pcm);
-    fprintf(stderr, "t2w: bigvgan %.2f s\n",
+    const bool host_oracle = getenv("T2W_HOST") && atoi(getenv("T2W_HOST"));
+    if (host_oracle)
+        bigvgan_run(val, T0, pcm);
+    else if (!bigvgan_run_ggml(val, T0, pcm)) {
+        fprintf(stderr, "t2w: bigvgan graph failed, falling back to host\n");
+        bigvgan_run(val, T0, pcm);
+    }
+    fprintf(stderr, "t2w: bigvgan(%s) %.2f s\n", host_oracle ? "host" : "gpu",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count());
+    if (const char * dp = getenv("T2W_PCM_DUMP")) {
+        FILE * f = fopen(dp, "wb");
+        if (f) { int n = (int)pcm.size(); fwrite(&n, 4, 1, f);
+                 fwrite(pcm.data(), 4, pcm.size(), f); fclose(f); }
+    }
     return !pcm.empty();
 }
 
@@ -1035,6 +1089,338 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
             }
             pcm[(size_t)n] = std::max(-1.0f, std::min(1.0f, s));
         });
+    }
+    return true;
+}
+
+// ------------------------------------------------------------- BigVGAN graph
+//
+// Same pipeline as bigvgan_run, expressed as one ggml graph on `backend`.
+// Layout conventions (matching ggml's conv ops):
+//   * activations [T, C] planar (ne0 = time, contiguous per channel) for the
+//     conv inputs/outputs; transposed to [C, T] (ne0 = channel) for bias /
+//     snake / padding, where per-channel vectors broadcast along ne[1];
+//   * dense conv kernels are referenced straight from wctx: the gguf stores
+//     them [K, IC, OC] (torch bytes of [OC][IC][K]) which is exactly what
+//     ggml_conv_1d wants; the ConvTranspose upsampler kernels are stored
+//     [K, OC, IC] which is what ggml_conv_transpose_1d wants, but that op is
+//     F32-only on CUDA, so they are dequantized once per (re)build into F32
+//     graph inputs;
+//   * the anti-aliased snake (aa_snake_act above) is reproduced as:
+//       replicate-pad 5/5 -> zero-stuff x2 -> depthwise kaiser conv (the
+//       transposed up-filter, taps flipped because ggml convs are
+//       correlations) -> crop to 2T-1 -> snake -> replicate-pad 5/6 ->
+//       strided depthwise kaiser conv (the down-filter, taps as-is).
+//     The zero-stuffing is exact: the host transposed conv only scatters
+//     into even w-lags, so the odd (zero) samples never contribute.
+//   * ggml's im2col buffers activations in F16 on the conv path, so the GPU
+//     result is not bit-identical to the host f32 oracle (see T2W parity).
+bool Token2Wav::build_bg_graph(int L0) {
+    if (bctx && bg_L_cached == L0) return true;
+    if (bctx) { ggml_free(bctx); bctx = nullptr; }
+    if (bg_ibuf) { ggml_backend_buffer_free(bg_ibuf); bg_ibuf = nullptr; }
+    if (bg_ictx) { ggml_free(bg_ictx); bg_ictx = nullptr; }
+    if (!bg_allocr) bg_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bg_in_uploads.clear();
+    bg_L_cached = L0;
+    // graph-input constants (filters / gathers / dequantized up-kernels) get
+    // their own ctx + buffer, same reasoning as the DiT inputs: gallocr pool
+    // memory is reused across non-overlapping lifetimes, which would clobber
+    // them between vocoder runs (or even mid-graph for the gather indices)
+    struct ggml_init_params bip = { 64ull * 1024 * 1024, NULL, true };
+    bg_ictx = ggml_init(bip);
+    struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, true };
+    bctx = ggml_init(ip);
+    if (!bctx || !bg_ictx) return false;
+    bgf = ggml_new_graph_custom(bctx, 65536, false);
+    const bool dbg_on = getenv("T2W_BG_DBG") != nullptr;
+    bg_dbg.clear();
+
+    auto new_in = [&](const int64_t * ne, int nd, ggml_type ty, const void * data, size_t nbytes) {
+        ggml_tensor * t = nd == 1 ? ggml_new_tensor_1d(bg_ictx, ty, ne[0])
+                                  : ggml_new_tensor(bg_ictx, ty, nd, ne);
+        bg_in_uploads.emplace_back(t, std::vector<char>((const char *)data, (const char *)data + nbytes));
+        return t;
+    };
+    auto gt = [&](const char * n) {
+        ggml_tensor * t = ggml_get_tensor(wctx_ref, n);
+        if (!t) fprintf(stderr, "t2w/bg: missing tensor %s\n", n);
+        return t;
+    };
+    auto toCT = [&](ggml_tensor * t) {   // [T, C] -> [C, T]
+        return ggml_cont(bctx, ggml_transpose(bctx, t));
+    };
+    // replicate-pad along time in [C, T] layout via a clamp()ed row gather
+    auto reppad = [&](ggml_tensor * x, int lp, int rp) {
+        const int64_t C = x->ne[0], T = x->ne[1];
+        const int64_t Tp = T + lp + rp;
+        std::vector<int> h((size_t)Tp);
+        for (int t = 0; t < Tp; t++) {
+            int v = t - lp;
+            h[(size_t)t] = v < 0 ? 0 : (v >= (int)T ? (int)T - 1 : v);
+        }
+        const int64_t ne[1] = { Tp };
+        ggml_tensor * idx = new_in(ne, 1, GGML_TYPE_I32, h.data(), sizeof(int) * (size_t)Tp);
+        return ggml_get_rows(bctx, x, idx);   // [C, Tp]
+    };
+    // depthwise kaiser kernels, one pair per channel count (12 taps)
+    std::map<int, ggml_tensor *> k_up, k_dn;
+    auto dw_up = [&](int64_t C) {
+        auto it = k_up.find((int)C);
+        if (it != k_up.end()) return it->second;
+        std::vector<float> h((size_t)12 * C);
+        for (int64_t c = 0; c < C; c++)
+            for (int k = 0; k < 12; k++)
+                h[(size_t)c * 12 + (size_t)k] = 2.0f * aa_filter[11 - k];
+        const int64_t ne[3] = { 12, 1, C };
+        ggml_tensor * t = new_in(ne, 3, GGML_TYPE_F32, h.data(), h.size() * 4);
+        k_up[(int)C] = t;
+        return t;
+    };
+    auto dw_dn = [&](int64_t C) {
+        auto it = k_dn.find((int)C);
+        if (it != k_dn.end()) return it->second;
+        std::vector<float> h((size_t)12 * C);
+        for (int64_t c = 0; c < C; c++)
+            for (int k = 0; k < 12; k++)
+                h[(size_t)c * 12 + (size_t)k] = aa_filter[k];
+        const int64_t ne[3] = { 12, 1, C };
+        ggml_tensor * t = new_in(ne, 3, GGML_TYPE_F32, h.data(), h.size() * 4);
+        k_dn[(int)C] = t;
+        return t;
+    };
+    // dense conv: in [T, IC] cont, kernel F32 [K, IC, OC] -> out [OC, T'].
+    // Built as im2col(F32) + mul_mat instead of ggml_conv_1d: the latter
+    // hardcodes an F16 im2col buffer, which quantizes every activation and
+    // caps the host-parity corr at ~0.995
+    auto conv1 = [&](ggml_tensor * w, ggml_tensor * b, ggml_tensor * in, int dil) {
+        const int K = (int)w->ne[0];
+        const int pad = (K * dil - dil) / 2;
+        ggml_tensor * im = ggml_im2col(bctx, w, in, 1, 0, pad, 0, dil, 0, false,
+                                       GGML_TYPE_F32);              // [IC*K, OW]
+        ggml_tensor * y = ggml_mul_mat(
+            bctx, ggml_reshape_2d(bctx, im, im->ne[0], im->ne[2] * im->ne[1]),
+            ggml_reshape_2d(bctx, w, w->ne[0] * w->ne[1], w->ne[2]));   // [OW, OC]
+        ggml_tensor * yc = toCT(y);
+        if (b) yc = ggml_add(bctx, yc, b);                          // [OC] broadcasts
+        return yc;
+    };
+    // depthwise conv with an F32 im2col, same reasoning
+    auto conv_dw_f32 = [&](ggml_tensor * k /*[K,1,C] F32*/, ggml_tensor * in /*[T,C]*/,
+                           int st, int pad) {
+        ggml_tensor * nb4 = ggml_reshape_4d(bctx, in, in->ne[0], 1, in->ne[1], 1);
+        ggml_tensor * im = ggml_im2col(bctx, k, nb4, st, 0, pad, 0, 1, 0, false,
+                                       GGML_TYPE_F32);              // [K, OW, C]
+        ggml_tensor * r = ggml_mul_mat(bctx, im, k);                // [OW, 1, C]
+        return ggml_reshape_3d(bctx, r, r->ne[0], r->ne[2], 1);     // [OW, C]
+    };
+    // scalar constant broadcastable anywhere
+    auto fconst = [&](float v) {
+        const int64_t ne[1] = { 1 };
+        return new_in(ne, 1, GGML_TYPE_F32, &v, sizeof(float));
+    };
+    ggml_tensor * c_beta = fconst(1e-9f);
+
+    // ---- anti-aliased snake: x [C,T] (cont) -> y [C,T] -------------------
+    auto aa_snake_g = [&](ggml_tensor * h, ggml_tensor * a_t, ggml_tensor * b_t) {
+        const int64_t C = h->ne[0], T = h->ne[1];
+        ggml_tensor * xp = reppad(h, 5, 5);                        // [C, T+10]
+        // zero-stuff: [C,Tp] -> [C,2Tp] with z[2t]=x[t], z[2t+1]=0.
+        // concat along channels makes each time row [xp[:,t]; 0]; the flat
+        // [C,2,Tp] order (c + C*j + 2C*t) reinterpreted as [C,2Tp] is exactly
+        // (c, 2t + j) - no permute needed
+        ggml_tensor * zs = ggml_scale(bctx, xp, 0.0f);
+        ggml_tensor * cat = ggml_concat(bctx, xp, zs, 0);          // [2C, Tp]
+        ggml_tensor * r3 = ggml_reshape_3d(bctx, cat, C, 2, T + 10);
+        ggml_tensor * z = ggml_reshape_2d(bctx, r3, C, 2 * (T + 10));
+        // up: y[o] = sum_k h'[k] z[o + 4 + k] - correlation with no padding,
+        // read off from output row 4 (host: y[o] = sum_kk 2f[kk] xrep[(o+5-kk)/2])
+        ggml_tensor * cu = conv_dw_f32(dw_up(C), toCT(z), 1, 0);
+        ggml_tensor * cut = toCT(cu);                              // [C, 2Tp-11]
+        ggml_tensor * yu = ggml_cont(bctx, ggml_view_2d(bctx, cut, C, 2 * T - 1,
+                                                        cut->nb[1], 4 * cut->nb[1]));
+        if (dbg_on && getenv("AA_TRACE")) {
+            ggml_tensor * sk = ggml_dup(bctx, yu);
+            ggml_build_forward_expand(bgf, sk);
+            bg_dbg.push_back(sk);   // up-conv result yu
+        }
+        // snake: y + sin(a y)^2 / (exp(b) + eps)
+        ggml_tensor * ar = ggml_reshape_2d(bctx, a_t, C, 1);
+        ggml_tensor * br = ggml_reshape_2d(bctx, b_t, C, 1);
+        ggml_tensor * sa = ggml_sin(bctx, ggml_mul(bctx, yu, ggml_exp(bctx, ar)));
+        ggml_tensor * s2 = ggml_add(bctx, yu,
+                                    ggml_div(bctx, ggml_mul(bctx, sa, sa),
+                                             ggml_add(bctx, ggml_exp(bctx, br), c_beta)));
+        // down: replicate pad 5/6, strided depthwise conv with the filter
+        if (dbg_on && getenv("AA_TRACE")) {
+            ggml_tensor * sk = ggml_dup(bctx, s2);
+            ggml_build_forward_expand(bgf, sk);
+            bg_dbg.push_back(sk);   // snaked yu
+        }
+        ggml_tensor * xd = reppad(s2, 5, 6);                       // [C, 2T+10]
+        ggml_tensor * cd = conv_dw_f32(dw_dn(C), toCT(xd), 2, 0);  // [T, C]
+        return toCT(cd);
+    };
+
+    // ---- mel preprocess: exp -> dB(-115) - 20 -> [-1, 1] -----------------
+    const int64_t mel_ne[2] = { L0, b_mel };
+    bg_mel_in = ggml_new_tensor_2d(bctx, GGML_TYPE_F32, L0, b_mel);
+    ggml_set_name(bg_mel_in, "bg_mel");
+    ggml_tensor * x = bg_mel_in;
+    x = ggml_clamp(bctx, ggml_exp(bctx, x), powf(10.0f, -115.0f / 20.0f), 1e30f);
+    x = ggml_log(bctx, x);
+    // (20*log10(v) - 20 + 115)/57.5 - 1 == (20/ln10 * ln(v) + 57.5)/57.5 - 1
+    //                           ==  (20/ln10 * ln(v) + 37.5)/57.5... keep steps:
+    x = ggml_scale(bctx, x, 20.0f / logf(10.0f));   // dB re min amplitude
+    x = ggml_add(bctx, x, fconst(-20.0f));
+    x = ggml_scale(bctx, x, 1.0f / 57.5f);
+    x = ggml_add(bctx, x, fconst(115.0f / 57.5f - 1.0f));
+    x = ggml_clamp(bctx, x, -1.0f, 1.0f);
+    if (dbg_on) {
+        ggml_tensor * snk = ggml_dup(bctx, x);
+        ggml_build_forward_expand(bgf, snk);
+        bg_dbg.push_back(snk);   // dbg 0: preprocessed mel [L0, 80] planar
+    }
+
+    // ---- conv_pre ---------------------------------------------------------
+    ggml_tensor * cur = conv1(gt("bg.conv_pre.weight"), gt("bg.conv_pre.bias"), x, 1);
+    if (dbg_on) {
+        ggml_tensor * snk = ggml_dup(bctx, cur);
+        ggml_build_forward_expand(bgf, snk);
+        bg_dbg.push_back(snk);   // dbg 1: conv_pre out [C, L] planar
+    }
+    int64_t Cc = b_ch;
+    int L = L0;
+
+    // ---- 6x [conv_transpose + mean of 3 AMP res-blocks] -------------------
+    const int n_up = 6, n_rb = 18;
+    const int up_k[6] = {11, 7, 4, 4, 4, 4}, up_s[6] = {5, 3, 2, 2, 2, 2};
+    for (int u = 0; u < n_up; u++) {
+        const int OC = b_ch >> (u + 1);
+        const int kin = L, p = (up_k[u] - up_s[u]) / 2;
+        const int Lout = (kin - 1) * up_s[u] + up_k[u] - 2 * p;
+        // F32 dequantized [K, OC, IC] transposed-conv kernel (CUDA op is F32)
+        char wn[64];
+        snprintf(wn, sizeof(wn), "bg.up.%d.weight", u);
+        std::vector<float> uw;
+        host_vec(gt(wn), uw);
+        snprintf(wn, sizeof(wn), "bg.up.%d.bias", u);
+        ggml_tensor * ub = gt(wn);
+        const int64_t uw_ne[3] = { up_k[u], OC, (int64_t)Cc };
+        ggml_tensor * uwt = new_in(uw_ne, 3, GGML_TYPE_F32, uw.data(), uw.size() * sizeof(float));
+        ggml_tensor * in = ggml_cont(bctx, ggml_transpose(bctx, cur));       // [T, IC]
+        ggml_tensor * yt = ggml_conv_transpose_1d(bctx, uwt, in, up_s[u], 0, 1);  // [Tfull, OC]
+        ggml_tensor * yc = ggml_cont(bctx, ggml_view_2d(bctx, yt, Lout, OC,
+                                                        yt->nb[1], (size_t)p * yt->nb[0]));
+        yc = ggml_add(bctx, toCT(yc), ub);                                   // [OC, Lout]
+        if (dbg_on && u == 0) {
+            ggml_tensor * snk = ggml_dup(bctx, yc);
+            ggml_build_forward_expand(bgf, snk);
+            bg_dbg.push_back(snk);   // after conv_transpose + bias
+        }
+        // 3 res-blocks, summed and averaged
+        ggml_tensor * acc = nullptr;
+        for (int r = 0; r < 3; r++) {
+            const int rbi = u * 3 + r;
+            ggml_tensor * h = yc;
+            for (int kk = 0; kk < 3; kk++) {
+                const int dil[3] = {1, 3, 5};
+                char b1[64], b2[64], b3[64], b4[64];
+                snprintf(b1, sizeof(b1), "bg.rb.%d.c1.%d.weight", rbi, kk);
+                snprintf(b2, sizeof(b2), "bg.rb.%d.c1.%d.bias", rbi, kk);
+                snprintf(b3, sizeof(b3), "bg.rb.%d.c2.%d.weight", rbi, kk);
+                snprintf(b4, sizeof(b4), "bg.rb.%d.c2.%d.bias", rbi, kk);
+                snprintf(wn, sizeof(wn), "bg.rb.%d.s1.%d.alpha", rbi, kk);
+                ggml_tensor * s1a = gt(wn);
+                snprintf(wn, sizeof(wn), "bg.rb.%d.s1.%d.beta", rbi, kk);
+                ggml_tensor * s1b = gt(wn);
+                snprintf(wn, sizeof(wn), "bg.rb.%d.s2.%d.alpha", rbi, kk);
+                ggml_tensor * s2a = gt(wn);
+                snprintf(wn, sizeof(wn), "bg.rb.%d.s2.%d.beta", rbi, kk);
+                ggml_tensor * s2b = gt(wn);
+                ggml_tensor * t1 = aa_snake_g(h, s1a, s1b);
+                if (dbg_on && u == 0 && r == 0 && kk == 0) {
+                    ggml_tensor * snk = ggml_dup(bctx, t1);
+                    ggml_build_forward_expand(bgf, snk);
+                    bg_dbg.push_back(snk);   // first aa_snake out
+                }
+                ggml_tensor * y1 = conv1(gt(b1), gt(b2),
+                                         ggml_cont(bctx, ggml_transpose(bctx, t1)), dil[kk]);
+                ggml_tensor * t2 = aa_snake_g(y1, s2a, s2b);
+                ggml_tensor * y2 = conv1(gt(b3), gt(b4),
+                                         ggml_cont(bctx, ggml_transpose(bctx, t2)), 1);
+                h = ggml_add(bctx, h, y2);
+            }
+            acc = acc ? ggml_add(bctx, acc, h) : h;
+        }
+        cur = ggml_scale(bctx, acc, 1.0f / 3.0f);
+        if (dbg_on) {
+            ggml_tensor * snk = ggml_dup(bctx, cur);
+            ggml_build_forward_expand(bgf, snk);
+            bg_dbg.push_back(snk);   // dbg 1..6: per up-layer out [C, L]
+        }
+        (void)n_rb;
+        Cc = OC;
+        L = Lout;
+    }
+
+    // ---- final aa-snake + conv_post (no bias) + clamp ---------------------
+    ggml_tensor * sf = aa_snake_g(cur, gt("bg.snake_pre.alpha"), gt("bg.snake_pre.beta"));
+    ggml_tensor * out = ggml_conv_1d(bctx, gt("bg.conv_post.weight"),
+                                     ggml_cont(bctx, ggml_transpose(bctx, sf)), 1, 3, 1);
+    out = ggml_clamp(bctx, out, -1.0f, 1.0f);   // [L, 1]
+    // keep the debug sinks alive to the very end: gallocr reuses pool memory
+    // across non-overlapping lifetimes, so a mid-graph sink would be clobbered
+    // by later stages before it can be read back
+    for (size_t i = 0; i < bg_dbg.size(); i++)
+        out = ggml_add(bctx, out, ggml_scale(bctx, bg_dbg[i], 0.0f));
+    ggml_set_name(out, "bg_pcm");
+    bg_out = out;
+    ggml_build_forward_expand(bgf, out);
+    bg_ibuf = ggml_backend_alloc_ctx_tensors(bg_ictx, backend);
+    if (!bg_ibuf) {
+        fprintf(stderr, "t2w/bg: input tensor alloc failed\n");
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(bg_allocr, bgf)) {
+        fprintf(stderr, "t2w/bg: graph alloc failed\n");
+        return false;
+    }
+    for (auto & up : bg_in_uploads) {
+        ggml_backend_tensor_set(up.first, up.second.data(), 0, up.second.size());
+    }
+    fprintf(stderr, "t2w/bg: graph built L0=%d nodes=%d\n", L0, (int)ggml_graph_n_nodes(bgf));
+    return true;
+}
+
+bool Token2Wav::bigvgan_run_ggml(const std::vector<float> & mel, int L0, std::vector<float> & pcm) {
+    if (!bg_mel_in || bg_L_cached != L0)
+        if (!build_bg_graph(L0)) return false;
+    // mel may be longer than the graph input (the RK4 state keeps the CFG
+    // batch halves); the vocoder only consumes the first [b_mel, L0] block
+    ggml_backend_tensor_set(bg_mel_in, mel.data(), 0,
+                            sizeof(float) * (size_t)b_mel * L0);
+    if (ggml_backend_graph_compute(backend, bgf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "t2w/bg: compute failed\n");
+        return false;
+    }
+    pcm.assign((size_t)ggml_nelements(bg_out), 0.0f);
+    ggml_backend_tensor_get(bg_out, pcm.data(), 0, sizeof(float) * pcm.size());
+    if (getenv("T2W_BG_DBG")) {
+        for (size_t i = 0; i < bg_dbg.size(); i++) {
+            char fn[256];
+            snprintf(fn, sizeof(fn), "%s%zu.bin", getenv("T2W_BG_DBG"), i);
+            FILE * f = fopen(fn, "wb");
+            if (f) {
+                const size_t n = (size_t)ggml_nelements(bg_dbg[i]);
+                std::vector<float> v(n);
+                ggml_backend_tensor_get(bg_dbg[i], v.data(), 0, sizeof(float) * n);
+                int c = (int)bg_dbg[i]->ne[0], t = (int)bg_dbg[i]->ne[1];
+                fwrite(&c, 4, 1, f); fwrite(&t, 4, 1, f);
+                fwrite(v.data(), 4, n, f);
+                fclose(f);
+            }
+        }
     }
     return true;
 }

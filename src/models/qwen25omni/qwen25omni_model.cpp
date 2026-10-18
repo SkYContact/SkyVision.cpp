@@ -1121,7 +1121,10 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
     read_emb_row(tok_embd, spk_bos_token, bos_emb.data());
     if (!tallocr) tallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     talker.allocr = tallocr;
-    t2w.allocr = tallocr;
+    // t2w keeps its own gallocr (made in Token2Wav::load): sharing the pool
+    // with the talker graphs made the allocator move t2w buffers between
+    // graph computations, which forced the per-eval mask re-uploads and is
+    // incompatible with the static DiT / BigVGAN graphs.
     float t_temp = 0.9f; int t_topk = 40; float t_topp = 0.8f, t_rep = 1.05f;
     if (const char * e = getenv("QOMNI_TALK_TEMP")) t_temp = atof(e);
     if (const char * e = getenv("QOMNI_TALK_TOPK")) t_topk = atoi(e);

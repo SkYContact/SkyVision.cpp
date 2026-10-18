@@ -11,6 +11,7 @@
 
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qwen25omni {
@@ -183,13 +184,21 @@ private:
     bool build_dit_graph(int T);
     bool ecapa_embed(const float * mel, int T, std::vector<float> & out);
     bool bigvgan_run(const std::vector<float> & mel, int L, std::vector<float> & pcm);
+    // BigVGAN as a ggml graph on the same backend (T2W_HOST=1 keeps the host
+    // path above as an oracle / fallback)
+    bool build_bg_graph(int L0);
+    bool bigvgan_run_ggml(const std::vector<float> & mel, int L0, std::vector<float> & pcm);
     bool dit_eval(const float * x, int T, float t, const float * codec_emb, bool drop_code,
                   const float * spk, const float * cond_vec, std::vector<float> & out);
-    // BigVGAN host pipeline
-    void bigvgan(const std::vector<float> & mel, int L, std::vector<float> & pcm);
 
     ggml_context * gctx = nullptr;
     ggml_cgraph * ggf = nullptr;
+    // dedicated ctx + buffer for the per-run-constant graph inputs (masks,
+    // pos, codec/spk/cond tracks): gallocr shares pool memory between
+    // non-overlapping-liveness tensors, so mid-graph inputs must NOT live in
+    // the pool (they'd be clobbered between evals)
+    ggml_context * ictx = nullptr;
+    ggml_backend_buffer_t ibuf = nullptr;
     ggml_tensor *g_x_in = nullptr, *g_t_in = nullptr, *g_code_emb = nullptr;
     ggml_tensor *g_spk_in = nullptr, *g_cond_in = nullptr, *g_out = nullptr;
     std::vector<ggml_tensor *> g_masks;   // per-layer block-diff masks
@@ -203,6 +212,22 @@ private:
     bool dit_inputs_ready = false;  // constant codec/spk/cond tracks uploaded
     std::vector<std::vector<ggml_fp16_t>> dit_mask_cache;   // built once per graph
     std::vector<int> dit_pos_cache;
+
+    // BigVGAN ggml graph state (own ctx + own gallocr so the pool never moves
+    // between graphs; CUDA graph cache keys on cgraph->nodes[0], so bctx /
+    // bg_allocr must outlive every compute of bgf)
+    struct ggml_context * wctx_ref = nullptr;   // weight ctx (model lifetime)
+    ggml_context * bctx = nullptr;
+    ggml_cgraph * bgf = nullptr;
+    ggml_gallocr_t bg_allocr = nullptr;
+    ggml_context * bg_ictx = nullptr;           // graph-input constants
+    ggml_backend_buffer_t bg_ibuf = nullptr;
+
+    ggml_tensor * bg_mel_in = nullptr;   // [L0, 80] planar (ne0 = time)
+    ggml_tensor * bg_out = nullptr;      // [L] clamped pcm
+    int bg_L_cached = -1;
+    std::vector<std::pair<ggml_tensor *, std::vector<char>>> bg_in_uploads;
+    std::vector<ggml_tensor *> bg_dbg;   // T2W_BG_DBG: per-stage dup sinks
 };
 
 }  // namespace qwen25omni
