@@ -21,15 +21,12 @@
 //
 // ---------------------------------------------------------------- migration
 // roadmap - hooks each remaining backend needs before it can move in:
-//   * moss_vl (cross-attention layers interleaved with self-attn layers):
-//       - LayerWeights needs cross_attn_* fields (or a second LayerWeights
-//         plus a LayerHooks::attention hook that overrides the FA call, since
-//         cross-attn reads a DIFFERENT cache keyed by the encoder, not pos);
-//       - a BlockHooks::skip_attn-like gate is NOT enough: cross layers also
-//         omit rope and use encoder positions, so the rope/FA segment should
-//         become overridable via hooks.attention (like vit_block) before
-//         moss_vl migrates; kv write-back must be suppressible (no set_rows
-//         into a self-attn cache).
+//   * moss_vl: DONE - cross-attention layers (and its self layers, whose IMROPE
+//         rope/KV-slot split the single LayerCtx::pos cannot express) go through
+//         hooks.attention + hooks.ffn_out; LayerWeights grew the cross fields
+//         (cq/cqn/co + tanh gates ga/gm + the xattn flag). ck/cv/ckn stay
+//         backend-side: the cross KV is projected once at load/media time into
+//         the caller's own caches, never written from the text graph.
 //   * qwen3_5 (delta-net linear-attention hybrid layers): its recurrent layers
 //         share norm/wo/SwiGLU but replace rope+FA+cache entirely with a
 //         chunked delta-rule scan; needs the same hooks.attention override
@@ -59,6 +56,12 @@ struct LayerWeights {
     ggml_tensor *norm = nullptr;                       // attn_norm
     ggml_tensor *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
     ggml_tensor *qn = nullptr, *kn = nullptr;          // per-head q/k norm (Qwen3); null = skip
+    // cross-attention layer (moss_vl): the hook path projects cq itself and
+    // adds tanh(ga) * co(...); cqn is the cross query per-head norm. null on
+    // self-attention layers (flagged by xattn so the caller can route caches).
+    ggml_tensor *cq = nullptr, *cqn = nullptr, *co = nullptr;
+    ggml_tensor *ga = nullptr, *gm = nullptr;          // cross tanh gates [1]
+    bool xattn = false;                                // true = cross-attention layer
     ggml_tensor *ffn_norm = nullptr;
     ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;
 };
@@ -84,15 +87,36 @@ struct LayerCtx {
 };
 
 struct BlockHooks {
-    // dump/probe anchors; all optional, all may inspect and name tensors but
-    // must not replace them (return values keep the stream intact)
+    // ---- observe hooks (existing tenants): may inspect and name tensors but
+    // must NOT replace them - return values are ignored, the stream is intact.
     void (*after_rope)(void *ud, int il, ggml_tensor *q, ggml_tensor *k) = nullptr;
     void (*after_attn)(void *ud, int il, ggml_tensor *attn) = nullptr;   // pre-wo
     void (*after_attn_proj)(void *ud, int il, ggml_tensor *x) = nullptr; // post-residual
     void (*after_layer)(void *ud, int il, ggml_tensor *x) = nullptr;     // block output
+    // ---- override hooks (moss_vl): take over a whole segment of the block.
+    // attention: given the post attention-norm stream l = rms_norm(x)*L.norm
+    // [D, T], build the ENTIRE attention branch - projections, rope (any kind),
+    // KV write-back (into whatever caches the backend owns; use c.gf for
+    // ggml_build_forward_expand), flash attention and the output projection
+    // incl. gates - and return its [D, T] output; the block only does
+    // x = x + return_value. Return nullptr to skip the attention residual
+    // entirely (moss cross layer with no vision: the reference zeroes the
+    // branch, which is equivalent to not adding it).
+    ggml_tensor *(*attention)(void *ud, int il, ggml_tensor *l, const LayerCtx &c) = nullptr;
+    // ffn_out: wrap the MLP branch output m = down*swiglu(...) AFTER the down
+    // projection, BEFORE the residual add (moss: *colmask *tanh(gm)). Return
+    // the replacement, or nullptr to skip this layer's MLP residual.
+    ggml_tensor *(*ffn_out)(void *ud, int il, ggml_tensor *m) = nullptr;
+    // debug naming for the shared segments: return the name to stamp or
+    // nullptr to leave unnamed. seg is "norm" (post attention-norm stream),
+    // "resid" (post attention residual add, hook path only) or "out" (block
+    // output, nullptr when ffn_out skipped the add). Only consulted when
+    // non-null; when null, the legacy dbg_layer0 naming below applies.
+    const char *(*dbg_name)(void *ud, int il, const char *seg) = nullptr;
     // false = separate silu()*up nodes (parity with VC3_NO_FUSION=1 graphs)
     bool swiglu_split = true;
-    // stamp the layer-0 t_l0_* debug names (parity sinks look them up by name)
+    // stamp the layer-0 t_l0_* debug names (parity sinks look them up by name);
+    // ignored when dbg_name is set (moss_vl names t_l0_*/t_x2_* through it)
     bool dbg_layer0 = true;
     void *ud = nullptr;
 };
@@ -104,12 +128,22 @@ struct BlockHooks {
 inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
                            const LayerWeights &L, const LayerCtx &c, const BlockHooks &h) {
     const int HD = c.head_dim, NH = c.n_head, NKV = c.n_kv_head, T = c.T, S = c.S;
-    const bool dbg = h.dbg_layer0 && il == 0;
+    const bool dbg = !h.dbg_name && h.dbg_layer0 && il == 0;
 
     ggml_tensor * l = ggml_rms_norm(ctx, x, c.rms_eps);
     l = ggml_mul(ctx, l, L.norm);
-    if (dbg) ggml_set_name(l, "t_l0_norm");
+    if (const char * nm = h.dbg_name ? h.dbg_name(h.ud, il, "norm") : (dbg ? "t_l0_norm" : nullptr))
+        ggml_set_name(l, nm);
 
+    if (h.attention) {
+        // override path: the hook owns the whole attention branch (see the
+        // BlockHooks::attention note); the block only adds its output
+        if (ggml_tensor * a = h.attention(h.ud, il, l, c)) {
+            x = ggml_add(ctx, x, a);
+            if (const char * nm = h.dbg_name ? h.dbg_name(h.ud, il, "resid") : nullptr)
+                ggml_set_name(x, nm);
+        }
+    } else {
     ggml_tensor * q = ggml_mul_mat(ctx, L.q, l);
     ggml_tensor * k = ggml_mul_mat(ctx, L.k, l);
     ggml_tensor * v = ggml_mul_mat(ctx, L.v, l);
@@ -196,6 +230,7 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     x = ggml_add(ctx, x, attn);
     if (h.after_attn_proj) h.after_attn_proj(h.ud, il, x);
     if (dbg) ggml_set_name(x, "t_l0_resid");
+    }   // ---- end of the non-hook attention segment (kept verbatim)
 
     ggml_tensor * m = ggml_rms_norm(ctx, x, c.rms_eps);
     m = ggml_mul(ctx, m, L.ffn_norm);
@@ -208,9 +243,15 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     }
     if (dbg) ggml_set_name(m, "t_l0_swiglu");
     m = ggml_mul_mat(ctx, L.down, m);
+    if (h.ffn_out) {
+        ggml_tensor * m2 = h.ffn_out(h.ud, il, m);
+        if (!m2) return x;    // this layer's MLP residual is skipped entirely
+        m = m2;
+    }
     x = ggml_add(ctx, x, m);
     if (h.after_layer) h.after_layer(h.ud, il, x);
-    if (dbg) ggml_set_name(x, "t_l0_out");
+    if (const char * nm = h.dbg_name ? h.dbg_name(h.ud, il, "out") : (dbg ? "t_l0_out" : nullptr))
+        ggml_set_name(x, nm);
     return x;
 }
 

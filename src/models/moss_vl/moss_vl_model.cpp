@@ -20,6 +20,7 @@
 //     4th position axis = T axis (covers the two tail frequency pairs).
 #include "vqa.hpp"
 #include "vit_block.hpp"
+#include "llm_block.hpp"
 
 #include <functional>
 #include <array>
@@ -69,14 +70,14 @@ struct VisLayer {
 };
 
 struct TxtLayer {
-    bool xattn = false;
-    ggml_tensor *norm = nullptr;                        // input_layernorm
-    ggml_tensor *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
-    ggml_tensor *qn = nullptr, *kn = nullptr;
-    ggml_tensor *cq = nullptr, *ck = nullptr, *cv = nullptr, *co = nullptr;
-    ggml_tensor *cqn = nullptr, *ckn = nullptr;
-    ggml_tensor *ga = nullptr, *gm = nullptr;           // cross tanh gates [1]
-    ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+    // text-graph weights (shared vqa::llm::LayerWeights, core/llm_block.hpp);
+    // w.xattn marks the cross-attention layers, which carry the cross group
+    // (cq/cqn/co + the tanh gates ga/gm) instead of the self q/k/v group
+    vqa::llm::LayerWeights w;
+    // cross-KV side weights: these never enter the text graph - ck/cv are
+    // fused into the xkv_fused GEMM at load time and cqn's k-side partner ckn
+    // projects the cross K inside append_cross_kv
+    ggml_tensor *ck = nullptr, *cv = nullptr, *ckn = nullptr;
 };
 
 // cross-attention visibility segment: text rows [start, start+len) see the
@@ -233,6 +234,11 @@ private:
     // static single-token decode graph (same-object across steps: CUDA-graph eligible)
     ggml_context * dec_ctx = nullptr;
     ggml_cgraph * dec_gf = nullptr;
+    // the decode graph gets its OWN gallocr: a shared one re-reserves (and
+    // frees) the buffer under dec_tok/dec_mpos/... whenever a later turn's
+    // prefill graph outgrows it, leaving these cached input pointers dangling
+    // (multi-turn crash: GGML_ASSERT(i1 < ne1) in set_rows / heap AV)
+    ggml_gallocr_t dec_allocr = nullptr;
     int dec_blk = 0, dec_vtot = -1;
     ggml_tensor * dec_tok = nullptr, * dec_mpos = nullptr, * dec_mask = nullptr, * dec_colmask = nullptr;
 
@@ -307,6 +313,7 @@ private:
 
 MossVL::~MossVL() {
     if (allocr) ggml_gallocr_free(allocr);
+    if (dec_allocr) ggml_gallocr_free(dec_allocr);
     if (dec_ctx) ggml_free(dec_ctx);
     kv.free();
     xkv.release();
@@ -320,7 +327,8 @@ bool MossVL::init_backend() {
     backend = vqa::init_backend(use_gpu, n_threads);
     if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return allocr != nullptr;
+    if (!dec_allocr) dec_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    return allocr != nullptr && dec_allocr != nullptr;
 }
 
 // ---------------------------------------------------------------- load
@@ -472,33 +480,34 @@ bool MossVL::load_weights(const char * path) {
     tl.resize(n_layer);
     for (int i = 0; i < n_layer; i++) {
         TxtLayer & L = tl[i];
-        L.xattn = std::binary_search(xlayers.begin(), xlayers.end(), i);
+        vqa::llm::LayerWeights & w = L.w;
+        w.xattn = std::binary_search(xlayers.begin(), xlayers.end(), i);
         char buf[128];
         auto g = [&](const char * suffix) {
             snprintf(buf, sizeof(buf), "blk.%d.%s", i, suffix);
             return gt(buf);
         };
-        L.norm = g("attn_norm.weight");
-        L.ffn_norm = g("ffn_norm.weight");
-        L.gate = g("ffn_gate.weight");
-        L.up = g("ffn_up.weight");
-        L.down = g("ffn_down.weight");
-        if (L.xattn) {
-            L.cq = g("cross_attn_q.weight");
+        w.norm = g("attn_norm.weight");
+        w.ffn_norm = g("ffn_norm.weight");
+        w.gate = g("ffn_gate.weight");
+        w.up = g("ffn_up.weight");
+        w.down = g("ffn_down.weight");
+        if (w.xattn) {
+            w.cq = g("cross_attn_q.weight");
             L.ck = g("cross_attn_k.weight");
             L.cv = g("cross_attn_v.weight");
-            L.co = g("cross_attn_output.weight");
-            L.cqn = g("cross_attn_q_norm.weight");
+            w.co = g("cross_attn_output.weight");
+            w.cqn = g("cross_attn_q_norm.weight");
             L.ckn = g("cross_attn_k_norm.weight");
-            L.ga = g("cross_gate_attn.weight");
-            L.gm = g("cross_gate_mlp.weight");
+            w.ga = g("cross_gate_attn.weight");
+            w.gm = g("cross_gate_mlp.weight");
         } else {
-            L.q = g("attn_q.weight");
-            L.k = g("attn_k.weight");
-            L.v = g("attn_v.weight");
-            L.o = g("attn_output.weight");
-            L.qn = g("attn_q_norm.weight");
-            L.kn = g("attn_k_norm.weight");
+            w.q = g("attn_q.weight");
+            w.k = g("attn_k.weight");
+            w.v = g("attn_v.weight");
+            w.o = g("attn_output.weight");
+            w.qn = g("attn_q_norm.weight");
+            w.kn = g("attn_k_norm.weight");
         }
     }
     {   // fuse the per-layer cross k/v projections into one weight so the
@@ -1101,6 +1110,159 @@ bool MossVL::project_cross_kv(const std::vector<float> & merged, const PromptPla
 }
 
 // ---------------------------------------------------------------- text
+
+// closure for the shared vqa::llm::block layer loop (build_text_graph): what
+// LayerCtx cannot carry - the moss-specific inputs (IMROPE sections, the
+// rope/slot split of mpos_in, the caller-owned self + cross KV caches, the
+// per-frame visibility segments) plus the running cache indexes
+struct TextHookCtx {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    const std::vector<TxtLayer> * tl = nullptr;
+    const vqa::KvCache * kv = nullptr;                    // self layers' KV
+    const std::vector<ggml_tensor *> * xkv_k = nullptr;   // cross layers' KV
+    const std::vector<ggml_tensor *> * xkv_v = nullptr;
+    const std::vector<XSeg> * segs = nullptr;             // visibility segments
+    ggml_tensor * pos_rope = nullptr;   // mpos_in view [4T]: MRoPE positions
+    ggml_tensor * pos_slot = nullptr;   // mpos_in view [T]: KV write-back slots
+    ggml_tensor * mask_in = nullptr, * colmask_in = nullptr;
+    ggml_tensor * x = nullptr;          // stream entering the current layer
+    int sections[GGML_MROPE_SECTIONS] = {0};
+    int D = 0;
+    float scale = 0;
+    bool has_vision = false;
+    int kv_idx = 0, xli = 0;            // advanced by the caller after each block()
+};
+
+// parity probe prefixes: t_l0_* on the first self layer, t_x2_* on the first
+// cross layer (the dump pipeline looks these names up, keep them stable)
+static const char * moss_layer_pfx(int il) {
+    return (il == 0) ? "t_l0" : (il == 2) ? "t_x2" : nullptr;
+}
+
+// shared-segment probe names for llm::block (norm / resid / out); the cross
+// residual keeps its historical "xattn" suffix instead of "resid"
+static const char * moss_dbg_name(void * ud, int il, const char * seg) {
+    (void)ud;
+    if (il == 0) {
+        if (strcmp(seg, "norm") == 0) return "t_l0_norm";
+        if (strcmp(seg, "resid") == 0) return "t_l0_resid";
+        if (strcmp(seg, "out") == 0) return "t_l0_out";
+    } else if (il == 2) {
+        if (strcmp(seg, "norm") == 0) return "t_x2_norm";
+        if (strcmp(seg, "resid") == 0) return "t_x2_xattn";
+        if (strcmp(seg, "out") == 0) return "t_x2_out";
+    }
+    return nullptr;
+}
+
+// self-attention decoder layer: the whole attention branch (projections ->
+// per-head q/k norms -> IMROPE on the text positions -> KV write-back at the
+// slot positions -> masked FA over the window -> wo), moved verbatim from the
+// pre-migration in-loop body; block() adds the returned branch to the stream
+static ggml_tensor * moss_self_attn(void * ud, int il, ggml_tensor * l,
+                                    const vqa::llm::LayerCtx & c) {
+    TextHookCtx * hc = (TextHookCtx *)ud;
+    ggml_context * ctx = hc->ctx;
+    const TxtLayer & L = (*hc->tl)[il];
+    const char * pfx = moss_layer_pfx(il);
+    const int HD = c.head_dim, NH = c.n_head, NKV = c.n_kv_head, T = c.T;
+
+    // ---- self-attention decoder layer
+    ggml_tensor * q = ggml_mul_mat(ctx, L.w.q, l);
+    ggml_tensor * k = ggml_mul_mat(ctx, L.w.k, l);
+    ggml_tensor * v = ggml_mul_mat(ctx, L.w.v, l);
+    if (pfx) ggml_set_name(q, (std::string(pfx) + "_q").c_str());
+
+    ggml_tensor * q3 = ggml_reshape_3d(ctx, q, HD, NH, T);
+    q3 = ggml_rms_norm(ctx, q3, c.rms_eps);
+    q3 = ggml_mul(ctx, q3, L.w.qn);
+    ggml_tensor * k3 = ggml_reshape_3d(ctx, k, HD, NKV, T);
+    k3 = ggml_rms_norm(ctx, k3, c.rms_eps);
+    k3 = ggml_mul(ctx, k3, L.w.kn);
+    if (pfx) ggml_set_name(q3, (std::string(pfx) + "_q_norm").c_str());
+
+    q3 = ggml_rope_multi(ctx, q3, hc->pos_rope, nullptr, HD, hc->sections,
+                         GGML_ROPE_TYPE_IMROPE, c.n_ctx, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    k3 = ggml_rope_multi(ctx, k3, hc->pos_rope, nullptr, HD, hc->sections,
+                         GGML_ROPE_TYPE_IMROPE, c.n_ctx, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (pfx) ggml_set_name(q3, (std::string(pfx) + "_q_rope").c_str());
+
+    ggml_tensor * k2 = ggml_reshape_2d(ctx, k3, NKV * HD, T);
+    ggml_tensor * v2 = ggml_reshape_2d(ctx, v, NKV * HD, T);
+    ggml_build_forward_expand(hc->gf, ggml_set_rows(ctx, hc->kv->k[hc->kv_idx], k2, hc->pos_slot));
+    ggml_build_forward_expand(hc->gf, ggml_set_rows(ctx, hc->kv->v[hc->kv_idx], v2, hc->pos_slot));
+
+    const int Swin = c.S;   // == the blk arg at both build_text_graph call sites
+    ggml_tensor * qf = ggml_view_3d(ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
+    ggml_tensor * kf = ggml_view_3d(ctx, hc->kv->k[hc->kv_idx], HD, Swin, NKV,
+                                    hc->kv->k[hc->kv_idx]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+    ggml_tensor * vf = ggml_view_3d(ctx, hc->kv->v[hc->kv_idx], HD, Swin, NKV,
+                                    hc->kv->v[hc->kv_idx]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, kf, vf, hc->mask_in, hc->scale, 0.0f, 0.0f);
+    ggml_tensor * attn = ggml_reshape_2d(ctx, ggml_cont(ctx, fa), NH * HD, T);
+    if (pfx) ggml_set_name(attn, (std::string(pfx) + "_attn").c_str());
+    return ggml_mul_mat(ctx, L.w.o, attn);
+}
+
+// cross-attention decoder layer (no self attention). queries roam the text
+// stream with TEXT MRoPE; keys/values live in the cross KV (vision MRoPE
+// applied once at projection time). Moved verbatim from the pre-migration
+// in-loop body; returns tanh(ga) * co(attn) for block() to add. With no vision
+// the reference zeroes both branch outputs - equivalent to skipping them.
+static ggml_tensor * moss_cross_attn(void * ud, int il, ggml_tensor * l,
+                                     const vqa::llm::LayerCtx & c) {
+    TextHookCtx * hc = (TextHookCtx *)ud;
+    if (!hc->has_vision) return nullptr;
+    ggml_context * ctx = hc->ctx;
+    const TxtLayer & L = (*hc->tl)[il];
+    const int HD = c.head_dim, NH = c.n_head, NKV = c.n_kv_head, T = c.T;
+    const int D = hc->D, xli = hc->xli;
+
+    ggml_tensor * q = ggml_mul_mat(ctx, L.w.cq, l);
+    ggml_tensor * q3 = ggml_reshape_3d(ctx, q, HD, NH, T);
+    q3 = ggml_rms_norm(ctx, q3, c.rms_eps);
+    q3 = ggml_mul(ctx, q3, L.w.cqn);
+    q3 = ggml_rope_multi(ctx, q3, hc->pos_rope, nullptr, HD, hc->sections,
+                         GGML_ROPE_TYPE_IMROPE, c.n_ctx, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    ggml_tensor * attn_all = nullptr;
+    for (const XSeg & sg : *hc->segs) {
+        ggml_tensor * chunk = nullptr;
+        if (sg.v_end == 0) {
+            // rows with no visible frames: the reference zeroes their
+            // attention output; skip the FA and emit exact zeros
+            chunk = ggml_scale(ctx, ggml_view_2d(ctx, hc->x, D, sg.len, hc->x->nb[1],
+                                                 (size_t)sg.start * hc->x->nb[1]), 0.0f);
+        } else {
+            ggml_tensor * qf = ggml_view_3d(ctx, q3, HD, sg.len, NH,
+                                            q3->nb[2], q3->nb[1],
+                                            (size_t)sg.start * q3->nb[2]);
+            ggml_tensor * kf = ggml_view_3d(ctx, (*hc->xkv_k)[xli], HD, sg.v_end, NKV,
+                                            (*hc->xkv_k)[xli]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+            ggml_tensor * vf = ggml_view_3d(ctx, (*hc->xkv_v)[xli], HD, sg.v_end, NKV,
+                                            (*hc->xkv_v)[xli]->nb[1], HD * sizeof(ggml_fp16_t), 0);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, kf, vf, nullptr, hc->scale, 0.0f, 0.0f);
+            chunk = ggml_reshape_2d(ctx, ggml_cont(ctx, fa), NH * HD, sg.len);
+        }
+        attn_all = attn_all ? ggml_concat(ctx, attn_all, chunk, 1) : chunk;
+    }
+    attn_all = ggml_mul_mat(ctx, L.w.co, attn_all);
+    return ggml_mul(ctx, attn_all, ggml_tanh(ctx, L.w.ga));
+}
+
+// MLP output wrapper for cross layers: zero the no-vision rows (colmask) and
+// apply the reference's tanh(mlp_gate) - BOTH gates must be multiplied
+// (docs/vlm-porting-sop.md §7: the missed second gate was the original bug)
+static ggml_tensor * moss_cross_ffn(void * ud, int il, ggml_tensor * m) {
+    TextHookCtx * hc = (TextHookCtx *)ud;
+    if (!hc->has_vision) return nullptr;
+    const TxtLayer & L = (*hc->tl)[il];
+    m = ggml_mul(hc->ctx, m, hc->colmask_in);             // zero no-vision rows (reference mask)
+    m = ggml_mul(hc->ctx, m, ggml_tanh(hc->ctx, L.w.gm)); // reference: residual + tanh(mlp_gate) * mlp
+    return m;
+}
+
 bool MossVL::build_text_graph(TextGraph & g, const PromptPlan & plan, int T, int S, int blk) {
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
@@ -1131,111 +1293,57 @@ bool MossVL::build_text_graph(TextGraph & g, const PromptPlan & plan, int T, int
     ggml_tensor * x = ggml_get_rows(g.ctx, tok_embd, g.tok_in);      // [D, T]
     ggml_set_name(x, "emb");
 
-    int sections[GGML_MROPE_SECTIONS] = { mrope_t, mrope_h, mrope_w, 0 };
     const float scale = 1.0f / sqrtf((float)HD);
 
-    int kv_idx = 0, xli = 0;
+    // ---- decoder layer loop: shared vqa::llm::block (core/llm_block.hpp).
+    // Both layer kinds override hooks.attention: the self layers need IMROPE
+    // rope on mpos_in's rope view but KV write-back on its slot view (two
+    // index tensors, which the single LayerCtx::pos cannot express), and the
+    // cross layers replace the whole branch with cross-attention into the
+    // caller's xkv caches. The hook bodies are the pre-migration in-loop
+    // bodies moved verbatim (same ops, same order - f16 graphs are sensitive
+    // to adjacent-node reordering).
+    TextHookCtx hc;
+    hc.ctx = g.ctx;
+    hc.gf = g.gf;
+    hc.tl = &tl;
+    hc.kv = &kv;
+    hc.xkv_k = &xkv.k;
+    hc.xkv_v = &xkv.v;
+    hc.segs = &segs;
+    hc.pos_rope = pos_rope;
+    hc.pos_slot = pos_slot;
+    hc.mask_in = g.mask_in;
+    hc.colmask_in = g.colmask_in;
+    hc.sections[0] = mrope_t; hc.sections[1] = mrope_h; hc.sections[2] = mrope_w;
+    hc.sections[3] = 0;
+    hc.D = D;
+    hc.scale = scale;
+    hc.has_vision = has_vision;
+
+    vqa::llm::LayerCtx lc;
+    lc.gf = g.gf;
+    lc.T = T; lc.S = blk;   // blk == S at both call sites: the FA window width
+    lc.n_head = NH; lc.n_kv_head = NKV; lc.head_dim = HD;
+    lc.n_ctx = n_ctx;
+    lc.rms_eps = rms_eps;
+    lc.rope_theta = rope_theta;
+
     for (int il = 0; il < n_layer; il++) {
-        const char * pfx = (il == 0) ? "t_l0" : (il == 2) ? "t_x2" : nullptr;
         TxtLayer & L = tl[il];
-        ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
-        l = ggml_mul(g.ctx, l, L.norm);
-        if (pfx) ggml_set_name(l, (std::string(pfx) + "_norm").c_str());
-
-        if (!L.xattn) {
-            // ---- self-attention decoder layer
-            ggml_tensor * q = ggml_mul_mat(g.ctx, L.q, l);
-            ggml_tensor * k = ggml_mul_mat(g.ctx, L.k, l);
-            ggml_tensor * v = ggml_mul_mat(g.ctx, L.v, l);
-            if (pfx) { ggml_set_name(q, (std::string(pfx) + "_q").c_str()); }
-
-            ggml_tensor * q3 = ggml_reshape_3d(g.ctx, q, HD, NH, T);
-            q3 = ggml_rms_norm(g.ctx, q3, rms_eps);
-            q3 = ggml_mul(g.ctx, q3, L.qn);
-            ggml_tensor * k3 = ggml_reshape_3d(g.ctx, k, HD, NKV, T);
-            k3 = ggml_rms_norm(g.ctx, k3, rms_eps);
-            k3 = ggml_mul(g.ctx, k3, L.kn);
-            if (pfx) ggml_set_name(q3, (std::string(pfx) + "_q_norm").c_str());
-
-            q3 = ggml_rope_multi(g.ctx, q3, pos_rope, nullptr, HD, sections,
-                                 GGML_ROPE_TYPE_IMROPE, n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            k3 = ggml_rope_multi(g.ctx, k3, pos_rope, nullptr, HD, sections,
-                                 GGML_ROPE_TYPE_IMROPE, n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            if (pfx) ggml_set_name(q3, (std::string(pfx) + "_q_rope").c_str());
-
-            ggml_tensor * k2 = ggml_reshape_2d(g.ctx, k3, NKV * HD, T);
-            ggml_tensor * v2 = ggml_reshape_2d(g.ctx, v, NKV * HD, T);
-            ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[kv_idx], k2, pos_slot));
-            ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[kv_idx], v2, pos_slot));
-
-            const int Swin = blk;
-            ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
-            ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[kv_idx], HD, Swin, NKV,
-                                            kv.k[kv_idx]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-            ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[kv_idx], HD, Swin, NKV,
-                                            kv.v[kv_idx]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-            ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in, scale, 0.0f, 0.0f);
-            ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
-            if (pfx) ggml_set_name(attn, (std::string(pfx) + "_attn").c_str());
-            attn = ggml_mul_mat(g.ctx, L.o, attn);
-            x = ggml_add(g.ctx, x, attn);
-            if (pfx) ggml_set_name(x, (std::string(pfx) + "_resid").c_str());
-            kv_idx++;
-        } else if (has_vision) {
-            // ---- cross-attention decoder layer (no self attention).
-            // queries roam the text stream with TEXT MRoPE; keys/values live
-            // in the cross KV (vision MRoPE applied once at projection time)
-            ggml_tensor * q = ggml_mul_mat(g.ctx, L.cq, l);
-            ggml_tensor * q3 = ggml_reshape_3d(g.ctx, q, HD, NH, T);
-            q3 = ggml_rms_norm(g.ctx, q3, rms_eps);
-            q3 = ggml_mul(g.ctx, q3, L.cqn);
-            q3 = ggml_rope_multi(g.ctx, q3, pos_rope, nullptr, HD, sections,
-                                 GGML_ROPE_TYPE_IMROPE, n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-            ggml_tensor * attn_all = nullptr;
-            for (const XSeg & sg : segs) {
-                ggml_tensor * chunk = nullptr;
-                if (sg.v_end == 0) {
-                    // rows with no visible frames: the reference zeroes their
-                    // attention output; skip the FA and emit exact zeros
-                    chunk = ggml_scale(g.ctx, ggml_view_2d(g.ctx, x, D, sg.len, x->nb[1],
-                                                           (size_t)sg.start * x->nb[1]), 0.0f);
-                } else {
-                    ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, sg.len, NH,
-                                                    q3->nb[2], q3->nb[1],
-                                                    (size_t)sg.start * q3->nb[2]);
-                    ggml_tensor * kf = ggml_view_3d(g.ctx, xkv.k[xli], HD, sg.v_end, NKV,
-                                                    xkv.k[xli]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-                    ggml_tensor * vf = ggml_view_3d(g.ctx, xkv.v[xli], HD, sg.v_end, NKV,
-                                                    xkv.v[xli]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-                    ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, nullptr, scale, 0.0f, 0.0f);
-                    chunk = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, sg.len);
-                }
-                attn_all = attn_all ? ggml_concat(g.ctx, attn_all, chunk, 1) : chunk;
-            }
-            attn_all = ggml_mul_mat(g.ctx, L.co, attn_all);
-            x = ggml_add(g.ctx, x, ggml_mul(g.ctx, attn_all, ggml_tanh(g.ctx, L.ga)));
-            if (pfx) ggml_set_name(x, (std::string(pfx) + "_xattn").c_str());
+        vqa::llm::BlockHooks lh;
+        lh.ud = &hc;
+        lh.dbg_layer0 = false;          // moss stamps t_l0_*/t_x2_* via dbg_name
+        lh.dbg_name = moss_dbg_name;
+        if (L.w.xattn) {
+            lh.attention = moss_cross_attn;   // nullptr branch out => passthrough layer
+            lh.ffn_out = moss_cross_ffn;
+        } else {
+            lh.attention = moss_self_attn;
         }
-        // if (!has_vision && L.xattn): passthrough - the reference zeroes both
-        // the attention and the MLP output for rows without vision
-
-        // MLP (all layers)
-        ggml_tensor * m = ggml_rms_norm(g.ctx, x, rms_eps);
-        m = ggml_mul(g.ctx, m, L.ffn_norm);
-        ggml_tensor * gate = ggml_mul_mat(g.ctx, L.gate, m);
-        ggml_tensor * up = ggml_mul_mat(g.ctx, L.up, m);
-        m = ggml_swiglu_split(g.ctx, gate, up);
-        m = ggml_mul_mat(g.ctx, L.down, m);
-        if (L.xattn && has_vision) {
-            m = ggml_mul(g.ctx, m, g.colmask_in);   // zero no-vision rows (reference mask)
-            m = ggml_mul(g.ctx, m, ggml_tanh(g.ctx, L.gm));  // reference: residual + tanh(mlp_gate) * mlp
-        }
-        if (!(L.xattn && !has_vision)) {
-            x = ggml_add(g.ctx, x, m);
-            if (pfx) ggml_set_name(x, (std::string(pfx) + "_out").c_str());
-        }
-        if (L.xattn) xli++;
+        hc.x = x;
+        x = vqa::llm::block(g.ctx, x, il, L.w, lc, lh);
+        if (L.w.xattn) hc.xli++; else hc.kv_idx++;
     }
 
     x = ggml_rms_norm(g.ctx, x, rms_eps);
@@ -1280,7 +1388,7 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
             }
             dec_gf = dg.gf;
             vqa::dump::finalize_sinks(dec_ctx, dec_gf, backend);
-            if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
+            if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
                 return false;
