@@ -78,6 +78,19 @@ struct ScoreResult {
     double start = -1.0, end = -1.0;    // grounding: decoded interval (seconds)
 };
 
+// Embedding request knobs (EmbeddingGemma2-style encoders).
+//   preset       task-instruction prefix prepended to the text ("none" = raw);
+//                the official presets are the sentence-transformers prompts:
+//                query / document / sts / classification / clustering / qa /
+//                fact / code. Media-only requests ignore it.
+//   truncate_dim Matryoshka output dimension (0 = the model's default, 768);
+//                the slice is re-normalized, matching sentence-transformers'
+//                truncate_dim.
+struct EmbedParams {
+    const char * preset = "none";
+    int truncate_dim = 0;
+};
+
 // Load-time configuration shared by every backend.
 struct LoadOptions {
     int n_ctx = 8192;      // KV context window
@@ -145,6 +158,16 @@ public:
 
     // batched text-only decode driver (one prompt per line); -1 = unsupported
     virtual int run_batch(const std::string & batch_path, int n_gen) { (void)batch_path; (void)n_gen; return -1; }
+
+    // Multimodal embedding: `media` may carry frames and/or audio, `text` may be
+    // empty; at least one of them must be set. The output is one L2-normalized
+    // vector of truncate_dim (0 = model default) floats. Returns false when the
+    // backend has no embedding head.
+    virtual bool embed(const MediaInput & media, const std::string & text,
+                       const EmbedParams & ep, std::vector<float> & out) {
+        (void)media; (void)text; (void)ep; (void)out;
+        return false;
+    }
 
     // Chat-template knowledge the front ends need but only the backend has.
     // format_history_turn renders one prior turn for gp.history ("" = this

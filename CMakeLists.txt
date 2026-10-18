@@ -150,6 +150,11 @@ set(MAGE_VL_SRC
     src/models/videochat3/vc3_preprocess.cpp
     src/models/mage_vl/mage_model.cpp)
 
+#   src/models/embedgemma2/  EmbeddingGemma-2 backend (Gemma text encoder + Gemma4
+#                            vision/audio towers; embedding output)
+set(EMBG2_SRC
+    src/models/embedgemma2/embedgemma2_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -164,7 +169,8 @@ add_executable(vqa-cli
     ${QWEN2VL_SRC}
     ${SMOLVLM_SRC}
     ${MAGE_VL_SRC}
-    ${QWEN25OMNI_SRC})
+    ${QWEN25OMNI_SRC}
+    ${EMBG2_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
 

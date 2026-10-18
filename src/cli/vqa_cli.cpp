@@ -39,6 +39,11 @@ void usage() {
         "               [--image <file>] [--video <file> | --frames <dir>] [--fps <f>] [--max-frames <n>]\n"
         "               --ask <question> [--mode <skill>] [options]\n"
         "               --batch <prompts.txt>   text-only batched decode (one prompt per line)\n"
+        "               --embed <text>          multimodal embedding (with --image/--video/--audio)\n"
+        "               --embed-file <txt>      embed one input per line, JSON lines out\n"
+        "               --embed-preset NAME     query|document|sts|classification|clustering|\n"
+        "                                       code|qa|fact (default none)\n"
+        "               --embed-dim N           Matryoshka truncation (512/256/128/64)\n"
         "               --score <qs.json>       candidate scoring (VideoJev):\n"
         "                                       {\"questions\":[{\"id\",\"task\":\"grounding|choice\",\"query\",\"options\"}]}\n"
         "               [--threshold T]         grounding probability threshold (default: model)\n"
@@ -90,8 +95,11 @@ int main(int argc, char ** argv) {
 #endif
 
     std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, audio_path, speak_wav, ask_text, mode, arch_override, batch_path,
-                dump_dir, vision_path, region_path, score_path;
+                dump_dir, vision_path, region_path, score_path, embed_text, embed_file,
+                embed_preset = "none";
+    bool embed_given = false;
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
+    int ep_dim = 0;
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f, threshold = 0.0f;
     int max_frames = 32;
     int serve_port = 0;
@@ -137,6 +145,10 @@ int main(int argc, char ** argv) {
         else if (a == "--dump-ids") dump_ids = true;
         else if (a == "--arch") arch_override = next("--arch");
         else if (a == "--score") score_path = next("--score");
+        else if (a == "--embed") { embed_text = next("--embed"); embed_given = true; }
+        else if (a == "--embed-file") embed_file = next("--embed-file");
+        else if (a == "--embed-preset") embed_preset = next("--embed-preset");
+        else if (a == "--embed-dim") ep_dim = atoi(next("--embed-dim"));
         else if (a == "--threshold") threshold = (float)atof(next("--threshold"));
         else if (a == "--quiet") quiet = true;
         else { fprintf(stderr, "unknown argument: %s\n", a.c_str()); usage(); return 2; }
@@ -227,7 +239,8 @@ int main(int argc, char ** argv) {
     if (!audio_path.empty()) {
         if (!vqa::load_audio(audio_path, media)) return 4;
     }
-    if (media.empty() && !media.has_audio() && ask_text.empty() && batch_path.empty() && score_path.empty()) { usage(); return 2; }
+    if (media.empty() && !media.has_audio() && ask_text.empty() && batch_path.empty() &&
+        score_path.empty() && !embed_given && embed_file.empty()) { usage(); return 2; }
 
     vqa::GenParams gp;
     if (!speak_wav.empty()) gp.speak_wav = speak_wav.c_str();
@@ -320,6 +333,48 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+
+    if (embed_given || !embed_file.empty()) {
+        vqa::EmbedParams ep;
+        ep.preset = embed_preset.c_str();
+        ep.truncate_dim = ep_dim;
+        if (embed_given) {
+            std::vector<float> e;
+            if (!model->embed(media, embed_text, ep, e)) {
+                fprintf(stderr, "embedding failed (backend has no embed head?)\n");
+                delete model; return 5;
+            }
+            printf("{\"dim\": %d, \"embedding\": [", (int)e.size());
+            for (size_t i = 0; i < e.size(); i++) printf("%s%.6f", i ? ", " : "", (double)e[i]);
+            printf("]}\n");
+        } else {
+            std::string doc;
+            if (!vqa::read_file(embed_file.c_str(), doc)) {
+                fprintf(stderr, "cannot read %s\n", embed_file.c_str()); delete model; return 2;
+            }
+            size_t idx = 0;
+            size_t pos = 0;
+            while (pos <= doc.size()) {
+                size_t nl = doc.find('\n', pos);
+                if (nl == std::string::npos) nl = doc.size();
+                std::string line = doc.substr(pos, nl - pos);
+                pos = nl + 1;
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                if (line.empty()) continue;
+                std::vector<float> e;
+                if (!model->embed(media, line, ep, e)) {
+                    fprintf(stderr, "embedding failed on line %zu\n", idx + 1);
+                    delete model; return 5;
+                }
+                printf("{\"i\": %zu, \"dim\": %d, \"embedding\": [", idx++, (int)e.size());
+                for (size_t i = 0; i < e.size(); i++) printf("%s%.6f", i ? ", " : "", (double)e[i]);
+                printf("]}\n");
+                fflush(stdout);
+            }
+        }
+        delete model;
+        return 0;
+    }
 
     std::string out;
     if (!model->ask(media, ask_text, mode, gp, out)) { fprintf(stderr, "inference failed\n"); return 5; }

@@ -101,6 +101,10 @@ const ArchEntry kArchs[] = {
     // the talker gguf (speech output) is an optional sibling of the gguf
     { { "qwen25omni", "qwen2_5_omni", nullptr }, create_qwen25omni,
       TokenizerMode::Qwen2Regex, "", 151936, false, false },
+    // EmbeddingGemma-2: bidirectional text encoder (PLE) + Gemma4 vision/audio
+    // towers fused as soft tokens; embedding output via Model::embed
+    { { "embgemma2", nullptr }, create_embedgemma2,
+      TokenizerMode::GemmaSP, "models/embeddinggemma-2", 262144, false, false },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

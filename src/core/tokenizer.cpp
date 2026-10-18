@@ -143,8 +143,9 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
     init_byte_table();
 
     use_pretokenizer = (mode == TokenizerMode::Qwen2Regex || mode == TokenizerMode::Gpt2Regex);
-    use_added_tokens = use_pretokenizer;
+    use_added_tokens = use_pretokenizer || mode == TokenizerMode::GemmaSP;
     gpt2_pretok = (mode == TokenizerMode::Gpt2Regex);
+    gemma_sp = (mode == TokenizerMode::GemmaSP);
 
     // vocab
     size_t vp = js.find("\"vocab\"");
@@ -243,7 +244,8 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
     fprintf(stderr, "tokenizer: %zu tokens, %zu merges, %zu added (%s)\n",
             id_to_piece.size(), merge_rank.size(), added.size(),
             mode == TokenizerMode::Qwen2Regex ? "qwen2 regex"
-            : mode == TokenizerMode::Gpt2Regex ? "gpt2 regex" : "plain gpt2");
+            : mode == TokenizerMode::Gpt2Regex ? "gpt2 regex"
+            : mode == TokenizerMode::GemmaSP ? "gemma sentencepiece" : "plain gpt2");
     return !id_to_piece.empty();
 }
 
@@ -298,6 +300,48 @@ void Tokenizer::encode_piece(const std::string & piece, std::vector<int> & out) 
     }
 }
 
+// SentencePiece-flavoured BPE (Gemma): spaces become U+2581 before the merge
+// loop, the merge alphabet is raw UTF-8 code points (no GPT-2 byte table), and
+// a merged piece the vocab does not know falls back to one <0xNN> token per
+// UTF-8 byte - exactly the HF tokenizers `byte_fallback` behaviour.
+void Tokenizer::encode_piece_gemma(const std::string & piece, std::vector<int> & out) const {
+    std::string sp;
+    sp.reserve(piece.size() + 8);
+    for (size_t i = 0; i < piece.size(); i++) {
+        if (piece[i] == ' ') sp += "\xE2\x96\x81";
+        else sp += piece[i];
+    }
+    std::vector<std::string> parts;
+    parts.reserve(sp.size());
+    for (size_t i = 0; i < sp.size();) {
+        size_t j = i;
+        cp_at(sp, j);
+        parts.push_back(sp.substr(i, j - i));
+        i = j;
+    }
+    while (parts.size() > 1) {
+        int best_rank = 1 << 30;
+        size_t best_i = 0;
+        for (size_t i = 0; i + 1 < parts.size(); i++) {
+            auto it = merge_rank.find({parts[i], parts[i + 1]});
+            if (it != merge_rank.end() && it->second < best_rank) { best_rank = it->second; best_i = i; }
+        }
+        if (best_rank == (1 << 30)) break;
+        parts[best_i] += parts[best_i + 1];
+        parts.erase(parts.begin() + best_i + 1);
+    }
+    for (auto & p : parts) {
+        auto it = vocab.find(p);
+        if (it != vocab.end()) { out.push_back(it->second); continue; }
+        for (unsigned char b : p) {          // byte fallback
+            char hex[8];
+            snprintf(hex, sizeof(hex), "<0x%02X>", b);
+            auto bt = vocab.find(hex);
+            if (bt != vocab.end()) out.push_back(bt->second);
+        }
+    }
+}
+
 std::vector<int> Tokenizer::encode(const std::string & text) const {
     std::vector<int> out;
     size_t i = 0;
@@ -320,14 +364,16 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
                 size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (stop - i);
                 if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
                 if (i + n > stop) n = stop - i;   // safe: added tokens start with ASCII
-                encode_piece(text.substr(i, n), out);
+                if (gemma_sp) encode_piece_gemma(text.substr(i, n), out);
+                else encode_piece(text.substr(i, n), out);
                 i += n;
             }
             continue;
         }
         size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (text.size() - i);
         if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
-        encode_piece(text.substr(i, n), out);
+        if (gemma_sp) encode_piece_gemma(text.substr(i, n), out);
+        else encode_piece(text.substr(i, n), out);
         i += n;
     }
     return out;
@@ -339,6 +385,21 @@ std::string Tokenizer::decode(const std::vector<int> & ids) const {
         if (t < 0 || t >= (int)id_to_piece.size()) continue;
         if (t < (int)is_added.size() && is_added[t]) continue;   // specials are not text
         const std::string & piece = id_to_piece[t];
+        if (gemma_sp) {
+            // <0xNN> byte-fallback tokens and U+2581 metaspace
+            if (piece.size() == 6 && piece.compare(0, 3, "<0x") == 0 && piece[5] == '>') {
+                out += (char)strtol(piece.c_str() + 3, nullptr, 16);
+                continue;
+            }
+            for (size_t i = 0; i < piece.size(); i++) {
+                if (piece[i] == '\xE2' && i + 2 < piece.size() &&
+                    (unsigned char)piece[i + 1] == 0x96 && (unsigned char)piece[i + 2] == 0x81) {
+                    out += ' ';
+                    i += 2;
+                } else out += piece[i];
+            }
+            continue;
+        }
         size_t i = 0;
         while (i < piece.size()) {
             uint32_t cp = utf8_next((const unsigned char *)piece.data(), piece.size(), i);

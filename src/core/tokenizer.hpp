@@ -24,6 +24,8 @@ enum class TokenizerMode {
     PlainGpt2,    // moondream / starmie: whole-string BPE, no specials
     Qwen2Regex,   // Qwen2/Qwen3 (VideoChat3): regex pre-tokenizer + added tokens
     Gpt2Regex,    // SmolLM2 (SmolVLM): Digits + ByteLevel/GPT-2 regex + added tokens
+    GemmaSP,      // Gemma (EmbeddingGemma2): SentencePiece BPE - space -> U+2581
+                  // before BPE, byte fallback (<0xNN> tokens) for OOV code points
 };
 
 // which pre-tokenizer / added-token handling a backend's checkpoint needs.
@@ -41,6 +43,7 @@ struct Tokenizer {
     bool use_pretokenizer = false;
     bool use_added_tokens = false;
     bool gpt2_pretok = false;   // Gpt2Regex: \s? prefix on words, no trailing CR/LF glue
+    bool gemma_sp = false;      // GemmaSP: metaspace + byte fallback, codepoint BPE
 
     bool load(const char * tokenizer_json, TokenizerMode mode = TokenizerMode::PlainGpt2);
 
@@ -53,6 +56,7 @@ struct Tokenizer {
 
   private:
     void encode_piece(const std::string & piece, std::vector<int> & out) const;
+    void encode_piece_gemma(const std::string & piece, std::vector<int> & out) const;
     int match_added(const std::string & text, size_t pos, size_t & len) const;
 };
 
