@@ -64,11 +64,13 @@ void conv1d_full(const float * x, int ic, int T, const float * w, const float * 
             const float * xc = x + (size_t)i * T;
             const float * wo = w + ((size_t)o * ic + i) * kw;
             for (int kk = 0; kk < kw; kk++) {
-                const int off = -kk * dil + pad;
+                // torch conv1d is correlation: out[n] += w[k] * x[n + k - pad]
+                const int off = kk * dil - pad;
                 const float * wk = wo + kk;
                 for (int n = 0; n < Ty; n++) {
-                    const int idx = n * dil + off;
-                    if (idx >= 0 && idx < T) yo[n] += wk[0] * xc[idx];
+                    const int idx = n + off;   // output stride is 1; dilation
+                    if (idx >= 0 && idx < T)   // only spreads the kernel taps
+                        yo[n] += wk[0] * xc[idx];
                 }
             }
         }
@@ -124,11 +126,15 @@ std::vector<float> kaiser_sinc_filter1d(int kernel, float cutoff, float half_wid
         const float r = ((float)n - (float)(kernel - 1) / 2.0f) / ((float)(kernel - 1) / 2.0f);
         const float kwin = bessel_i0(beta * sqrtf(std::max(0.0f, 1.0f - r * r))) / i0b;
         const float t = (float)(n - half) + 0.5f;
-        // normalized sinc (t in samples, cutoff in cycles/sample)
-        const float v = (t == 0.0f) ? 2.0f * cutoff
-            : cutoff * sinf((float)M_PI * cutoff * t) / ((float)M_PI * cutoff * t);
-        f[(size_t)n] = v * kwin;
+        // torch.sinc(2*cutoff*t) * 2*cutoff, then normalized to sum 1 (HF)
+        const float a = 2.0f * (float)M_PI * cutoff * t;
+        const float v = (t == 0.0f) ? 1.0f : sinf(a) / a;
+        f[(size_t)n] = 2.0f * cutoff * v * kwin;
     }
+    double sum = 0.0;
+    for (float v : f) sum += v;
+    if (sum != 0.0)
+        for (auto & v : f) v = (float)(v / sum);
     return f;
 }
 
@@ -161,6 +167,54 @@ void aa_resample(const float * x, int C, int T, const std::vector<float> & filte
         }
     } else {
         conv1d_full(xp.data(), C, Tp, filter.data(), nullptr, C, kernel, ratio, 0, y, Ty);
+    }
+}
+
+// anti-aliased SnakeBeta: up2 (replicate pad 5, transposed-conv scatter,
+// crop 15/16) -> snake -> down2 (replicate pad 5/6, strided conv), all with
+// the 12-tap kaiser filter - exactly HF's AntiAliasedActivation1d
+static const std::vector<float> aa_filter = kaiser_sinc_filter1d(12, 0.25f, 0.3f);
+
+void aa_snake_act(const float * x, int C, int T, const std::vector<float> & alpha,
+                  const std::vector<float> & beta, const std::vector<float> & filter,
+                  float * y) {
+    const int K = (int)filter.size();          // 12
+    const int pad = K / 2 - 1;                 // 5
+    const int pad_l = pad * 2 + (K - 2) / 2;   // 15
+    const int pad_r = pad * 2 + (K - 2 + 1) / 2;  // 16
+    const int Tu = 2 * T - 1;
+    std::vector<float> up((size_t)C * Tu);
+    for (int c = 0; c < C; c++) {
+        const float * xc = x + (size_t)c * T;
+        float * yc = up.data() + (size_t)c * Tu;
+        auto at = [&](int i) { return xc[i < 0 ? 0 : (i >= T ? T - 1 : i)]; };
+        for (int n = -pad; n < T + pad; n++) {          // padded input positions
+            const float xv = at(n);
+            for (int kk = 0; kk < K; kk++) {
+                const int idx = (n + pad) * 2 + kk;      // full transposed-conv index
+                const int o = idx - pad_l;
+                if (o >= 0 && o < Tu) yc[o] += 2.0f * filter[(size_t)kk] * xv;
+            }
+        }
+    }
+    // snake on the upsampled grid
+    for (int c = 0; c < C; c++) {
+        const float a = expf(alpha[(size_t)c]);
+        const float b = expf(beta[(size_t)c]) + 1e-9f;
+        float * xc = up.data() + (size_t)c * Tu;
+        for (int n = 0; n < Tu; n++) xc[n] += sinf(xc[n] * a) * sinf(xc[n] * a) / b;
+    }
+    // down2: replicate pad left 5 / right 6, strided depthwise conv
+    const int dl = K / 2 - 1, dr = K / 2;
+    for (int c = 0; c < C; c++) {
+        const float * xc = up.data() + (size_t)c * Tu;
+        float * yc = y + (size_t)c * T;
+        auto at = [&](int i) { return xc[i < 0 ? 0 : (i >= Tu ? Tu - 1 : i)]; };
+        for (int n = 0; n < T; n++) {
+            float s = 0.0f;
+            for (int kk = 0; kk < K; kk++) s += filter[(size_t)kk] * at(n * 2 - dl + kk);
+            yc[n] = s;
+        }
     }
 }
 
@@ -775,6 +829,20 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
     fprintf(stderr, "t2w: rk4 done mel [%.3f..%.3f] mean %.3f\n",
             *std::min_element(val.begin(), val.end()), *std::max_element(val.begin(), val.end()),
             std::accumulate(val.begin(), val.end(), 0.0) / val.size());
+    if (const char * mp = getenv("T2W_MEL_LOAD")) {   // parity: feed the vocoder
+        FILE * f = fopen(mp, "rb");                     // a reference mel [t][bin]
+        if (f) {                                        // row-major, stored as [bin][t]
+            std::vector<float> ref((size_t)d_mel * T0);
+            if (fread(ref.data(), 4, ref.size(), f) == ref.size()) {
+                std::vector<float> tr((size_t)d_mel * T0);
+                for (int t = 0; t < T0; t++)
+                    for (int b = 0; b < d_mel; b++)
+                        tr[(size_t)b * T0 + t] = ref[(size_t)t * d_mel + b];
+                val = tr;
+            } else fprintf(stderr, "t2w: mel load size mismatch\n");
+            fclose(f);
+        }
+    }
     // val: [mel][T0] mel spectrogram -> BigVGAN
     bigvgan_run(val, T0, pcm);
     return !pcm.empty();
@@ -805,6 +873,9 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
     if (getenv("T2W_DEBUG")) {
         float mn = cur[0], mx = cur[0];
         for (float v : cur) { if (v < mn) mn = v; if (v > mx) mx = v; }
+        fprintf(stderr, "t2w: x ch0 t0-3 = %.6f %.6f %.6f\n", x[0], x[1], x[2]);
+        fprintf(stderr, "t2w: convpre ch0 t0-3 = %.6f %.6f %.6f %.6f w0=%.6f b0=%.6f\n",
+                cur[0], cur[1], cur[2], cur[3], bg_pre_w[0], bg_pre_b.empty() ? 0.f : bg_pre_b[0]);
         fprintf(stderr, "t2w: bg x [%.2f..%.2f] conv_pre [%.2f..%.2f]\n",
                 *std::min_element(x.begin(), x.end()), *std::max_element(x.begin(), x.end()), mn, mx);
     }
@@ -817,7 +888,16 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
         std::vector<float> up((size_t)U.oc * Lout);
         conv_transpose1d_full(cur.data(), cc, kin, U.w.data(), U.b.data(), U.oc, U.k,
                               U.stride, p, up.data(), Lout);
+        if (getenv("T2W_DEBUG") && u == 0)
+            fprintf(stderr, "t2w: up0 ch0 t0-3 = %.6f %.6f %.6f (cur ch0 t0 = %.6f)\n",
+                    up[0], up[(size_t)1], up[(size_t)2], cur[0]);
         // 3 res-blocks at U.oc channels, summed and averaged
+        if (const char * dp = getenv("T2W_BLK_DUMP"); dp && u == 0) {
+            char fn[256]; snprintf(fn, sizeof(fn), "%s_up.bin", dp);
+            FILE * f = fopen(fn, "wb");
+            if (f) { fwrite(&cc, 4, 1, f); fwrite(&kin, 4, 1, f);
+                     fwrite(up.data(), 4, up.size(), f); fclose(f); }
+        }
         std::vector<float> acc((size_t)U.oc * Lout, 0.0f);
         for (int r = 0; r < 3; r++) {
             const ResBlock & R = rbs[(size_t)u * 3 + (size_t)r];
@@ -828,22 +908,42 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
                 const int k2 = (int)(R.c2[(size_t)kk].w.size() / (size_t)(hc * hc));
                 const int dil[3] = {1, 3, 5};
                 std::vector<float> t((size_t)hc * Lout), t2((size_t)hc * Lout);
-                snake_act(h.data(), hc, Lout, R.s1a[(size_t)kk], R.s1b[(size_t)kk], t.data());
+                aa_snake_act(h.data(), hc, Lout, R.s1a[(size_t)kk], R.s1b[(size_t)kk],
+                             aa_filter, t.data());
+                if (const char * dp = getenv("T2W_AA_DUMP"); dp && u == 0 && r == 0 && kk == 0) {
+                    FILE * f = fopen(dp, "wb");
+                    if (f) { int c2 = hc, t2_ = Lout; fwrite(&c2, 4, 1, f); fwrite(&t2_, 4, 1, f);
+                             fwrite(t.data(), 4, t.size(), f); fclose(f); }
+                }
+                if (getenv("T2W_DEBUG") && u == 0 && r == 0 && kk == 0)
+                    fprintf(stderr, "t2w: aa_snake0 |y|=%.4f y0=%.6f h0=%.6f a=%.4f b=%.4f\n",
+                            fabsf(t[0]), t[1], h[1],
+                            expf(R.s1a[0][0]), expf(R.s1b[0][0]) + 1e-9f);
                 std::vector<float> y((size_t)hc * Lout);
                 conv1d_full(t.data(), hc, Lout, R.c1[(size_t)kk].w.data(),
                             R.c1[(size_t)kk].b.data(), hc, k1, dil[kk], (k1 * dil[kk] - dil[kk]) / 2,
                             y.data(), Lout);
-                snake_act(y.data(), hc, Lout, R.s2a[(size_t)kk], R.s2b[(size_t)kk], t2.data());
+                aa_snake_act(y.data(), hc, Lout, R.s2a[(size_t)kk], R.s2b[(size_t)kk],
+                             aa_filter, t2.data());
                 conv1d_full(t2.data(), hc, Lout, R.c2[(size_t)kk].w.data(),
                             R.c2[(size_t)kk].b.data(), hc, k2, 1, (k2 - 1) / 2, y.data(), Lout);
                 for (size_t i = 0; i < h.size(); i++) h[i] += y[i];
-                (void)t2;
+                if (getenv("T2W_DEBUG") && u == 3)
+                    fprintf(stderr, "t2w: L3 r%d kk%d |t|=%.4f |c1y|=%.4f |y|=%.4f |h|=%.4f\n",
+                            r, kk, fabsf(t[100]), fabsf(y[100]), fabsf(y[500]),
+                            fabsf(h[100]));
             }
             for (size_t i = 0; i < acc.size(); i++) acc[i] += h[i];
+            if (const char * dp = getenv("T2W_BLK_DUMP"); dp && u == 0) {
+                char fn[256]; snprintf(fn, sizeof(fn), "%s_r%d.bin", dp, r);
+                FILE * f = fopen(fn, "wb");
+                if (f) { fwrite(&hc, 4, 1, f); fwrite(&Lout, 4, 1, f);
+                         fwrite(h.data(), 4, h.size(), f); fclose(f); }
+            }
         }
         const float inv = 1.0f / 3.0f;
         for (auto & v : acc) v *= inv;
-        if (getenv("T2W_DEBUG") && u == 0) {
+        if (getenv("T2W_DEBUG")) {
             float mup = 0, mrb = 0;
             for (float v : up) mup = std::max(mup, fabsf(v));
             for (float v : acc) mrb = std::max(mrb, fabsf(v));
@@ -853,6 +953,13 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
                     (int)(rbs[0].c1[0].w.size() / (size_t)(U.oc * U.oc)));
         }
         cur.swap(acc);
+        if (const char * dp = getenv("T2W_LAYER_DUMP")) {
+            char fn[256];
+            snprintf(fn, sizeof(fn), "%s_L%d.bin", dp, (int)u);
+            FILE * f = fopen(fn, "wb");
+            if (f) { fwrite(&cc, 4, 1, f); fwrite(&L, 4, 1, f);
+                     fwrite(cur.data(), 4, cur.size(), f); fclose(f); }
+        }
         cc = U.oc;
         L = Lout;
     }
@@ -860,7 +967,7 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
     std::vector<float> sf((size_t)cc * L);
     if (getenv("T2W_DEBUG")) fprintf(stderr, "t2w: bigvgan pre-snake [%.3f..%.3f]\n",
             *std::min_element(cur.begin(), cur.end()), *std::max_element(cur.begin(), cur.end()));
-    snake_act(cur.data(), cc, L, snake_pre_a, snake_pre_b, sf.data());
+    aa_snake_act(cur.data(), cc, L, snake_pre_a, snake_pre_b, aa_filter, sf.data());
     pcm.assign((size_t)L, 0.0f);
     {
         // post_w is [1, cc, 7] torch layout
@@ -871,7 +978,7 @@ bool Token2Wav::bigvgan_run(const std::vector<float> & mel, int L0, std::vector<
                 const float * xc = sf.data() + (size_t)c * L;
                 const float * wc = post_w.data() + (size_t)c * kw;
                 for (int kk = 0; kk < kw; kk++) {
-                    const int idx = n - kk + kw / 2;
+                    const int idx = n + kk - kw / 2;   // correlation, like torch
                     if (idx >= 0 && idx < L) s += wc[kk] * xc[idx];
                 }
             }

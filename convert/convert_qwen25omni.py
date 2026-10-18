@@ -567,12 +567,16 @@ def convert_talker(weights, gw, cfg, qtype, args):
     for u in range(n_up):
         for r in range(n_rb_per_up):
             for k in range(len(cfg["b_rb_dilations"])):
-                f32(f"bg.rb.{rb}.s1.{k}.alpha", weights.get(f"{B}.resblocks.{rb}.activations.{k}.act.alpha"))
-                f32(f"bg.rb.{rb}.s1.{k}.beta", weights.get(f"{B}.resblocks.{rb}.activations.{k}.act.beta"))
+                # HF pairs iteration k with activations[2k] (before convs1.k)
+                # and activations[2k+1] (before convs2.k): acts1=[::2], acts2=[1::2]
+                f32(f"bg.rb.{rb}.s1.{k}.alpha",
+                    weights.get(f"{B}.resblocks.{rb}.activations.{2 * k}.act.alpha"))
+                f32(f"bg.rb.{rb}.s1.{k}.beta",
+                    weights.get(f"{B}.resblocks.{rb}.activations.{2 * k}.act.beta"))
                 f32(f"bg.rb.{rb}.s2.{k}.alpha",
-                    weights.get(f"{B}.resblocks.{rb}.activations.{3 + k}.act.alpha"))
+                    weights.get(f"{B}.resblocks.{rb}.activations.{2 * k + 1}.act.alpha"))
                 f32(f"bg.rb.{rb}.s2.{k}.beta",
-                    weights.get(f"{B}.resblocks.{rb}.activations.{3 + k}.act.beta"))
+                    weights.get(f"{B}.resblocks.{rb}.activations.{2 * k + 1}.act.beta"))
             rb += 1
 
     # ------------------------------------------------------------ speakers

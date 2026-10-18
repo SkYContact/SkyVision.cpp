@@ -1169,6 +1169,18 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
         if (f) { int n = (int)codec.size(); fwrite(&n, 4, 1, f);
                  fwrite(codec.data(), 4, codec.size(), f); fclose(f); }
     }
+    if (const char * lp = getenv("QOMNI_CODEC_LOAD")) {   // parity: run t2w on
+        FILE * f = fopen(lp, "rb");                        // a reference codec stream
+        if (f) {
+            int n = 0;
+            if (fread(&n, 4, 1, f) == 1 && n > 0 && n < 100000) {
+                codec.resize(n);
+                fread(codec.data(), 4, n, f);
+            }
+            fclose(f);
+            fprintf(stderr, "t2w: loaded %d reference codec tokens\n", (int)codec.size());
+        }
+    }
     std::vector<float> pcm;
     if (!t2w.run(codec, pcm)) {
         fprintf(stderr, "token2wav: synthesis failed\n");
