@@ -909,6 +909,18 @@ bool Qwen25Omni::run_text(TextGraph & g, const std::vector<int> & toks,
                                 sizeof(float) * aud_feats->size());
         ggml_backend_tensor_set(g.aud_pos_in, aud_pos->data(), 0, sizeof(int) * aud_pos->size());
     }
+    if (getenv("QOMNI_DBG_IDX")) {   // read back every index input after upload
+        auto rb = [](ggml_tensor * t, const char * what) {
+            std::vector<int> v((size_t)ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, sizeof(int) * v.size());
+            int mn = v.empty() ? 0 : v[0], mx = mn;
+            for (int x : v) { mn = std::min(mn, x); mx = std::max(mx, x); }
+            fprintf(stderr, "dbg %s: n=%zu min=%d max=%d\n", what, v.size(), mn, mx);
+        };
+        rb(g.tok_in, "tok_in"); rb(g.pos_in, "pos_in"); rb(g.slot_in, "slot_in");
+        if (g.img_pos_in) rb(g.img_pos_in, "img_pos_in");
+        if (g.aud_pos_in) rb(g.aud_pos_in, "aud_pos_in");
+    }
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "text compute failed\n");
         return false;
@@ -973,6 +985,9 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     text += "<|im_end|>\n<|im_start|>assistant\n";
 
     std::vector<int> toks = tok_.encode(text);
+    if (getenv("QOMNI_DBG_IDX"))
+        fprintf(stderr, "dbg ask: n_img=%d n_aud=%d T=%zu grid=%d,%d,%d\n",
+                n_img, n_aud, toks.size(), grid[0], grid[1], grid[2]);
     if ((int)toks.size() + gp.max_tokens + 8 > n_ctx) {
         fprintf(stderr, "prompt %zu + %d tokens exceed n_ctx %d\n", toks.size(), gp.max_tokens, n_ctx);
         return false;
@@ -1007,6 +1022,17 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
                 st++;
             }
         }
+    }
+    // the placeholder tokens MUST all be single special tokens in the loaded
+    // tokenizer: a wrong-but-same-size tokenizer (vocab-probe collision) splits
+    // them, the gather below finds nothing, and the set_rows injection then
+    // reads uninitialized device indices - fail loudly instead
+    if ((n_img > 0 && img_pos.size() != (size_t)n_img) ||
+        (n_aud > 0 && aud_pos.size() != (size_t)n_aud)) {
+        fprintf(stderr, "qwen25omni: soft-token placeholders not found in the tokenizer "
+                        "(img %zu/%d aud %zu/%d) - wrong tokenizer.json for this model\n",
+                img_pos.size(), n_img, aud_pos.size(), n_aud);
+        return false;
     }
 
     const bool want_talker = talker_loaded && gp.speak_wav;

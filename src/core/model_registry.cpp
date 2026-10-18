@@ -165,11 +165,9 @@ std::string ModelRegistry::pick_tokenizer(const std::string & base_dir, const st
     if (dir_ != base_dir && !dir_.empty()) dirs.push_back(dir_);
     // last resort: the arch's canonical checkpoint dir (models/VideoChat3-4B
     // etc.) - covers single ggufs parked anywhere else in the repo
-    {
-        const std::string hint = default_tokenizer_dir(arch);
-        if (!hint.empty())
-            for (const auto & d : dirs) if (d != hint) { dirs.push_back(hint); break; }
-    }
+    std::string hint_dir = default_tokenizer_dir(arch);
+    if (!hint_dir.empty())
+        for (const auto & d : dirs) if (d != hint_dir) { dirs.push_back(hint_dir); break; }
     std::vector<std::string> cands;
     for (const auto & d : dirs) {
         cands.push_back(d + "/" + stem + "/tokenizer.json");   // per-model checkpoint dir
@@ -192,6 +190,19 @@ std::string ModelRegistry::pick_tokenizer(const std::string & base_dir, const st
         if (n == 0) continue;
         const size_t diff = n > target ? n - target : target - n;
         if (diff * 5 <= target) return c;
+    }
+    // the arch's canonical checkpoint dir beats a same-size stranger: total
+    // vocab counts collide across families (moss_vl and qwen25omni both parse
+    // as 151673) while their added-token sets differ - a <|IMAGE|> missing
+    // from the picked tokenizer silently splits the soft-token placeholders
+    // and starves the injection indices (garbage answers + CUDA crash)
+    if (!hint_dir.empty()) {
+        const std::string c = hint_dir + "/tokenizer.json";
+        const size_t n = tokenizer_vocab(c);
+        if (n != 0) {
+            const size_t diff = n > target ? n - target : target - n;
+            if (diff * 5 <= target) return c;
+        }
     }
     size_t best_diff = 0;
     std::string best;

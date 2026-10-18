@@ -104,6 +104,7 @@ struct AudioTower {
 
 private:
     bool build_graph(const AudioGeometry & geo);
+    AudioGeometry geo_cached;        // geometry the current actx/agf were built for
 
     ggml_context * actx = nullptr;
     ggml_cgraph * agf = nullptr;

@@ -69,7 +69,18 @@ MelSpec AudioTower::log_mel(const float * pcm, int n_samples) const {
 // ---------------------------------------------------------------- graph
 
 bool AudioTower::build_graph(const AudioGeometry & geo) {
+    // static-graph discipline (see moss_vl / the text decode graphs): ggml's
+    // CUDA-graph cache keys on cgraph->nodes[0] and replays captured pointers,
+    // so a graph must keep its ctx, allocator and buffer alive for as long as
+    // it may be recomputed. Cache the built graph on the geometry and only
+    // rebuild (freeing the old ctx first) when the shape actually changes.
+    if (actx && geo_cached.cols == geo.cols && geo_cached.T_pad == geo.T_pad &&
+        geo_cached.n_valid == geo.n_valid && geo_cached.n_pool == geo.n_pool)
+        return true;
     if (actx) { ggml_free(actx); actx = nullptr; }
+    if (!allocr)
+        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    geo_cached = geo;
     const int T_pad = geo.T_pad, T2 = geo.cols;
 
     struct ggml_init_params ip = { 256ull * 1024 * 1024, NULL, /*no_alloc*/ true };
