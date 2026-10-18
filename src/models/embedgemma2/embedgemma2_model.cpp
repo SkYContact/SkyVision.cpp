@@ -250,7 +250,8 @@ private:
 
     // vision
     bool preprocess_image(const uint8_t * rgb, int w0, int h0, std::vector<float> & patches,
-                          std::vector<int> & xs, std::vector<int> & ys, int & gw, int & gh);
+                          std::vector<int> & xs, std::vector<int> & ys, int & gw, int & gh,
+                          int max_soft = 0);
     bool build_vision_graph(int P, int n_soft, int B, int pw, int ph);
     bool run_vision(const std::vector<float> & patches, const std::vector<int> & xs,
                     const std::vector<int> & ys, int P, int n_soft, int B, int pw, int ph,
@@ -284,6 +285,7 @@ private:
     // vision hyper
     int v_layer = 16, v_embd = 768, v_head = 12, v_head_dim = 64, v_ff = 3072;
     int v_patch = 16, v_pool = 3, v_pos_table = 10240, v_max_soft = 280, v_resample = 3;
+    int v_max_soft_video = 140;   // video processor uses half the image soft budget
     float v_rope = 100.0f, v_eps = 1e-6f;
     float v_fps = 1.0f;
 
@@ -409,6 +411,7 @@ bool EmbedGemma2::load_weights(const char * path) {
     v_rope = vqa::gguf::f32(gu, "embgemma2.vision.rope.freq_base", v_rope);
     v_eps = vqa::gguf::f32(gu, "embgemma2.vision.layer_norm_rms_epsilon", v_eps);
     v_max_soft = vqa::gguf::u32(gu, "embgemma2.vision.max_soft_tokens", v_max_soft);
+    v_max_soft_video = vqa::gguf::u32(gu, "embgemma2.vision.video_max_soft_tokens", v_max_soft_video);
     v_resample = vqa::gguf::u32(gu, "embgemma2.vision.resize_resample", v_resample);
     v_fps = vqa::gguf::f32(gu, "embgemma2.vision.video_fps", v_fps);
 
@@ -664,10 +667,11 @@ bool EmbedGemma2::load(const std::string & gguf_path, const std::string & tokeni
 // values are 2*(x/255 - 0.5), channel-major within the patch
 bool EmbedGemma2::preprocess_image(const uint8_t * rgb, int w0, int h0,
                                    std::vector<float> & patches, std::vector<int> & xs,
-                                   std::vector<int> & ys, int & gw, int & gh) {
+                                   std::vector<int> & ys, int & gw, int & gh,
+                                   int max_soft) {
     const int P = v_patch, K = v_pool;
     const double total = (double)w0 * h0;
-    const double budget = (double)v_max_soft * K * K * P * P;
+    const double budget = (double)(max_soft > 0 ? max_soft : v_max_soft) * K * K * P * P;
     const double factor = sqrt(budget / total);
     int side_mult = K * P;
     int tw = std::max(1, (int)(factor * w0)) / side_mult * side_mult;
@@ -717,8 +721,10 @@ bool EmbedGemma2::build_vision_graph(int P, int n_soft, int B, int pw, int ph) {
 
     v_patches_in = ggml_new_tensor_3d(vctx, GGML_TYPE_F32, C3, P, B);
     ggml_set_name(v_patches_in, "v_patches");
-    v_xs_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, P);
-    v_ys_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, P);
+    // coordinates repeated per frame (rope walks the P*B token axis); the
+    // position-embedding get_rows reshape turns the same vector into [E, P, B]
+    v_xs_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, P * B);
+    v_ys_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, P * B);
 
     // patchify: x = proj(patches) + pos(x) + pos(y), scaling 2*(x-0.5) done host-side
     ggml_tensor * x = ggml_mul_mat(vctx, v_patch_proj, v_patches_in);   // [E, P, B]
@@ -730,9 +736,9 @@ bool EmbedGemma2::build_vision_graph(int P, int n_soft, int B, int pw, int ph) {
     ggml_tensor * tbl_y = ggml_view_3d(vctx, tbl, tbl->ne[0], tbl->ne[1], 1,
                                        tbl->nb[1], tbl->nb[2], tbl->nb[2]);
     ggml_tensor * pos_x = ggml_cast(vctx,
-        ggml_reshape_3d(vctx, ggml_get_rows(vctx, tbl_x, v_xs_in), E, P, 1), GGML_TYPE_F32);
+        ggml_reshape_3d(vctx, ggml_get_rows(vctx, tbl_x, v_xs_in), E, P, B), GGML_TYPE_F32);
     ggml_tensor * pos_y = ggml_cast(vctx,
-        ggml_reshape_3d(vctx, ggml_get_rows(vctx, tbl_y, v_ys_in), E, P, 1), GGML_TYPE_F32);
+        ggml_reshape_3d(vctx, ggml_get_rows(vctx, tbl_y, v_ys_in), E, P, B), GGML_TYPE_F32);
     x = ggml_add(vctx, x, ggml_add(vctx, pos_x, pos_y));
     ggml_set_name(x, "v_embed");
 
@@ -769,7 +775,9 @@ bool EmbedGemma2::build_vision_graph(int P, int n_soft, int B, int pw, int ph) {
         q = rope_all(q);
         k = rope_all(k);
 
-        // [hd, P, head, B] for flash attention
+        // [hd, P*B, head] for flash attention - the caller runs one frame per
+        // graph (B=1): HF attends per frame, and this fork's cont/permute on
+        // 4D batch layouts miscompiles, so cross-frame batching is avoided
         ggml_tensor * qf = ggml_cont(vctx, ggml_permute(vctx, q, 0, 2, 1, 3));
         ggml_tensor * kf = ggml_cont(vctx, ggml_permute(vctx, k, 0, 2, 1, 3));
         ggml_tensor * vf = ggml_cont(vctx, ggml_permute(vctx, v, 0, 2, 1, 3));
@@ -798,7 +806,7 @@ bool EmbedGemma2::build_vision_graph(int P, int n_soft, int B, int pw, int ph) {
     ggml_build_forward_expand(vgf, x);
 
     if (!dump_dir.empty()) {
-        static const char * const dn[] = { "v_embed", "v_blk0_out", "v_blk1_out", "v_blk2_out",
+        static const char * const dn[] = { "v_patches", "v_embed", "v_blk0_out", "v_blk1_out", "v_blk2_out",
                                            "v_blk3_out", "v_blk7_out", "v_blk15_out",
                                            "v_final", "v_feats", nullptr };
         vqa::dump::mark_sinks(vctx, vgf, dn);
@@ -819,15 +827,22 @@ bool EmbedGemma2::run_vision(const std::vector<float> & patches, const std::vect
         if (!build_vision_graph(P, n_soft, B, pw, ph)) return false;
     }
     ggml_backend_tensor_set(v_patches_in, patches.data(), 0, sizeof(float) * patches.size());
-    ggml_backend_tensor_set(v_xs_in, xs.data(), 0, sizeof(int) * xs.size());
-    ggml_backend_tensor_set(v_ys_in, ys.data(), 0, sizeof(int) * ys.size());   // tbl_y view handles the offset
+    std::vector<int> xs_b, ys_b;   // frame-major: token index b*P + p
+    xs_b.reserve((size_t)P * B);
+    ys_b.reserve((size_t)P * B);
+    for (int b = 0; b < B; b++) {
+        xs_b.insert(xs_b.end(), xs.begin(), xs.end());
+        ys_b.insert(ys_b.end(), ys.begin(), ys.end());
+    }
+    ggml_backend_tensor_set(v_xs_in, xs_b.data(), 0, sizeof(int) * xs_b.size());
+    ggml_backend_tensor_set(v_ys_in, ys_b.data(), 0, sizeof(int) * ys_b.size());
 
     if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vision compute failed\n");
         return false;
     }
     if (!dump_dir.empty() && vis_runs == 0) {
-        static const char * const dn[] = { "v_embed", "v_blk0_out", "v_blk1_out", "v_blk2_out",
+        static const char * const dn[] = { "v_patches", "v_embed", "v_blk0_out", "v_blk1_out", "v_blk2_out",
                                            "v_blk3_out", "v_blk7_out", "v_blk15_out",
                                            "v_final", "v_feats", nullptr };
         for (int i = 0; dn[i]; i++) dump(vgf, dn[i]);
@@ -1398,8 +1413,9 @@ bool EmbedGemma2::embed(const vqa::MediaInput & media, const std::string & text,
             std::vector<float> patches;
             std::vector<int> fx, fy;
             int fgw = 0, fgh = 0;
+            const int soft_budget = (media.kind == vqa::MediaKind::Video) ? v_max_soft_video : 0;
             if (!preprocess_image(media.frames[(size_t)fi].rgb.data(), media.width,
-                                  media.height, patches, fx, fy, fgw, fgh)) return false;
+                                  media.height, patches, fx, fy, fgw, fgh, soft_budget)) return false;
             if (fi == 0) { gw = fgw; gh = fgh; xs = fx; ys = fy; }
             else if (fgw != gw || fgh != gh) { xs.clear(); }
             all_patches.insert(all_patches.end(), patches.begin(), patches.end());
@@ -1408,7 +1424,15 @@ bool EmbedGemma2::embed(const vqa::MediaInput & media, const std::string & text,
         const int P = gw * gh;
         const int n_soft = (gw / v_pool) * (gh / v_pool);
         n_soft_per_frame = n_soft;
-        if (!run_vision(all_patches, xs, ys, P, n_soft, n_frames, gw, gh, vis_soft)) return false;
+        // one frame per graph run: HF attention never crosses frames, and the
+        // batched (B>1) vision graph is not layout-safe on this ggml fork
+        for (int fi = 0; fi < n_frames; fi++) {
+            std::vector<float> frame_patches(all_patches.begin() + (size_t)fi * P * 3 * v_patch * v_patch,
+                                             all_patches.begin() + (size_t)(fi + 1) * P * 3 * v_patch * v_patch);
+            std::vector<float> frame_soft;
+            if (!run_vision(frame_patches, xs, ys, P, n_soft, 1, gw, gh, frame_soft)) return false;
+            vis_soft.insert(vis_soft.end(), frame_soft.begin(), frame_soft.end());
+        }
         fprintf(stderr, "vision: %dx%d -> %dx%d patches, %d soft tokens x %d frame(s)\n",
                 media.width, media.height, gw, gh, n_soft, n_frames);
     }
@@ -1472,7 +1496,10 @@ bool EmbedGemma2::embed(const vqa::MediaInput & media, const std::string & text,
                 if (p != std::string::npos) s.replace(p, marker.size(), rep);
                 else s += (s.empty() ? "" : " ") + rep;
             };
-            if (!vblock.empty()) expand(prompt, "<|video|>", vblock);
+            // for video, `block` holds every frame's soft block concatenated
+            // (vblock is just the first frame's)
+            if (media.kind == vqa::MediaKind::Video && n_soft_per_frame > 0)
+                expand(prompt, "<|video|>", block);
             else if (!block.empty()) expand(prompt, "<|image|>", block);
             if (!ablock.empty()) expand(prompt, "<|audio|>", ablock);
         }

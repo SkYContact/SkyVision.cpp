@@ -156,6 +156,8 @@ def write_metadata(gw, cfg, outtype):
     gw.add_float32("embgemma2.vision.rope.freq_base", float(cfg["v_rope"]))
     gw.add_float32("embgemma2.vision.layer_norm_rms_epsilon", float(cfg["v_eps"]))
     gw.add_uint32("embgemma2.vision.max_soft_tokens", cfg["max_soft_tokens"])
+    gw.add_uint32("embgemma2.vision.video_max_soft_tokens",
+                  int(pconf.get("video_processor", {}).get("max_soft_tokens", 140)))
     gw.add_uint32("embgemma2.vision.resize_resample", cfg["v_resample"])
     gw.add_float32("embgemma2.vision.video_fps", float(cfg["v_fps"]))
 
