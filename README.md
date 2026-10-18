@@ -679,6 +679,8 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
   禁止跨族"统一"浮点行为）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
   `ggml_dump.hpp`（对拍导出）、`sampler.hpp`、`tokenizer.cpp`、`media_io.cpp`。
 - **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/unicode_ranges.inc`。
+- **回归冒烟**：`scripts/smoke.sh` 跑跨后端金标准电池（smolvlm/vc3/moss/qwen3.5 各一条贪婪，CPU
+  + 钉死 `--threads 1` 保证可复现）；`--golden FILE` 对既有金标准逐字节比对。改共享层/做迁移后先跑它。
 
 ## License
 
