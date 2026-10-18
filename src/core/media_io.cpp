@@ -24,6 +24,10 @@
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+#else
+  #include <dirent.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
 #endif
 
 namespace vqa {
@@ -137,9 +141,33 @@ bool load_frame_dir(const std::string & dir, double fps, MediaInput & out) {
     } while (FindNextFileA(hfind, &fd));
     FindClose(hfind);
 #else
-    (void)fps;
-    fprintf(stderr, "frame directories are only supported on Windows for now\n");
-    return false;
+    // POSIX port of the Windows branch above, same semantics: flat
+    // (non-recursive) listing of dir, directories skipped, extension filter
+    // applied to the lowercased name, original-case names collected and
+    // sorted once after the loop. NOTE (待验证): this host has no Linux and
+    // no gcc/WSL, so this branch has NOT been compiled by a POSIX toolchain -
+    // it was only syntax-checked against a POSIX-signature dirent.h shim
+    // (VS clang++). Runtime check lands with the Docker-gcc CI.
+    DIR * d = opendir(dir.c_str());
+    if (!d) {
+        fprintf(stderr, "cannot list frame directory: %s\n", dir.c_str());
+        return false;
+    }
+    struct dirent * e;
+    while ((e = readdir(d)) != nullptr) {
+        struct stat st;
+        if (stat((dir + "/" + e->d_name).c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) continue;   // covers "." and "..", like the Win32 branch
+        std::string name = e->d_name;
+        std::string low = name;
+        for (auto & c : low) c = (char)tolower((unsigned char)c);
+        if (low.size() < 4) continue;
+        if (low.rfind(".png") == low.size() - 4 || low.rfind(".jpg") == low.size() - 4 ||
+            low.rfind(".bmp") == low.size() - 4) {
+            files.push_back(name);
+        }
+    }
+    closedir(d);
 #endif
     if (files.empty()) {
         fprintf(stderr, "no frames in %s\n", dir.c_str());
