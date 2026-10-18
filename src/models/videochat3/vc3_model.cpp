@@ -12,6 +12,7 @@
 //     with 2D rope and full (non causal) attention, final LN, merge, projector.
 #include "vqa.hpp"
 #include "vit_block.hpp"
+#include "llm_block.hpp"
 
 #include <functional>
 #include <array>
@@ -57,13 +58,6 @@ struct VisLayer {
     ggml_tensor *wo_w = nullptr, *wo_b = nullptr;
     ggml_tensor *fc0_w = nullptr, *fc0_b = nullptr;
     ggml_tensor *fc1_w = nullptr, *fc1_b = nullptr;
-};
-
-struct TxtLayer {
-    ggml_tensor *norm = nullptr;
-    ggml_tensor *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
-    ggml_tensor *qn = nullptr, *kn = nullptr;
-    ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
 };
 
 struct TextGraph {
@@ -141,7 +135,7 @@ private:
     std::vector<float> pos_emb_host, pos_time_host;
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr;
-    std::vector<TxtLayer> tl;
+    std::vector<vqa::llm::LayerWeights> tl;   // core/llm_block.hpp
     std::vector<VisLayer> vl;
     ggml_tensor *v_patch_w = nullptr, *v_patch_b = nullptr;
     ggml_tensor *v_final_w = nullptr, *v_final_b = nullptr;
@@ -487,23 +481,20 @@ bool VideoChat3::load_weights(const char * path) {
 
     tl.resize(n_layer);
     for (int i = 0; i < n_layer; i++) {
-        char buf[128];
-        auto g = [&](const char * suffix) {
-            snprintf(buf, sizeof(buf), "blk.%d.%s", i, suffix);
-            return gt(buf);
-        };
-        TxtLayer & L = tl[i];
-        L.norm = g("attn_norm.weight");
-        L.q = g("attn_q.weight");
-        L.k = g("attn_k.weight");
-        L.v = g("attn_v.weight");
-        L.o = g("attn_output.weight");
-        L.qn = g("attn_q_norm.weight");
-        L.kn = g("attn_k_norm.weight");
-        L.ffn_norm = g("ffn_norm.weight");
-        L.gate = g("ffn_gate.weight");
-        L.up = g("ffn_up.weight");
-        L.down = g("ffn_down.weight");
+        vqa::llm::LayerWeights & L = tl[i];
+        vqa::gguf::bind_layer(wctx, "blk.%d", i, {
+            {"attn_norm.weight",   &L.norm},
+            {"attn_q.weight",      &L.q},
+            {"attn_k.weight",      &L.k},
+            {"attn_v.weight",      &L.v},
+            {"attn_output.weight", &L.o},
+            {"attn_q_norm.weight", &L.qn},
+            {"attn_k_norm.weight", &L.kn},
+            {"ffn_norm.weight",    &L.ffn_norm},
+            {"ffn_gate.weight",    &L.gate},
+            {"ffn_up.weight",      &L.up},
+            {"ffn_down.weight",    &L.down},
+        });
     }
 
     vl.resize(vc.n_layer);
@@ -966,99 +957,29 @@ bool VideoChat3::build_text_graph(TextGraph & g, int T, int S, int n_img, bool l
     }
     int max_layers = n_layer;
     if (const char * e = getenv("VC3_MAX_LAYERS")) max_layers = std::min(max_layers, atoi(e));
+    // ---- decoder layer loop: shared vqa::llm::block (core/llm_block.hpp) ----
+    // the layer body below is VideoChat3's original build verbatim (same ops,
+    // same operand order, same node creation order - f16 graphs are sensitive
+    // to adjacent-node reordering); only the t_l0_* names, the fusion toggle
+    // and the cache/mask/position plumbing stay parameterized here.
+    static const bool no_fusion = getenv("VC3_NO_FUSION") != nullptr;
+    vqa::llm::LayerCtx lc;
+    lc.gf = g.gf;
+    lc.pos = g.pos_in;
+    lc.mask = g.mask_in;
+    lc.T = T; lc.S = S;
+    lc.n_head = NH; lc.n_kv_head = NKV; lc.head_dim = HD;
+    lc.n_ctx = n_ctx;
+    lc.rms_eps = rms_eps;
+    lc.rope_theta = rope_theta;
+    lc.bat_groups = bat_groups;
+    lc.bat_masks = bat_groups ? &bat_mask_ts : nullptr;
+    vqa::llm::BlockHooks lh;
+    lh.swiglu_split = !no_fusion;
     for (int il = 0; il < max_layers; il++) {
-        TxtLayer & L = tl[il];
-        ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
-        l = ggml_mul(g.ctx, l, L.norm);
-        if (il == 0) ggml_set_name(l, "t_l0_norm");
-
-        ggml_tensor * q = ggml_mul_mat(g.ctx, L.q, l);
-        ggml_tensor * k = ggml_mul_mat(g.ctx, L.k, l);
-        ggml_tensor * v = ggml_mul_mat(g.ctx, L.v, l);
-        if (il == 0) { ggml_set_name(q, "t_l0_q"); ggml_set_name(k, "t_l0_k"); }
-
-        ggml_tensor * q3 = ggml_reshape_3d(g.ctx, q, HD, NH, T);
-        q3 = ggml_rms_norm(g.ctx, q3, rms_eps);
-        q3 = ggml_mul(g.ctx, q3, L.qn);
-        ggml_tensor * k3 = ggml_reshape_3d(g.ctx, k, HD, NKV, T);
-        k3 = ggml_rms_norm(g.ctx, k3, rms_eps);
-        k3 = ggml_mul(g.ctx, k3, L.kn);
-        if (il == 0) { ggml_set_name(q3, "t_l0_q_norm"); ggml_set_name(k3, "t_l0_k_norm"); }
-
-        q3 = ggml_rope_ext(g.ctx, q3, g.pos_in, nullptr, HD, GGML_ROPE_TYPE_NEOX, n_ctx,
-                           rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_ext(g.ctx, k3, g.pos_in, nullptr, HD, GGML_ROPE_TYPE_NEOX, n_ctx,
-                           rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (il == 0) { ggml_set_name(q3, "t_l0_q_rope"); ggml_set_name(k3, "t_l0_k_rope"); }
-
-        ggml_tensor * k2 = ggml_reshape_2d(g.ctx, k3, NKV * HD, T);
-        ggml_tensor * v2 = ggml_reshape_2d(g.ctx, v, NKV * HD, T);
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[il], k2, g.pos_in));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[il], v2, g.pos_in));
-
-        // q3 is [HD, NH, T]; flash attention wants [HD, n_q, n_head], so swap the
-        // two trailing strides. The KV cache is [NKV*HD, n_ctx]: one position is
-        // NKV*HD halves and one head inside it is HD halves.
-        ggml_tensor * fa = nullptr;
-        if (bat_groups) {
-            // batch layout: each group is one sequence with its own KV window
-            // view at its own base - attention work scales with the window, not
-            // with n_ctx (the old single masked FA swept all 8192 slots for
-            // every column, 7/8 of it masked-off garbage)
-            for (size_t gi = 0; gi < bat_groups->size(); gi++) {
-                const auto & gr = (*bat_groups)[gi];
-                const int cs = gr[0], cc = gr[1], cbase = gr[2];
-                // FA's CUDA kernels want the KV/mask width 32-aligned; pad the
-                // window and hide the tail slots with the mask
-                int cwin = (gr[3] + 31) & ~31;
-                if (cbase + cwin > n_ctx) cwin = n_ctx - cbase;
-                ggml_tensor * qs = ggml_view_3d(g.ctx, q3, HD, NH, cc, q3->nb[1], q3->nb[2],
-                                                (size_t)cs * q3->nb[2]);
-                ggml_tensor * qfs = ggml_view_3d(g.ctx, qs, HD, cc, NH, qs->nb[2], qs->nb[1], 0);
-                ggml_tensor * kfs = ggml_view_3d(g.ctx, kv.k[il], HD, cwin, NKV,
-                                                 kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t),
-                                                 (size_t)cbase * kv.k[il]->nb[1]);
-                ggml_tensor * vfs = ggml_view_3d(g.ctx, kv.v[il], HD, cwin, NKV,
-                                                 kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t),
-                                                 (size_t)cbase * kv.v[il]->nb[1]);
-                // NOTE: look the mask up by NAME only at input-set time; inside
-                // the build the tensors are not graph members yet, so use the
-                // pre-created pointer directly
-                ggml_tensor * ms = bat_mask_ts[gi];
-                ggml_tensor * fs = ggml_flash_attn_ext(g.ctx, qfs, kfs, vfs, ms,
-                                                       1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-                fa = fa ? ggml_concat(g.ctx, fa, fs, 1) : fs;
-            }
-        } else {
-        ggml_tensor * qf = ggml_view_3d(g.ctx, q3, HD, T, NH, q3->nb[2], q3->nb[1], 0);
-        ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[il], HD, S, NKV,
-                                        kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[il], HD, S, NKV,
-                                        kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * fa2 = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
-                                               1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-        fa = fa2;
-        }
-        ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
-        if (il == 0) ggml_set_name(attn, "t_l0_attn");
-        attn = ggml_mul_mat(g.ctx, L.o, attn);
-        x = ggml_add(g.ctx, x, attn);
-        if (il == 0) ggml_set_name(x, "t_l0_resid");
-
-        ggml_tensor * m = ggml_rms_norm(g.ctx, x, rms_eps);
-        m = ggml_mul(g.ctx, m, L.ffn_norm);
-        ggml_tensor * gate = ggml_mul_mat(g.ctx, L.gate, m);
-        ggml_tensor * up = ggml_mul_mat(g.ctx, L.up, m);
-        static const bool no_fusion = getenv("VC3_NO_FUSION") != nullptr;
-        if (no_fusion) {
-            m = ggml_mul(g.ctx, ggml_silu(g.ctx, gate), up);          // silu(gate) * up
-        } else {
-            m = ggml_swiglu_split(g.ctx, gate, up);                   // fused, no intermediate
-        }
-        if (il == 0) ggml_set_name(m, "t_l0_swiglu");
-        m = ggml_mul_mat(g.ctx, L.down, m);
-        x = ggml_add(g.ctx, x, m);
-        if (il == 0) ggml_set_name(x, "t_l0_out");
+        lc.k_cache = kv.k[il];
+        lc.v_cache = kv.v[il];
+        x = vqa::llm::block(g.ctx, x, il, tl[il], lc, lh);
     }
 
     x = ggml_rms_norm(g.ctx, x, rms_eps);
