@@ -83,10 +83,16 @@ def main():
     gw = gguf.GGUFWriter(args.out, "moondream3-vision")   # GGUFWriter writes general.architecture
     gw.add_name("moondream3.1-9B-A2B-vision")
     gw.add_file_type(gguf.LlamaFileType.MOSTLY_F16)
-    gw.add_uint32(gguf.Keys.LLM.BLOCK_COUNT, N_LAYERS)
-    gw.add_uint32(gguf.Keys.LLM.EMBEDDING_LENGTH, ENC_DIM)
-    gw.add_uint32(gguf.Keys.LLM.FEED_FORWARD_LENGTH, FF_DIM)
-    gw.add_uint32(gguf.Keys.Attention.HEAD_COUNT, N_HEADS)
+    # Same gguf-py Keys trap as convert_hf_to_gguf.py: the constants are
+    # "{arch}.*" format templates; without .format() they are written as a
+    # literal "{arch}.block_count" key (the in-tree vision gguf carries them).
+    def key(t):
+        return t.format(arch="moondream3-vision")
+
+    gw.add_uint32(key(gguf.Keys.LLM.BLOCK_COUNT), N_LAYERS)
+    gw.add_uint32(key(gguf.Keys.LLM.EMBEDDING_LENGTH), ENC_DIM)
+    gw.add_uint32(key(gguf.Keys.LLM.FEED_FORWARD_LENGTH), FF_DIM)
+    gw.add_uint32(key(gguf.Keys.Attention.HEAD_COUNT), N_HEADS)
     # vision-specific keys (custom)
     v = "moondream3.vision."
     gw.add_uint32(v + "enc_dim", ENC_DIM)

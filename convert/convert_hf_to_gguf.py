@@ -91,25 +91,35 @@ def main():
             t = t.view(torch.uint8)
         return t.contiguous().numpy()
 
-    gw = gguf.GGUFWriter(out_path, "moondream3")   # GGUFWriter writes general.architecture
+    arch = "moondream3"
+    gw = gguf.GGUFWriter(out_path, arch)   # GGUFWriter writes general.architecture
     gw.add_file_type(gguf.LlamaFileType.MOSTLY_Q6_K if args.q6 else
                      gguf.LlamaFileType.MOSTLY_Q4_K_M if args.q4 else
                      gguf.LlamaFileType.MOSTLY_Q8_0)
     gw.add_name("moondream3.1-9B-A2B")
 
+    # gguf-py's Keys constants are "{arch}.*" format templates, not literals.
+    # Used without .format(arch=...) they land in the gguf as a literal
+    # "{arch}.block_count" key (every moondream3 text/vision gguf converted
+    # before this fix carries them; the engine only survived because its
+    # loader falls back to hardcoded per-architecture struct defaults and
+    # vram_guard probes the "{arch}" prefix explicitly).
+    def key(t):
+        return t.format(arch=arch)
+
     k = gguf.Keys
-    gw.add_uint32(k.LLM.BLOCK_COUNT, N_LAYERS)
-    gw.add_uint32(k.LLM.EMBEDDING_LENGTH, DIM)
-    gw.add_uint32(k.LLM.FEED_FORWARD_LENGTH, FF)
-    gw.add_uint32(k.Attention.HEAD_COUNT, N_HEADS)
-    gw.add_uint32(k.Attention.HEAD_COUNT_KV, N_KV_HEADS)
-    gw.add_uint32(k.LLM.CONTEXT_LENGTH, 32768)
-    gw.add_uint32(k.LLM.VOCAB_SIZE, VOCAB)
-    gw.add_float32(k.Rope.FREQ_BASE, ROPE_THETA)
-    gw.add_uint32(k.LLM.EXPERT_COUNT, N_EXPERTS)
-    gw.add_uint32(k.LLM.EXPERT_USED_COUNT, N_USED)
-    gw.add_uint32(k.LLM.EXPERT_FEED_FORWARD_LENGTH, INTER)
-    gw.add_uint32(k.LLM.LEADING_DENSE_BLOCK_COUNT, N_DENSE)
+    gw.add_uint32(key(k.LLM.BLOCK_COUNT), N_LAYERS)
+    gw.add_uint32(key(k.LLM.EMBEDDING_LENGTH), DIM)
+    gw.add_uint32(key(k.LLM.FEED_FORWARD_LENGTH), FF)
+    gw.add_uint32(key(k.Attention.HEAD_COUNT), N_HEADS)
+    gw.add_uint32(key(k.Attention.HEAD_COUNT_KV), N_KV_HEADS)
+    gw.add_uint32(key(k.LLM.CONTEXT_LENGTH), 32768)
+    gw.add_uint32(key(k.LLM.VOCAB_SIZE), VOCAB)
+    gw.add_float32(key(k.Rope.FREQ_BASE), ROPE_THETA)
+    gw.add_uint32(key(k.LLM.EXPERT_COUNT), N_EXPERTS)
+    gw.add_uint32(key(k.LLM.EXPERT_USED_COUNT), N_USED)
+    gw.add_uint32(key(k.LLM.EXPERT_FEED_FORWARD_LENGTH), INTER)
+    gw.add_uint32(key(k.LLM.LEADING_DENSE_BLOCK_COUNT), N_DENSE)
     # moondream3 specifics (custom keys)
     gw.add_uint32("moondream3.moe_start_layer", MOE_START)
     gw.add_bool("moondream3.tau_attention", True)
