@@ -163,6 +163,8 @@ private:
     ggml_tensor *v_idx_in = nullptr, *v_idx_out = nullptr;
     ggml_tensor *v_feats = nullptr;
     ggml_tensor *v_patch_sink = nullptr;   // guards the patch-embed dump read
+    ggml_context * v_dump_ctx2 = nullptr, * v_dump_ctx3 = nullptr;   // layer-0 probes
+    ggml_tensor * v_probe0 = nullptr, * v_probe1 = nullptr, * v_probe2 = nullptr;
     std::vector<std::string> v_layer_files;      // per-layer hidden dump paths
     ggml_context * v_dump_ctx = nullptr;         // persistent dump buffers (the
     ggml_backend_buffer_t v_dump_alloc = nullptr;// gallocr pool reuses dup sinks)
@@ -543,6 +545,20 @@ bool Qwen25Omni::build_vision_graph(int gh, int gw) {
     }
     x = ggml_mul_mat(vctx, v_patch_w, x);               // [v_embd, N]
     ggml_set_name(x, "v_patch_out");
+    if (getenv("QOMNI_VB0_DUMP")) {   // layer-0 bisection probes (persistent
+        v_dump_ctx2 = v_dump_ctx2 ? v_dump_ctx2 : ggml_init(   // buffer trick)
+            { (size_t)8 * ggml_tensor_overhead(), NULL, true });
+        if (!v_probe0) {
+            v_probe0 = ggml_new_tensor_2d(v_dump_ctx2, GGML_TYPE_F32, v_embd, N);
+            v_probe1 = ggml_new_tensor_1d(v_dump_ctx2, GGML_TYPE_I32, N);
+            ggml_backend_alloc_ctx_tensors(v_dump_ctx2, backend);
+            std::vector<int> r(N);
+            for (int i = 0; i < N; i++) r[i] = i;
+            ggml_backend_tensor_set(v_probe1, r.data(), 0, sizeof(int) * N);
+        }
+        ggml_build_forward_expand(vgf, ggml_set_rows(vctx, v_probe0,
+            ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N), v_probe1));
+    }
     if (getenv("QOMNI_VPATCH_DUMP")) {   // dup: the bare buffer gets reused
         v_patch_sink = ggml_dup(vctx, x);
         ggml_build_forward_expand(vgf, v_patch_sink);
@@ -605,6 +621,13 @@ bool Qwen25Omni::build_vision_graph(int gh, int gw) {
         attn = ggml_add(vctx, attn, L.bo);
         x = ggml_add(vctx, x, attn);
         if (il == 0) ggml_set_name(x, "v_blk0_attn_out");
+        if (il == 0 && getenv("QOMNI_VB0_DUMP")) {
+            v_dump_ctx3 = ggml_init({ (size_t)4 * ggml_tensor_overhead(), NULL, true });
+            v_probe2 = ggml_new_tensor_2d(v_dump_ctx3, GGML_TYPE_F32, v_embd, N);
+            ggml_backend_alloc_ctx_tensors(v_dump_ctx3, backend);
+            ggml_build_forward_expand(vgf, ggml_set_rows(vctx, v_probe2,
+                ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N), v_probe1));
+        }
 
         h = ggml_rms_norm(vctx, x, v_eps);
         h = ggml_mul(vctx, h, L.ln2);
@@ -664,6 +687,17 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
         if (f) { int r = 1, c = (int)patches.size();
                  fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
                  fwrite(patches.data(), 4, patches.size(), f); fclose(f); }
+    }
+    std::vector<float> patches_ov;
+    if (const char * lp = getenv("QOMNI_VIN_LOAD")) {   // parity: exact HF pixels
+        FILE * f = fopen(lp, "rb");
+        if (f) {
+            patches_ov.resize(patches.size());
+            if (fread(patches_ov.data(), 4, patches_ov.size(), f) == patches_ov.size())
+                const_cast<std::vector<float> &>(patches) = patches_ov;
+            else fprintf(stderr, "vin load size mismatch\n");
+            fclose(f);
+        }
     }
     ggml_backend_tensor_set(v_in, patches.data(), 0, sizeof(float) * patches.size());
 
@@ -746,6 +780,18 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
                  fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
     }
     v_layer_files.clear();
+    if (v_probe0) {
+        auto wr = [&](ggml_tensor * t, const char * fn) {
+            std::vector<float> hv((size_t)ggml_nelements(t));
+            ggml_backend_tensor_get(t, hv.data(), 0, sizeof(float) * hv.size());
+            FILE * f = fopen(fn, "wb");
+            if (f) { int r = v_embd, c = N;
+                     fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
+                     fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
+        };
+        wr(v_probe0, "vb0_patch.bin");
+        if (v_probe2) wr(v_probe2, "vb0_attn.bin");
+    }
     if (v_patch_sink) {
         const char * dp = getenv("QOMNI_VPATCH_DUMP");
         ggml_tensor * pe = v_patch_sink;
