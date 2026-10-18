@@ -17,5 +17,6 @@ Model * create_videomae();
 Model * create_qwen2vl();
 Model * create_smolvlm();
 Model * create_mage_vl();
+Model * create_qwen25omni();
 
 }  // namespace vqa

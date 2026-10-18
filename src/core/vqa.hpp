@@ -27,8 +27,14 @@ struct MediaInput {
     std::vector<Frame> frames;                       // 1 for images, N for video
     double fps = 0.0;                                // video only (0 if unknown)
     std::vector<double> timestamps;                  // seconds, one per frame (video)
+    // optional audio track: mono float PCM at sample_rate (16 kHz when it comes
+    // from load_audio). Qwen2.5-Omni style - a model consumes either frames,
+    // audio, or both.
+    std::vector<float> audio;
+    int sample_rate = 0;
 
     bool empty() const { return frames.empty(); }
+    bool has_audio() const { return !audio.empty() && sample_rate > 0; }
 };
 
 struct GenParams {
@@ -47,6 +53,9 @@ struct GenParams {
     // markers), prepended verbatim before the new user turn. Backends without
     // multi-turn support ignore it.
     std::string history;
+    // speech output (qwen2.5-omni talker): write 24 kHz wav here when set.
+    // Backends without a talker ignore it.
+    const char * speak_wav = nullptr;
 };
 
 // Candidate scoring: a "System One" video model does not decode an answer, it

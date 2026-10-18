@@ -89,7 +89,7 @@ int main(int argc, char ** argv) {
     }
 #endif
 
-    std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, ask_text, mode, arch_override, batch_path,
+    std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, audio_path, speak_wav, ask_text, mode, arch_override, batch_path,
                 dump_dir, vision_path, region_path, score_path;
     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f, threshold = 0.0f;
@@ -113,6 +113,8 @@ int main(int argc, char ** argv) {
         else if (a == "--frames") frames_dir = next("--frames");
         else if (a == "--fps") fps = (float)atof(next("--fps"));
         else if (a == "--video") video_path = next("--video");
+        else if (a == "--audio") audio_path = next("--audio");
+        else if (a == "--speak") speak_wav = next("--speak");
         else if (a == "--max-frames") max_frames = atoi(next("--max-frames"));
         else if (a == "--serve") { serve_port = atoi(next("--serve")); if (serve_port <= 0) serve_port = 8899; }
         else if (a == "--host") serve_host = next("--host");
@@ -222,9 +224,13 @@ int main(int argc, char ** argv) {
     } else if (!frames_dir.empty()) {
         if (!vqa::load_frame_dir(frames_dir, fps, media)) return 4;
     }
-    if (media.empty() && ask_text.empty() && batch_path.empty() && score_path.empty()) { usage(); return 2; }
+    if (!audio_path.empty()) {
+        if (!vqa::load_audio(audio_path, media)) return 4;
+    }
+    if (media.empty() && !media.has_audio() && ask_text.empty() && batch_path.empty() && score_path.empty()) { usage(); return 2; }
 
     vqa::GenParams gp;
+    if (!speak_wav.empty()) gp.speak_wav = speak_wav.c_str();
     gp.max_tokens = max_tokens;
     gp.temperature = temp;
     gp.top_k = top_k;

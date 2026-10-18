@@ -26,4 +26,8 @@ bool load_frame_dir(const std::string & dir, double fps, MediaInput & out);
 // ffmpeg-pipe video decode (uses FFMPEG or ffmpeg from PATH)
 bool load_video_file(const std::string & path, double fps, int max_frames, MediaInput & out);
 
+// Decode any ffmpeg-readable audio file (wav/mp3/flac/m4a/ogg) to mono 16 kHz
+// float PCM in MediaInput::audio (video_pipe.cpp owns the ffmpeg pipe).
+bool load_audio(const std::string & path, MediaInput & out);
+
 }  // namespace vqa

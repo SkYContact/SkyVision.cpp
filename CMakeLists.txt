@@ -133,6 +133,13 @@ set(VIDEOMAE_SRC
 set(QWEN2VL_SRC
     src/models/qwen2vl/qwen2vl_model.cpp)
 
+#   src/models/qwen25omni/   Qwen2.5-Omni thinker (Qwen2.5 trunk + VL tower + Whisper audio)
+set(QWEN25OMNI_SRC
+    src/models/qwen25omni/qwen25omni_model.cpp
+    src/models/qwen25omni/qwen25omni_audio.cpp
+    src/models/qwen25omni/qwen25omni_talker.cpp
+    src/models/qwen25omni/qwen25omni_t2w.cpp)
+
 #   src/models/smolvlm/      SmolVLM / Idefics3 backend (SigLIP + SmolLM2)
 set(SMOLVLM_SRC
     src/models/smolvlm/smolvlm_model.cpp)
@@ -156,9 +163,10 @@ add_executable(vqa-cli
     ${VIDEOMAE_SRC}
     ${QWEN2VL_SRC}
     ${SMOLVLM_SRC}
-    ${MAGE_VL_SRC})
+    ${MAGE_VL_SRC}
+    ${QWEN25OMNI_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC})
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
 
 # --- vision encoder test target (milestone 6) ---
 add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)

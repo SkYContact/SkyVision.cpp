@@ -153,4 +153,39 @@ bool load_video_file(const std::string & path, double fps, int max_frames, Media
     return true;
 }
 
+
+// Decode any ffmpeg-readable audio file to mono 16 kHz float PCM. The models
+// that take audio (Qwen2.5-Omni) expect exactly this rate, so it is baked in
+// here rather than spread over call sites.
+bool load_audio(const std::string & path, MediaInput & out) {
+    const std::string ffmpeg = find_ffmpeg();
+    if (ffmpeg.empty()) {
+        fprintf(stderr, "ffmpeg not found (install it or set FFMPEG=<path>)\n");
+        return false;
+    }
+#ifdef _WIN32
+    std::string cmd = "\"\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -i \"" + path +
+                      "\" -ac 1 -ar 16000 -f f32le -\"";
+#else
+    std::string cmd = "\"" + ffmpeg + "\" -nostdin -hide_banner -loglevel error -i \"" + path +
+                      "\" -ac 1 -ar 16000 -f f32le -";
+#endif
+    FILE * p = popen(cmd.c_str(), "r");
+    if (!p) { fprintf(stderr, "cannot spawn ffmpeg (errno %d)\n", errno); return false; }
+    std::vector<float> pcm;
+    float buf[8192];
+    size_t n;
+    while ((n = fread(buf, sizeof(float), 8192, p)) > 0)
+        pcm.insert(pcm.end(), buf, buf + n);
+    const int rc = pclose(p);
+    if (rc != 0 || pcm.empty()) {
+        fprintf(stderr, "audio decode failed (%s)\n", path.c_str());
+        return false;
+    }
+    out.audio = std::move(pcm);
+    out.sample_rate = 16000;
+    fprintf(stderr, "audio: %s -> %.1f s @ 16 kHz\n", path.c_str(), out.audio.size() / 16000.0);
+    return true;
+}
+
 }  // namespace vqa

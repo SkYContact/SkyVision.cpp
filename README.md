@@ -27,6 +27,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 | **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
 | **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
+| **Qwen2.5-Omni（3B）** | `qwen25omni` | 图像 + 音频输入，文本 + 语音输出 | 全功能 thinker-talker：Qwen2.5 文本主干（untied lm_head）+ Qwen2.5-VL 视觉塔（与 `qwen2vl` 同款窗口注意力图）+ Whisper 系音频塔（128-bin log-mel、**n_window=100 分块卷积+分块注意力**、25 token/s）→ **Talker**（24 层双轨 LM：文本轨吃 thinker 隐状态，输出 25Hz codec token）→ **Token2Wav**（flow-matching DiT，RK4×10 步 + CFG + sway 采样；BigVGAN v2 抗锯齿激活，纯 C++ 宿主实现）。音频输入走 `--audio`（ffmpeg 解码 16k mono）。参考实现：llama.cpp PR #13784（thinker）+ HF transformers 5.20 官方源码（全部语义基准），mel/音频塔与官方逐位对齐 |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 
 ## 当前状态
@@ -561,3 +562,37 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
 ## License
 
 MIT，见 [LICENSE](LICENSE)。ggml 为 MIT（ggml-org）。模型权重与 tokenizer 遵循其各自条款，单独下载。
+
+
+### Qwen2.5-Omni
+
+```bash
+python convert/convert_qwen25omni.py --src models/qwen25omni/hf --out-type f16 --vision-f32
+# → qwen25omni-f16.gguf（thinker，9.4GB）+ qwen25omni-talker-f16.gguf（talker+token2wav+音色，2GB）
+vqa-cli --model qwen25omni-f16.gguf --tokenizer models/qwen25omni/hf \
+        --image photo.jpg --audio clip.wav --ask "What is shown?" \
+        --speak reply.wav          # 语音输出（24kHz wav，默认音色 Chelsie）
+```
+
+thinker 侧：文本主干走 QWEN2VL 同构图（注意 lm_head **不 tied**，转换器写 `t.output.weight`）；
+音频塔与原味 whisper 的三点差异都按 HF 5.20 官方实现复刻——mel 按 n_window×2=200 帧分块后
+**逐块独立卷积**（ggml 侧用 4 零列 + conv1 后零化边界两列精确复现）、块内注意力、帧对 (2i, 2i+1)
+平均池化（floor 语义，奇尾帧丢弃）。`ggml_conv_1d` 的三要素（kernel 字节 = torch [OC,IC,K] 原样、
+数据通道连续、输出 [T,C] 且 bias 在转置后加）在 `qwen25omni_audio.cpp` 顶部有完整注释。
+
+talker 侧：预填只有 3 个位置（[h0+e0, bos+codec_pad, h1+e1+codec_bos]），prompt 只通过 rope 绝对
+偏移起作用；codec 采样 temp 0.9 / top-k 40 / top-p 0.8 / 重复惩罚 1.05。Token2Wav 的 DiT 走 ggml 图
+（AdaLN-zero、block=24 分块注意力 mask、RoPE），BigVGAN 与 ECAPA 说话人塔是宿主 C++（抗锯齿激活的
+分组 FIR 没有 ggml 算子；kaiser 滤波器按 HF 公式现算）。已知差距：语音数值尚未与 HF 对齐（HF 的
+token2wav 在 CPU bf16 下有 dtype 问题，参考输出待补），音量偏小，BigVGAN 的 snake/fir 语义值得用
+官方 fp32 权重再核对一遍。
+
+量化版：
+
+| 精度 | thinker / talker | 验证 | 用法 |
+|---|---|---|---|
+| q8_0 | 5.64 GB / 1.66 GB | 与 ggml-org 官方 Q8_0 **逐张量 bit 级一致**；答案与 f16 相同，logits corr 0.9991；音频塔 corr 0.9993 | CPU 全功能（含 `--speak`）；6G 卡放不下 |
+| q4_0 | 3.63 GB / 1.50 GB | 答案与 f16 相同，logits corr 0.9511 | **6G 卡全功能**：QA 加 `QOMNI_NO_TALKER=1 --n-ctx 4096`；文本→语音整链也能全在卡上跑；QA+语音同跑超 6G 显存 |
+
+GPU 上所有"宿主直读权重"的位置（mel 滤波器、BigVGAN/ECAPA/spk）都必须走
+`ggml_backend_tensor_get`——GPU 上 `t->data` 是空指针，`tensor_to_f32` 直读必崩。

@@ -97,6 +97,10 @@ const ArchEntry kArchs[] = {
     // (mage-gate-f16.gguf) sits next to the model gguf and loads when present
     { { "mage_vl", nullptr }, create_mage_vl,
       TokenizerMode::Qwen2Regex, "models/Mage-VL", 151936, false, false },
+    // Qwen2.5-Omni thinker: Qwen2.5 trunk + Qwen2.5-VL tower + Whisper audio;
+    // the talker gguf (speech output) is an optional sibling of the gguf
+    { { "qwen25omni", "qwen2_5_omni", nullptr }, create_qwen25omni,
+      TokenizerMode::Qwen2Regex, "", 151936, false, false },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {
