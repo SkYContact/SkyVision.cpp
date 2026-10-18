@@ -336,6 +336,28 @@ std::string read_file(const std::string & p) {
     return out;
 }
 
+// minimal standard base64 (with padding) - used to ship the talker's wav
+// back to the omni web page inside a JSON field, no dependency needed
+std::string base64(const std::string & in) {
+    static const char * tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i+1] << 8) | (unsigned char)in[i+2];
+        out += tbl[(v >> 18) & 63]; out += tbl[(v >> 12) & 63];
+        out += tbl[(v >> 6) & 63];  out += tbl[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        const unsigned v = (unsigned char)in[i] << 16;
+        out += tbl[(v >> 18) & 63]; out += tbl[(v >> 12) & 63]; out += "==";
+    } else if (i + 2 == in.size()) {
+        const unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i+1] << 8);
+        out += tbl[(v >> 18) & 63]; out += tbl[(v >> 12) & 63]; out += tbl[(v >> 6) & 63]; out += '=';
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- models
 // Discovery and the single-resident model slot live in core/model_registry.cpp,
 // shared with the MCP front end: one place decides which GGUFs are runnable and
@@ -473,6 +495,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             for (unsigned char ch : req.body) { ukey ^= ch; ukey *= 1099511628211ull; }
             ukey ^= (uint64_t)req.body.size() ^ (kind == "video" ? 0x9e3779b97f4a7c15ull : 0);
             const bool want_video = (kind == "video");
+            const bool want_audio = (kind == "audio");   // ffmpeg pipe -> 16 kHz mono PCM
+            if (want_audio) ukey ^= 0xc2b2ae3d27d4eb4full;   // audio must not hit the image cache slot
             double fps_d = 0; int mf_i = 0;
             if (want_video) {
                 fps_d = atof(query_param(req.query, "fps").c_str());
@@ -491,6 +515,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                     if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
                     ok = vqa::load_video_file(tmp, fps_d, mf_i, media);
                     remove(tmp.c_str());
+                } else if (want_audio) {
+                    std::string tmp = "serve_upload.tmp";
+                    FILE * f = fopen(tmp.c_str(), "wb");
+                    if (f) { fwrite(req.body.data(), 1, req.body.size(), f); fclose(f); }
+                    ok = vqa::load_audio(tmp, media);
+                    remove(tmp.c_str());
                 } else {
                     ok = vqa::load_image_from_memory(req.body, media);
                 }
@@ -499,7 +529,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             if (!req.body.empty() && !ok) {
                 if (stream) {
                     send_stream_head(c, "application/x-ndjson");
-                    send_chunk_str(c, "{\"error\":\"media decode failed (video needs ffmpeg; check FFMPEG)\"}\n");
+                    send_chunk_str(c, "{\"error\":\"media decode failed (video/audio needs ffmpeg; check FFMPEG)\"}\n");
                     send_stream_end(c);
                 } else send_error(c, "media decode failed");
                 return true;
@@ -507,6 +537,15 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             vqa::GenParams gp;
             gp.max_tokens = atoi(query_param(req.query, "n").c_str());
             if (gp.max_tokens <= 0) gp.max_tokens = 256;
+            // speech output (?speak=1): only for audio-capable backends that
+            // loaded a talker; the wav lands in serve_speak.wav next to the exe
+            const char * speak_path = nullptr;
+            if (query_param(req.query, "speak") == "1" && g_reg.loaded() &&
+                g_reg.loaded()->caps().audio) {
+                speak_path = "serve_speak.wav";
+                remove(speak_path);   // never serve a stale file from an earlier turn
+            }
+            gp.speak_wav = speak_path;
             std::string q = query_param(req.query, "q");
             std::string mode = query_param(req.query, "mode");
             if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
@@ -608,16 +647,26 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 else send_error(c, "inference failed");
                 return true;
             }
+            // collect the talker's wav (if any) and ship it base64 inside the
+            // final event / final JSON; a missing or empty file is not an error
+            std::string wav_b64;
+            if (speak_path) {
+                std::string w = read_file(speak_path);
+                remove(speak_path);
+                if (!w.empty()) wav_b64 = base64(w);
+            }
             if (stream) {
                 // whole-result skills (detect/point/gaze) never emit token
                 // events — deliver the text as one final event so the page
                 // isn't left with an empty string ("未检测到目标")
                 if (!sent_any && !out.empty())
                     send_chunk_str(c, std::string("{\"t\":\"") + json_escape(out) + "\"}\n");
-                send_chunk_str(c, "{\"done\":true}\n");
+                send_chunk_str(c, wav_b64.empty() ? "{\"done\":true}\n"
+                    : "{\"wav\":\"" + wav_b64 + "\",\"done\":true}\n");
                 send_stream_end(c);
             }
-            else send_json(c, "{\"text\":\"" + json_escape(out) + "\"}");
+            else send_json(c, wav_b64.empty() ? "{\"text\":\"" + json_escape(out) + "\"}"
+                : "{\"text\":\"" + json_escape(out) + "\",\"wav\":\"" + wav_b64 + "\"}");
             if (!sess.empty() && !q.empty())
                 sessions[sess].push_back({q, out});   // remember the turn
             return true;

@@ -101,7 +101,7 @@ const ArchEntry kArchs[] = {
     // Qwen2.5-Omni thinker: Qwen2.5 trunk + Qwen2.5-VL tower + Whisper audio;
     // the talker gguf (speech output) is an optional sibling of the gguf
     { { "qwen25omni", "qwen2_5_omni", nullptr }, create_qwen25omni,
-      TokenizerMode::Qwen2Regex, "", 151936, false, false, "" },
+      TokenizerMode::Qwen2Regex, "models/Qwen2.5-Omni-3B", 151936, false, false, "omni.html" },
     // EmbeddingGemma-2: bidirectional text encoder (PLE) + Gemma4 vision/audio
     // towers fused as soft tokens; embedding output via Model::embed
     { { "embgemma2", nullptr }, create_embedgemma2,
