@@ -30,6 +30,7 @@
 #include "gguf.h"
 #include "gguf_util.hpp"
 #include "load_util.hpp"
+#include "llm_block.hpp"
 #include "resample.hpp"
 #include "sampler.hpp"
 #include "weight_load.hpp"
@@ -44,11 +45,6 @@
 #include <vector>
 
 namespace smolvlm {
-
-struct TxtLayer {
-    ggml_tensor *norm = nullptr, *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr;
-    ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-};
 
 struct VisLayer {
     ggml_tensor *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr;
@@ -124,7 +120,7 @@ private:
     ggml_gallocr_t allocr = nullptr;
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr, *lm_head = nullptr;
-    std::vector<TxtLayer> tl;
+    std::vector<vqa::llm::LayerWeights> tl;   // core/llm_block.hpp
 
     ggml_tensor *v_patch_w = nullptr, *v_patch_b = nullptr, *v_pos = nullptr;
     ggml_tensor *v_post_w = nullptr, *v_post_b = nullptr, *v_proj = nullptr;
@@ -235,12 +231,12 @@ bool SmolVLM::load_weights(const char * path) {
     for (int i = 0; i < n_layer; i++) {
         char b[96];
         auto g = [&](const char * suf) { snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf); return gt(b); };
-        TxtLayer & L = tl[(size_t)i];
+        vqa::llm::LayerWeights & L = tl[(size_t)i];   // qn/kn stay null: no per-head norms
         L.norm = g("attn_norm.weight");
-        L.wq = g("wq.weight"); L.wk = g("wk.weight"); L.wv = g("wv.weight"); L.wo = g("wo.weight");
+        L.q = g("wq.weight"); L.k = g("wk.weight"); L.v = g("wv.weight"); L.o = g("wo.weight");
         L.ffn_norm = g("ffn_norm.weight");
         L.gate = g("w_gate.weight"); L.up = g("w_up.weight"); L.down = g("w_down.weight");
-        if (!L.norm || !L.wq || !L.wk || !L.wv || !L.wo || !L.gate || !L.up || !L.down) return false;
+        if (!L.norm || !L.q || !L.k || !L.v || !L.o || !L.gate || !L.up || !L.down) return false;
     }
 
     v_patch_w = gt("v.patch_embd.weight");
@@ -550,56 +546,27 @@ bool SmolVLM::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logi
     }
     ggml_set_name(x, "t_emb");
 
-    std::vector<int> slots((size_t)T);
-    for (int i = 0; i < T; i++) slots[(size_t)i] = i;
-    ggml_tensor * slot_in = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, T);
-    ggml_set_name(slot_in, "slot_in");
-    (void)slots;
-
+    // ---- decoder layer loop: shared vqa::llm::block (core/llm_block.hpp) ----
+    // SmolLM2 trunk moved verbatim: RMSNorm -> WQ/WK/WV -> NEOX rope (theta 1e5,
+    // the llm_block roadmap's "no rope" note was wrong) -> KV write-back ->
+    // flash_attn_ext over the F16 cache -> wo -> residual -> RMSNorm -> fused
+    // SwiGLU. No per-head q/k norms (qn/kn null) and no batch path (bat_groups
+    // null); the KV row indices are pos_in, whose values are exactly the slot
+    // numbers the old slot_in input carried (i on prefill, slot_base on decode).
+    vqa::llm::LayerCtx lc;
+    lc.gf = g.gf;
+    lc.pos = g.pos_in;
+    lc.mask = g.mask_in;
+    lc.T = T; lc.S = S;
+    lc.n_head = NH; lc.n_kv_head = NKV; lc.head_dim = HD;
+    lc.n_ctx = n_ctx;
+    lc.rms_eps = rms_eps;
+    lc.rope_theta = rope_theta;
+    vqa::llm::BlockHooks lh;   // dbg_layer0 keeps the t_l0_* probe names stamped
     for (int il = 0; il < n_layer; il++) {
-        TxtLayer & L = tl[(size_t)il];
-        ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
-        l = ggml_mul(g.ctx, l, L.norm);
-        if (il == 0) ggml_set_name(l, "t_l0_norm");
-
-        ggml_tensor * q = ggml_mul_mat(g.ctx, L.wq, l);
-        ggml_tensor * k = ggml_mul_mat(g.ctx, L.wk, l);
-        ggml_tensor * v = ggml_mul_mat(g.ctx, L.wv, l);
-        if (il == 0) { ggml_set_name(q, "t_l0_q"); ggml_set_name(k, "t_l0_k"); }
-
-        ggml_tensor * q3 = ggml_reshape_3d(g.ctx, q, HD, NH, T);
-        ggml_tensor * k3 = ggml_reshape_3d(g.ctx, k, HD, NKV, T);
-        q3 = ggml_rope_ext(g.ctx, q3, g.pos_in, nullptr, HD, GGML_ROPE_TYPE_NEOX, n_ctx,
-                           rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_ext(g.ctx, k3, g.pos_in, nullptr, HD, GGML_ROPE_TYPE_NEOX, n_ctx,
-                           rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (il == 0) ggml_set_name(q3, "t_l0_q_rope");
-
-        ggml_tensor * k2 = ggml_cast(g.ctx, ggml_reshape_2d(g.ctx, k3, NKV * HD, T), GGML_TYPE_F16);
-        ggml_tensor * v2 = ggml_cast(g.ctx, ggml_reshape_2d(g.ctx, v, NKV * HD, T), GGML_TYPE_F16);
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[il], k2, slot_in));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[il], v2, slot_in));
-
-        ggml_tensor * qf = ggml_cont(g.ctx, ggml_permute(g.ctx, q3, 0, 2, 1, 3));
-        ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[il], HD, S, NKV, kv.k[il]->nb[1],
-                                        HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[il], HD, S, NKV, kv.v[il]->nb[1],
-                                        HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
-                                               1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
-        attn = ggml_mul_mat(g.ctx, L.wo, attn);
-        x = ggml_add(g.ctx, x, attn);
-        if (il == 0) ggml_set_name(x, "t_l0_attn");
-
-        ggml_tensor * m = ggml_rms_norm(g.ctx, x, rms_eps);
-        m = ggml_mul(g.ctx, m, L.ffn_norm);
-        ggml_tensor * gate = ggml_mul_mat(g.ctx, L.gate, m);
-        ggml_tensor * up = ggml_mul_mat(g.ctx, L.up, m);
-        m = ggml_swiglu_split(g.ctx, gate, up);
-        m = ggml_mul_mat(g.ctx, L.down, m);
-        x = ggml_add(g.ctx, x, m);
-        if (il == 0) ggml_set_name(x, "t_l0_out");
+        lc.k_cache = kv.k[il];
+        lc.v_cache = kv.v[il];
+        x = vqa::llm::block(g.ctx, x, il, tl[il], lc, lh);
     }
 
     x = ggml_rms_norm(g.ctx, x, rms_eps);
@@ -631,12 +598,6 @@ bool SmolVLM::run_text(TextGraph & g, const std::vector<int> & toks, const std::
     const int T = (int)toks.size();
     ggml_backend_tensor_set(g.tok_in, toks.data(), 0, sizeof(int) * toks.size());
     ggml_backend_tensor_set(g.pos_in, pos.data(), 0, sizeof(int) * pos.size());
-    {
-        std::vector<int> slots((size_t)T);
-        for (int i = 0; i < T; i++) slots[(size_t)i] = slot_base + i;
-        ggml_tensor * st = ggml_get_tensor(g.ctx, "slot_in");
-        if (st) ggml_backend_tensor_set(st, slots.data(), 0, sizeof(int) * slots.size());
-    }
     if (g.img_in && img_feats && img_pos) {
         ggml_backend_tensor_set(g.img_in, img_feats->data(), 0, sizeof(float) * img_feats->size());
         ggml_backend_tensor_set(g.img_pos_in, img_pos->data(), 0, sizeof(int) * img_pos->size());

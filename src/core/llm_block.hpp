@@ -36,11 +36,10 @@
 //         (plus hooks.attention_in to feed it the post-norm stream rather
 //         than per-head q/k/v, or a weights.fused_qkv_null fast path), and a
 //         BlockHooks::after_layer for its per-layer recurrent state plumbing.
-//   * smolvlm (no rope at all): zero new machinery - rope_pos == nullptr
-//         should mean "skip rope" (today VideoChat3 always ropes); then it is
-//         just LayerWeights with qn/kn null. Also the first chance to let
-//         mask == nullptr mean causal-by-construction if its backend relies
-//         on that (VideoChat3 always passes one).
+//   * smolvlm: DONE - it needed qn/kn null (no per-head norms) and that is all.
+//         The "no rope" note here was wrong: SmolLM2 ropes (NEOX, theta 1e5), so
+//         it passes pos like VideoChat3. mask==nullptr still always means an
+//         explicit mask; no tenant relies on causal-by-construction yet.
 #pragma once
 
 #include "ggml.h"
@@ -68,7 +67,8 @@ struct LayerWeights {
 // CALLER's - this file never allocates or owns KV state
 struct LayerCtx {
     ggml_cgraph *gf = nullptr;         // for set_rows write-back expansion
-    ggml_tensor *pos = nullptr;        // position ids [T]
+    ggml_tensor *pos = nullptr;        // position ids [T]; null = no rope (it also
+                                       // indexes the KV write-back, see block())
     ggml_tensor *mask = nullptr;       // single-sequence F16 causal mask [S, T]
     ggml_tensor *k_cache = nullptr;    // this layer's cache [n_kv_head*head_dim, n_ctx]
     ggml_tensor *v_cache = nullptr;
@@ -116,17 +116,28 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     if (dbg) { ggml_set_name(q, "t_l0_q"); ggml_set_name(k, "t_l0_k"); }
 
     ggml_tensor * q3 = ggml_reshape_3d(ctx, q, HD, NH, T);
-    q3 = ggml_rms_norm(ctx, q3, c.rms_eps);
-    q3 = ggml_mul(ctx, q3, L.qn);
+    // per-head q/k RMSNorm is Qwen3-only; null (plain Qwen2 / Llama-style) skips
+    // the whole reshape->norm->mul segment
+    if (L.qn) {
+        q3 = ggml_rms_norm(ctx, q3, c.rms_eps);
+        q3 = ggml_mul(ctx, q3, L.qn);
+    }
     ggml_tensor * k3 = ggml_reshape_3d(ctx, k, HD, NKV, T);
-    k3 = ggml_rms_norm(ctx, k3, c.rms_eps);
-    k3 = ggml_mul(ctx, k3, L.kn);
-    if (dbg) { ggml_set_name(q3, "t_l0_q_norm"); ggml_set_name(k3, "t_l0_k_norm"); }
+    if (L.kn) {
+        k3 = ggml_rms_norm(ctx, k3, c.rms_eps);
+        k3 = ggml_mul(ctx, k3, L.kn);
+    }
+    if (dbg && L.qn && L.kn) { ggml_set_name(q3, "t_l0_q_norm"); ggml_set_name(k3, "t_l0_k_norm"); }
 
-    q3 = ggml_rope_ext(ctx, q3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
-                       c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k3 = ggml_rope_ext(ctx, k3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
-                       c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    // pos null = no rope at all; NOTE pos also indexes the KV write-back below,
+    // so a rope-less tenant must still pass row indices (or the cache fields
+    // must stay null with an out-of-block write-back)
+    if (c.pos) {
+        q3 = ggml_rope_ext(ctx, q3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
+                           c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k3 = ggml_rope_ext(ctx, k3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
+                           c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
     if (h.after_rope) h.after_rope(h.ud, il, q3, k3);
     if (dbg) { ggml_set_name(q3, "t_l0_q_rope"); ggml_set_name(k3, "t_l0_k_rope"); }
 
