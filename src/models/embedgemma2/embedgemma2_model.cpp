@@ -35,6 +35,10 @@
 // the embedding is mean-pooled over all tokens and L2-normalized (MRL: slice
 // + re-normalize for truncate_dim < 768). Reference behavior:
 // transformers EmbeddingGemma2Processor / Gemma4*Model, verified against it.
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <cmath>
 #include "vqa.hpp"
 
 #include "attention.hpp"
