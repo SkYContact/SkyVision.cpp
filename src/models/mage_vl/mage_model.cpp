@@ -181,6 +181,12 @@ private:
     ggml_cgraph * dec_gf = nullptr;
     int dec_blk = 0;
     ggml_tensor * dec_tok = nullptr, * dec_pos = nullptr, * dec_mask = nullptr;
+    // the decode graph gets its OWN gallocr: a shared one re-reserves (and
+    // frees) the buffer under dec_tok/dec_pos/dec_mask whenever a later turn's
+    // prefill graph outgrows it, leaving these cached input pointers dangling
+    // (multi-turn crash: heap AV in the decode step from turn 2 on - same bug
+    // moss_vl fixed in 09c944a and videochat3 in ddf69d2)
+    ggml_gallocr_t dec_allocr = nullptr;
     int n_past = 0;
 
     int id_image_pad = 151655, id_video_pad = 151656;
@@ -383,6 +389,7 @@ void MageVL::gate_cleanup() {
 MageVL::~MageVL() {
     gate_cleanup();
     if (allocr) ggml_gallocr_free(allocr);
+    if (dec_allocr) ggml_gallocr_free(dec_allocr);
     if (dec_ctx) ggml_free(dec_ctx);
     kv.free();
     if (wbuf) ggml_backend_buffer_free(wbuf);
@@ -407,7 +414,8 @@ bool MageVL::init_backend() {
         fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), n_threads);
     }
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return allocr != nullptr;
+    if (!dec_allocr) dec_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    return allocr != nullptr && dec_allocr != nullptr;
 }
 
 // ---------------------------------------------------------------- load
@@ -1378,7 +1386,7 @@ bool MageVL::run_text(TextGraph & g, const std::vector<int> & toks, const std::v
             dg.ctx = dec_ctx;
             if (!build_text_graph(dg, 1, blk, 0)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
             dec_gf = dg.gf;
-            if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
+            if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
                 return false;
