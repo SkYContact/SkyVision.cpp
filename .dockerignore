@@ -17,6 +17,8 @@ ref_*/
 tmp_*/
 *.log
 
+# libjpeg-turbo ditto (cloned inside the image, see the build stage)
+vendor/libjpeg-turbo/
 # ggml is fetched inside the image (add_subdirectory(ggml)); shipping a local
 # checkout would add ~100 MB to the context and make the build non-reproducible
 ggml/

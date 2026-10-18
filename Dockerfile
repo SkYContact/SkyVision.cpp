@@ -26,7 +26,7 @@ FROM ubuntu:24.04 AS toolchain
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-        git cmake ninja-build g++ ccache ca-certificates
+        git cmake ninja-build g++ ccache ca-certificates nasm
 
 # ---------------------------------------------------------------- ggml
 # Built as a standalone project (not add_subdirectory) so that its object files
@@ -69,6 +69,18 @@ FROM ggml AS build
 WORKDIR /src/SkyVision
 COPY . /src/SkyVision
 
+# libjpeg-turbo for bit-exact-with-PIL JPEG decoding (gitignored locally, like
+# ggml, so the context does not carry it - clone it here; if it were absent the
+# CMake guard would silently fall back to stb_image). With nasm from the
+# toolchain stage the SIMD kernels come online; output is identical either way.
+# Upstream forbids add_subdirectory() for unmodified trees: rewriting
+# CMAKE_SOURCE_DIR -> CMAKE_CURRENT_SOURCE_DIR turns its guard into a
+# self-comparison (never fires) and fixes the remaining absolute paths - the
+# same patch our vendored copy carries (see README).
+RUN git clone --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo vendor/libjpeg-turbo \
+ && rm -rf vendor/libjpeg-turbo/.git \
+ && sed -i 's/CMAKE_SOURCE_DIR/CMAKE_CURRENT_SOURCE_DIR/g' vendor/libjpeg-turbo/CMakeLists.txt
+
 # CCACHE_DIR + the cache mount make a rebuild after a source edit take seconds
 # for the unchanged sources instead of recompiling them
 RUN --mount=type=cache,target=/ccache \
@@ -76,6 +88,7 @@ RUN --mount=type=cache,target=/ccache \
     cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_INSTALL_DOCDIR=share/doc/libjpeg-turbo \
         -DGGML_PREBUILT_DIR=/opt/ggml/prebuilt \
     && cmake --build build --target vqa-cli
 

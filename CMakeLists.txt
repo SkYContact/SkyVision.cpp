@@ -74,6 +74,53 @@ if (MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# optional libjpeg-turbo (vendored at ./vendor/libjpeg-turbo, clone separately
+# like ggml - the build stays self-contained without it and JPEG falls back to
+# stb_image). With it, JPEG pixels are bit-exact with PIL/libjpeg instead of
+# stb's 1-3 gray-level IDCT difference; PNG/BMP always stay on stb.
+#   * SIMD needs NASM; without it we compile the portable C kernel - upstream
+#     guarantees identical output, just 2-4x slower (install nasm to upgrade).
+#   * static lib only, linked as `jpeg-static`; arith-coded JPEG stays enabled
+#     (stb supported it, no reason to regress); WITH_CRT_DLL keeps the /MD
+#     runtime so we don't mix CRTs on MSVC.
+# ---------------------------------------------------------------------------
+set(VQA_HAVE_LIBJPEG OFF)
+if (EXISTS ${CMAKE_SOURCE_DIR}/vendor/libjpeg-turbo/CMakeLists.txt)
+    find_program(NASM_EXEC nasm)
+    if (NOT NASM_EXEC)
+        message(STATUS "libjpeg-turbo: nasm not found - WITH_SIMD=OFF (identical output, slower decode)")
+        set(WITH_SIMD OFF CACHE BOOL "" FORCE)
+    else()
+        message(STATUS "libjpeg-turbo: nasm found at ${NASM_EXEC}")
+        set(WITH_SIMD ON CACHE BOOL "" FORCE)
+    endif()
+    set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+    set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+    set(WITH_TURBOJPEG OFF CACHE BOOL "" FORCE)
+    set(WITH_JAVA OFF CACHE BOOL "" FORCE)
+    set(WITH_ARITH_DEC ON CACHE BOOL "" FORCE)
+    set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
+    if (MSVC)
+        set(WITH_CRT_DLL ON CACHE BOOL "" FORCE)
+    endif()
+    set(VQA_JPEG_INC      ${CMAKE_SOURCE_DIR}/vendor/libjpeg-turbo/src)
+    set(VQA_JPEG_GEN_INC  ${CMAKE_BINARY_DIR}/vendor/libjpeg-turbo)  # generated jconfig.h
+    # their vendored GNUInstallDirs leaves CMAKE_INSTALL_DOCDIR as an empty
+    # cache entry on CMake >= 4 (placeholder default + mark_as_advanced
+    # ordering), which trips their own "cannot be blank" guard. We never
+    # install libjpeg - hand the whole DIRLIST sane values up front.
+    set(CMAKE_INSTALL_BINDIR      "bin"                      CACHE PATH "" FORCE)
+    set(CMAKE_INSTALL_DATAROOTDIR "share"                    CACHE PATH "" FORCE)
+    set(CMAKE_INSTALL_DOCDIR      "share/doc/libjpeg-turbo"  CACHE PATH "" FORCE)
+    set(CMAKE_INSTALL_INCLUDEDIR  "include"                  CACHE PATH "" FORCE)
+    set(CMAKE_INSTALL_LIBDIR      "lib"                      CACHE PATH "" FORCE)
+    add_subdirectory(vendor/libjpeg-turbo)
+    set(VQA_HAVE_LIBJPEG ON)
+    message(STATUS "libjpeg-turbo: JPEG decoding via jpeg-static (VQA_HAVE_LIBJPEG)")
+endif()
+
+
+# ---------------------------------------------------------------------------
 # layout
 #   src/core/                shared engine layer: interfaces, utils, media I/O,
 #                            tokenizer, GGUF weight loading
@@ -99,6 +146,7 @@ set(VQA_CORE_SRC
     src/core/vqa_registry.cpp
     src/core/model_registry.cpp
     src/core/media_io.cpp
+    src/core/jpeg_decode.cpp
     src/core/video_pipe.cpp
     src/core/backend.cpp
     src/core/resample.cpp
@@ -173,6 +221,11 @@ add_executable(vqa-cli
     ${EMBG2_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
+if (VQA_HAVE_LIBJPEG)
+    target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
+    target_link_libraries(vqa-cli PRIVATE jpeg-static)
+    target_include_directories(vqa-cli PRIVATE ${VQA_JPEG_INC} ${VQA_JPEG_GEN_INC})
+endif()
 
 # --- vision encoder test target (milestone 6) ---
 add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)
@@ -191,3 +244,13 @@ add_executable(moondream-preprocess-test src/models/moondream/moondream_preproce
 target_compile_definitions(moondream-preprocess-test PRIVATE PREPROCESS_TEST_MAIN)
 target_link_libraries(moondream-preprocess-test PRIVATE ggml ggml-cpu)
 target_include_directories(moondream-preprocess-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC} ${CORE_INC})
+
+# --- media decode dump tool (JPEG engine A/B vs PIL, scripts/test_jpeg_decode.py) ---
+add_executable(media-decode-dump src/core/media_io.cpp src/core/jpeg_decode.cpp)
+target_compile_definitions(media-decode-dump PRIVATE MEDIA_IO_DECODE_DUMP_MAIN)
+target_include_directories(media-decode-dump PRIVATE ${STB_INC} ${CORE_INC})
+if (VQA_HAVE_LIBJPEG)
+    target_compile_definitions(media-decode-dump PRIVATE VQA_HAVE_LIBJPEG)
+    target_link_libraries(media-decode-dump PRIVATE jpeg-static)
+    target_include_directories(media-decode-dump PRIVATE ${VQA_JPEG_INC} ${VQA_JPEG_GEN_INC})
+endif()

@@ -15,6 +15,7 @@ build_cuda_log.txt
 
 # vendored dependencies (clone separately, see README)
 ggml/
+vendor/libjpeg-turbo/
 
 # run logs & debug artifacts
 run*.log
