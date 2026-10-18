@@ -351,10 +351,10 @@ private:
     // text graph
     ggml_context * tctx = nullptr;
     ggml_cgraph * tgf = nullptr;
+    int tg_T = 0, tg_S = 0, tg_pad = 0;
     ggml_tensor *t_toks_in = nullptr, *t_soft_pos_in = nullptr, *t_soft_in = nullptr;
     ggml_tensor *t_mask_swa = nullptr, *t_mask_full = nullptr;
     ggml_tensor *t_embd_out = nullptr;
-    int tg_T = 0, tg_S = 0;
 
     int vis_runs = 0;
 };
@@ -1220,11 +1220,17 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
     if (!tctx) return false;
     tgf = ggml_new_graph_custom(tctx, 32768, false);
 
-    t_toks_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, T);
+    // CUDA fattn needs the KV length to be a multiple of its KQ stride (256)
+    // for head_dim 256/512 - pad the sequence the standard way and mask the
+    // pad keys; CPU flash attention is generic and keeps the exact length
+    const int Tq = ggml_backend_is_cpu(backend) ? T : (T + 255) / 256 * 256;
+    tg_pad = Tq - T;
+
+    t_toks_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, Tq);
     ggml_set_name(t_toks_in, "toks");
-    t_mask_swa = ggml_new_tensor_2d(tctx, GGML_TYPE_F16, T, T);
+    t_mask_swa = ggml_new_tensor_2d(tctx, GGML_TYPE_F16, Tq, Tq);
     ggml_set_name(t_mask_swa, "mask_swa");
-    t_mask_full = ggml_new_tensor_2d(tctx, GGML_TYPE_F16, T, T);
+    t_mask_full = ggml_new_tensor_2d(tctx, GGML_TYPE_F16, Tq, Tq);
     ggml_set_name(t_mask_full, "mask_full");
     if (S > 0) {
         t_soft_pos_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, S);
@@ -1242,12 +1248,12 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
     // projection-only PLE: [12288, T] -> [512, 24, T] normed -> [512, T, 24]
     ggml_tensor * pl = ggml_scale(tctx, ggml_mul_mat(tctx, t_ple_model_proj, x),
                                   1.0f / sqrtf((float)n_embd));
-    pl = ggml_reshape_3d(tctx, pl, ple_dim, n_layer, T);
+    pl = ggml_reshape_3d(tctx, pl, ple_dim, n_layer, Tq);
     pl = ggml_mul(tctx, ggml_rms_norm(tctx, pl, eps), t_ple_norm);
     pl = ggml_cont(tctx, ggml_permute(tctx, pl, 0, 2, 1, 3));        // [512, T, 24]
     ggml_set_name(pl, "ple");
 
-    ggml_tensor * pos_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, T);
+    ggml_tensor * pos_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, Tq);
     ggml_set_name(pos_in, "pos");
     for (int il = 0; il < n_layer; il++) {
         const bool full = is_full(il);
@@ -1261,9 +1267,9 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
         ggml_tensor * k = ggml_mul_mat(tctx, L.wk, cur);
         ggml_tensor * v = ggml_mul_mat(tctx, L.wv, cur);
 
-        q = ggml_reshape_3d(tctx, q, hd, nh, T);
-        k = ggml_reshape_3d(tctx, k, hd, nkv, T);
-        v = ggml_reshape_3d(tctx, v, hd, nkv, T);
+        q = ggml_reshape_3d(tctx, q, hd, nh, Tq);
+        k = ggml_reshape_3d(tctx, k, hd, nkv, Tq);
+        v = ggml_reshape_3d(tctx, v, hd, nkv, Tq);
         q = ggml_mul(tctx, ggml_rms_norm(tctx, q, eps), L.q_norm);
         k = ggml_mul(tctx, ggml_rms_norm(tctx, k, eps), L.k_norm);
         v = ggml_rms_norm(tctx, v, eps);
@@ -1279,28 +1285,8 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
         ggml_tensor * kf = ggml_cont(tctx, ggml_permute(tctx, k, 0, 2, 1, 3));
         ggml_tensor * vf = ggml_cont(tctx, ggml_permute(tctx, v, 0, 2, 1, 3));
         ggml_tensor * mask = full ? t_mask_full : t_mask_swa;
-        ggml_tensor * attn = nullptr;
-        if (full && !ggml_backend_is_cpu(backend)) {
-            // CUDA fattn has no kernel for head_dim 512 unless the KV length
-            // is a multiple of its KQ stride - explicit attention for those
-            // layers on GPU (flash attention stays on CPU where it is generic)
-            ggml_tensor * kh = ggml_new_tensor_3d(tctx, GGML_TYPE_F32, hd, T, nh);
-            ggml_tensor * ke = ggml_repeat(tctx, kf, kh);          // [hd, T_k, nh]
-            ggml_tensor * ve = ggml_repeat(tctx, vf, kh);
-            ggml_tensor * sc = ggml_mul_mat(tctx, ke, qf);         // [T_k, T_q, nh]
-            ggml_tensor * m3 = ggml_repeat(tctx,
-                ggml_reshape_3d(tctx, mask, T, T, 1),
-                ggml_new_tensor_3d(tctx, GGML_TYPE_F16, T, T, nh));
-            sc = ggml_add(tctx, sc, ggml_cast(tctx, m3, GGML_TYPE_F32));
-            ggml_tensor * prob = ggml_soft_max(tctx, sc);          // over T_k
-            ggml_tensor * v_t = ggml_cont(tctx, ggml_permute(tctx, ve, 1, 0, 2, 3));  // [T_k, hd, nh]
-            ggml_tensor * o3 = ggml_mul_mat(tctx, prob, v_t);      // [T_q, hd, nh]
-            attn = ggml_reshape_2d(tctx,
-                ggml_cont(tctx, ggml_permute(tctx, o3, 2, 0, 1, 3)), nh * hd, T);
-        } else {
-            ggml_tensor * fa = ggml_flash_attn_ext(tctx, qf, kf, vf, mask, 1.0f, 0.0f, 0.0f);
-            attn = ggml_reshape_2d(tctx, ggml_cont(tctx, fa), nh * hd, T);
-        }
+        ggml_tensor * fa = ggml_flash_attn_ext(tctx, qf, kf, vf, mask, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * attn = ggml_reshape_2d(tctx, ggml_cont(tctx, fa), nh * hd, Tq);
         attn = ggml_mul_mat(tctx, L.wo, attn);
         if (il == 0) ggml_set_name(attn, "l0_attn_proj");
 
@@ -1317,7 +1303,7 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
 
         // PLE block
         {
-            ggml_tensor * slice = ggml_view_2d(tctx, pl, ple_dim, T, pl->nb[1],
+            ggml_tensor * slice = ggml_view_2d(tctx, pl, ple_dim, Tq, pl->nb[1],
                                                (size_t)il * pl->nb[2]);
             ggml_tensor * g = ggml_gelu(tctx, ggml_mul_mat(tctx, L.ple_gate, cur));
             g = ggml_mul(tctx, g, slice);
@@ -1335,8 +1321,11 @@ bool EmbedGemma2::build_text_graph(int T, int S, bool have_media) {
     ggml_tensor * proj = ggml_mul_mat(tctx, t_out_proj, x);          // [768, T]
     ggml_set_name(proj, "t_proj");
 
-    // mean pool over tokens + L2 normalize
-    ggml_tensor * tp = ggml_cont(tctx, ggml_transpose(tctx, proj));  // [T, 768] contiguous
+    // mean pool over the REAL tokens only (rows [0, T); pad rows excluded)
+    ggml_tensor * tpr = tg_pad > 0
+        ? ggml_view_2d(tctx, proj, out_dim, T, proj->nb[1], 0)
+        : proj;
+    ggml_tensor * tp = ggml_cont(tctx, ggml_transpose(tctx, tpr));  // [T, 768] contiguous
     ggml_tensor * pooled = ggml_scale(tctx, ggml_reshape_1d(tctx, ggml_sum_rows(tctx, tp), out_dim),
                                       1.0f / (float)T);
     ggml_tensor * nrm = ggml_sqrt(tctx, ggml_sum(tctx, ggml_mul(tctx, pooled, pooled)));
@@ -1367,24 +1356,38 @@ bool EmbedGemma2::run_text(const std::vector<int> & toks, const std::vector<int>
     if (!tgf || tg_T != T || tg_S != S) {
         if (!build_text_graph(T, S, S > 0)) return false;
     }
-    ggml_backend_tensor_set(t_toks_in, toks.data(), 0, sizeof(int) * toks.size());
+    // pad slots (GPU only): any valid token id - their rows are excluded from
+    // pooling and their keys are masked out of every real query's softmax
+    std::vector<int> toks_q = toks;
+    if (tg_pad > 0) toks_q.insert(toks_q.end(), tg_pad, toks.empty() ? 0 : toks.back());
+    ggml_backend_tensor_set(t_toks_in, toks_q.data(), 0, sizeof(int) * toks_q.size());
     if (S > 0) {
         ggml_backend_tensor_set(t_soft_pos_in, soft_pos.data(), 0, sizeof(int) * soft_pos.size());
         ggml_backend_tensor_set(t_soft_in, soft.data(), 0, sizeof(float) * soft.size());
     }
     {
-        // positions 0..T-1 for the rope, plus the two masks
+        const int Tq = T + tg_pad;
+        // positions 0..Tq-1 for the rope, plus the two masks
         ggml_tensor * pos = ggml_get_tensor(tctx, "pos");
-        std::vector<int> pv((size_t)T);
-        for (int i = 0; i < T; i++) pv[(size_t)i] = i;
+        std::vector<int> pv((size_t)Tq);
+        for (int i = 0; i < Tq; i++) pv[(size_t)i] = i;
         ggml_backend_tensor_set(pos, pv.data(), 0, sizeof(int) * pv.size());
 
-        std::vector<ggml_fp16_t> full((size_t)T * T, ggml_fp32_to_fp16(0.0f));
+        const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t hide = ggml_fp32_to_fp16(-INFINITY);
+        // full mask: real<->real open; pad keys hidden; pad queries see only
+        // themselves (an all-hidden row would NaN the softmax)
+        std::vector<ggml_fp16_t> full((size_t)Tq * Tq, hide);
+        for (int i = 0; i < T; i++)
+            for (int j = 0; j < T; j++) full[(size_t)i * Tq + j] = keep;
+        for (int i = T; i < Tq; i++) full[(size_t)i * Tq + i] = keep;
         ggml_backend_tensor_set(t_mask_full, full.data(), 0, sizeof(ggml_fp16_t) * full.size());
-        std::vector<ggml_fp16_t> swa((size_t)T * T, ggml_fp32_to_fp16(-INFINITY));
+        // sliding window mask, same pad policy
+        std::vector<ggml_fp16_t> swa((size_t)Tq * Tq, hide);
         for (int i = 0; i < T; i++)
             for (int j = std::max(0, i - window); j <= std::min(T - 1, i + window); j++)
-                swa[(size_t)i * T + j] = ggml_fp32_to_fp16(0.0f);
+                swa[(size_t)i * Tq + j] = keep;
+        for (int i = T; i < Tq; i++) swa[(size_t)i * Tq + i] = keep;
         ggml_backend_tensor_set(t_mask_swa, swa.data(), 0, sizeof(ggml_fp16_t) * swa.size());
     }
     if (ggml_backend_graph_compute(backend, tgf) != GGML_STATUS_SUCCESS) {
