@@ -80,9 +80,12 @@ const ArchEntry kArchs[] = {
     { { "videochat3", nullptr }, create_videochat3,
       TokenizerMode::Qwen2Regex, "models/VideoChat3-4B", 151936, false, false, "" },
     // marlin = legacy GGUF label for the same qwen3.5 backbone; videojev =
-    // qwen3.5 + a cosine decision head (score-only inference)
+    // qwen3.5 + a cosine decision head (score-only inference). vocab_target
+    // 248320: the Qwen3.5 family is 248k - the shared 151k default made the
+    // tokenizer discovery reject the checkpoint's own tokenizer.json whenever
+    // a GGUF shipped without a readable vocab_size key (server garbage)
     { { "qwen3_5", "marlin", "videojev" }, create_qwen3_5,
-      TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 151936, false, false, "" },
+      TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 248320, false, false, "" },
     { { "moss_vl", nullptr }, create_moss_vl,
       TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false, "moss.html" },
     // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk

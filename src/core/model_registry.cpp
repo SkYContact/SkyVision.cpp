@@ -116,6 +116,15 @@ bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ft
     // 151k-vocab tokenizer against a 248k-vocab model (garbled output)
     int kv = gguf_find_key(g, (arch + ".vocab_size").c_str());
     if (kv < 0) kv = gguf_find_key(g, (raw_arch + ".vocab_size").c_str());
+    if (kv < 0 && (arch == "qwen3_5" || arch == "marlin")) {
+        // arch and raw_arch coincide when the file is already labelled
+        // qwen3_5, yet the converter still wrote the legacy marlin.* keys
+        // (models/Qwen3.5-2B ships marlin.vocab_size=248320) - probe the
+        // sibling spelling too or the lookup falls to the family fallback,
+        // whose 151k default then rejects the checkpoint's own tokenizer
+        kv = gguf_find_key(g, arch == "qwen3_5" ? "marlin.vocab_size"
+                                                : "qwen3_5.vocab_size");
+    }
     if (kv >= 0) vocab = (size_t)gguf_get_val_u32(g, kv);
     const int kf = gguf_find_key(g, "general.file_type");
     if (kf >= 0) {

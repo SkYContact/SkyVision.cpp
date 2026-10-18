@@ -216,6 +216,12 @@ private:
     ggml_cgraph * dec_gf = nullptr;
     int dec_blk = 0;
     ggml_tensor * dec_tok = nullptr, * dec_mpos = nullptr, * dec_mask = nullptr;
+    // the decode graph reserves from its OWN gallocr: a shared one re-reserves
+    // (and frees) the buffer under dec_tok/dec_mpos/dec_mask whenever a later
+    // turn's prefill graph outgrows it, leaving the cached input pointers
+    // dangling (reproduced live as a server SIGSEGV on the turn after a
+    // short ask - same bug vc3 hit, fixed there in ddf69d2, moss in 09c944a)
+    ggml_gallocr_t dec_allocr = nullptr;
 
     // speculative graph caches (qwen3_5_mtp.inc): one verify graph per state
     // slot + one draft graph, keyed on the 512-block KV window; allocated once
@@ -248,6 +254,7 @@ static float randf_(uint64_t & s) {
 
 Qwen3_5::~Qwen3_5() {
     if (dec_ctx) ggml_free(dec_ctx);
+    if (dec_allocr) ggml_gallocr_free(dec_allocr);
     for (auto & c : spec_v) {
         if (c.ctx) ggml_free(c.ctx);
         if (c.alloc) ggml_gallocr_free(c.alloc);
@@ -268,7 +275,8 @@ bool Qwen3_5::init_backend() {
     backend = vqa::init_backend(use_gpu, n_threads);
     if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return allocr != nullptr;
+    if (!dec_allocr) dec_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    return allocr != nullptr && dec_allocr != nullptr;
 }
 
 // ---------------------------------------------------------------- load
@@ -279,6 +287,19 @@ bool Qwen3_5::load(const std::string & gguf_path, const std::string & tokenizer_
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::Qwen2Regex)) return false;
+    // a tokenizer from the wrong family (a 151k Qwen vocab picked for this
+    // 248k model by a registry scanning a models dir) loads fine and turns
+    // every answer into merged-garbage loops - refuse it here where the
+    // mismatch is visible (same 20% family rule the registry discovery uses)
+    if (tok_.size() > 0) {
+        const int64_t diff = tok_.size() > n_vocab ? tok_.size() - (int64_t)n_vocab
+                                                   : (int64_t)n_vocab - tok_.size();
+        if (diff * 5 > n_vocab) {
+            fprintf(stderr, "qwen3_5: tokenizer vocab %d vs model vocab %d - wrong tokenizer.json\n",
+                    tok_.size(), n_vocab);
+            return false;
+        }
+    }
     if (!alloc_state()) return false;
 
     vqa::assign_token_ids(tok_, {
@@ -1252,7 +1273,7 @@ bool Qwen3_5::run_text(TextGraph & g, const std::vector<int> & toks,
             dg.ctx = dec_ctx;
             if (!build_text_graph(dg, 1, blk, 0)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
             dec_gf = dg.gf;
-            if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
+            if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
                 return false;
