@@ -81,6 +81,14 @@ public:
     const char * name() const override { return "videochat3-4b"; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
+    // ChatML template knowledge for the server's multi-turn sessions (moss
+    // pattern): gp.history is prepended verbatim before the new user turn in
+    // ask(), so the front end stays template-agnostic
+    std::string format_history_turn(const std::string & user,
+                                    const std::string & assistant) const override {
+        return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
+             + assistant + "<|im_end|>\n";
+    }
 
     // tunables, set before load()
     int n_ctx = 8192;
@@ -1170,7 +1178,8 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
     // covered by the 16-token margin) so an oversized image is clamped or rejected
     // before the multi-second vision encode instead of after it
     {
-        const int text_overhead = (int)tok_.encode(render_prompt(1, prompt, video_kind, nullptr)).size();
+        const int text_overhead = (int)tok_.encode(gp.history +
+            render_prompt(1, prompt, video_kind, nullptr)).size();
         // per-clip timestamp prompt ("<12.5 seconds>" etc.) costs ~10 tokens; the
         // 1-placeholder probe above renders none of them, so reserve room for all clips
         const int n_clips = (int)((media.frames.size() + vc.temporal_merge - 1) / vc.temporal_merge);
@@ -1208,7 +1217,9 @@ bool VideoChat3::ask(const vqa::MediaInput & media, const std::string & prompt,
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
     const bool video = media.kind == vqa::MediaKind::Video;
-    const std::string text = render_prompt(n_img, prompt, video, &clip_marks);
+    // multi-turn session: the server's history prefix (fully formatted prior
+    // turns, moss pattern) goes in verbatim before the new user turn
+    const std::string text = gp.history + render_prompt(n_img, prompt, video, &clip_marks);
     const std::vector<int> ids = tok_.encode(text);
     const int pad_id = video ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;

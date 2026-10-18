@@ -98,6 +98,14 @@ public:
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp,
              std::string & out_text) override;
+    // ChatML template knowledge for the server's multi-turn sessions (moss
+    // pattern): gp.history is prepended verbatim before the new user turn in
+    // ask(), so the front end stays template-agnostic
+    std::string format_history_turn(const std::string & user,
+                                    const std::string & assistant) const override {
+        return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
+             + assistant + "<|im_end|>\n";
+    }
     // VideoJev: candidate scoring instead of decoding (see vqa::ScoreQuery)
     bool score(const vqa::MediaInput & media, const std::vector<vqa::ScoreQuery> & queries,
                float threshold, std::vector<vqa::ScoreResult> & out,
@@ -1418,7 +1426,8 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     const auto tv0 = std::chrono::steady_clock::now();
     const bool video_kind = media.kind == vqa::MediaKind::Video;
     {
-        const int text_overhead = (int)tok_.encode(render_prompt(1, user_text, video_kind)).size();
+        const int text_overhead = (int)tok_.encode(gp.history +
+            render_prompt(1, user_text, video_kind)).size();
         const int budget = n_ctx - gp.max_tokens - text_overhead - 16;
         if (budget <= 0) {
             fprintf(stderr, "n_ctx %d too small: prompt %d tokens + max_new %d leaves nothing for the image\n",
@@ -1450,7 +1459,10 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     fprintf(stderr, "[perf] vision encode: %.0f ms (%d tokens)\n",
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tv0).count(), n_img);
 
-    const std::string text = render_prompt(n_img, user_text, video_kind);
+    // multi-turn session: the server's history prefix (fully formatted prior
+    // turns, moss pattern) goes in verbatim before the new user turn; the
+    // final assistant turn keeps the non-thinking prefix from render_prompt
+    const std::string text = gp.history + render_prompt(n_img, user_text, video_kind);
     const std::vector<int> ids = tok_.encode(text);
     const int pad_id = video_kind ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;
