@@ -42,6 +42,13 @@ void resize_antialias(const uint8_t * src, int sw, int sh, int dw, int dh,
 void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
                            int dw, int dh, uint8_t * dst);
 
+// Same Resample.c machinery with PIL's BICUBIC filter (cubic convolution
+// a = -0.5, support 2.0) - what PIL image.resize(Image.BICUBIC) does, i.e. the
+// slow HF processors' resample=3 path (SigLIP et al). Same 8bpc fixpoint
+// pipeline as the Lanczos twin; bit-exact vs PIL. `dst` holds dw*dh*sc bytes.
+void resize_bicubic_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                           int dw, int dh, uint8_t * dst);
+
 // torch F.interpolate(mode="bicubic", align_corners=False) semantics
 // (Keys a = -0.75, 4-tap clamped reads) of an interleaved float (sh,sw,C)
 // buffer -> (dh,dw,C). What VideoChat3 uses for its learned pos table.

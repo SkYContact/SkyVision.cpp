@@ -19,5 +19,6 @@ Model * create_smolvlm();
 Model * create_mage_vl();
 Model * create_qwen25omni();
 Model * create_embedgemma2();
+Model * create_siglip();
 
 }  // namespace vqa

@@ -106,6 +106,9 @@ const ArchEntry kArchs[] = {
     // towers fused as soft tokens; embedding output via Model::embed
     { { "embgemma2", nullptr }, create_embedgemma2,
       TokenizerMode::GemmaSP, "models/embeddinggemma-2", 262144, false, false, "" },
+    // SigLIP image tower: pooled embedding (get_image_features) / classifier
+    { { "siglip", nullptr }, create_siglip,
+      TokenizerMode::Qwen2Regex, "models/siglip-base", 0, false, true, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

@@ -297,6 +297,14 @@ static inline double md_lanczos_filter(double x) {  // support = 3.0
     return 0.0;
 }
 
+// PIL Resample.c cubic_filter (cubic convolution a = -0.5, support = 2.0)
+static inline double md_cubic_filter(double x) {
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    return 0.0;
+}
+
 static const int MD_PRECISION_BITS = 32 - 8 - 2;  // 22
 
 struct MdCoeffs {
@@ -306,8 +314,9 @@ struct MdCoeffs {
 };
 
 // box = (0, in) full axis; PIL in0/in1 defaults.
-static void md_precompute_coeffs(int in_size, int out_size, MdCoeffs & c) {
-    const double support_filter = 3.0;
+static void md_precompute_coeffs(int in_size, int out_size,
+                                 double support_filter, double (*filter)(double),
+                                 MdCoeffs & c) {
     double scale = (double)in_size / out_size;   // PIL: (in1-in0)/out
     double filterscale = scale < 1.0 ? 1.0 : scale;
     double support = support_filter * filterscale;
@@ -328,7 +337,7 @@ static void md_precompute_coeffs(int in_size, int out_size, MdCoeffs & c) {
         std::vector<double> w(count);
         double ww = 0.0;
         for (int x = 0; x < count; x++) {
-            w[x] = md_lanczos_filter((x + xmin - center + 0.5) * inv_fs);
+            w[x] = filter((x + xmin - center + 0.5) * inv_fs);
             ww += w[x];
         }
         int32_t * k = &c.kk[(size_t)xx * ksize];
@@ -352,22 +361,13 @@ static inline uint8_t md_clip8(int64_t v) {  // PIL clip8 lookup equivalent
     return (uint8_t)v;
 }
 
-void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
-                           int dw, int dh, uint8_t * dst) {
-    if (sw == dw && sh == dh) {
-        std::memcpy(dst, src, (size_t)sw * sh * sc);
-        return;
-    }
-    bool need_h = dw != sw, need_v = dh != sh;
-    // Pillow 10.4 (the version the parity reference uses) always runs the
-    // horizontal pass first; the vertical-first heuristic is a newer-Pillow
-    // addition. Keep the exact order the reference resampler uses.
-    (void)0;
-
-    MdCoeffs ch, cv;
-    if (need_v) md_precompute_coeffs(sh, dh, cv);
-    if (need_h) md_precompute_coeffs(sw, dw, ch);
-
+// the shared Resample.c 8bpc pipeline: horizontal pass -> uint8 temp, then
+// vertical pass (Pillow 10.4 runs the horizontal pass first; the vertical-first
+// heuristic is a newer-Pillow addition)
+static void pil_coeffs_resize(const uint8_t * src, int sw, int sh, int sc,
+                              int dw, int dh, uint8_t * dst,
+                              const MdCoeffs & ch, const MdCoeffs & cv,
+                              bool need_h, bool need_v) {
     {
         // pass 1: horizontal -> temp [dw, sh] (uint8 per channel, like PIL)
         if (!need_h) {
@@ -421,6 +421,32 @@ void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
             }
         }
     }
+}
+
+void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                           int dw, int dh, uint8_t * dst) {
+    if (sw == dw && sh == dh) {
+        std::memcpy(dst, src, (size_t)sw * sh * sc);
+        return;
+    }
+    bool need_h = dw != sw, need_v = dh != sh;
+    MdCoeffs ch, cv;
+    if (need_v) md_precompute_coeffs(sh, dh, 3.0, md_lanczos_filter, cv);
+    if (need_h) md_precompute_coeffs(sw, dw, 3.0, md_lanczos_filter, ch);
+    pil_coeffs_resize(src, sw, sh, sc, dw, dh, dst, ch, cv, need_h, need_v);
+}
+
+void resize_bicubic_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                           int dw, int dh, uint8_t * dst) {
+    if (sw == dw && sh == dh) {
+        std::memcpy(dst, src, (size_t)sw * sh * sc);
+        return;
+    }
+    bool need_h = dw != sw, need_v = dh != sh;
+    MdCoeffs ch, cv;
+    if (need_v) md_precompute_coeffs(sh, dh, 2.0, md_cubic_filter, cv);
+    if (need_h) md_precompute_coeffs(sw, dw, 2.0, md_cubic_filter, ch);
+    pil_coeffs_resize(src, sw, sh, sc, dw, dh, dst, ch, cv, need_h, need_v);
 }
 
 // ---------------------------------------------------------------- torch bicubic
