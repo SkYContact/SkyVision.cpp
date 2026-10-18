@@ -118,7 +118,8 @@ private:
                   const std::vector<float> * aud_feats, const std::vector<int> * aud_pos,
                   std::vector<float> & logits, int slot_base = 0,
                   std::vector<float> * hidden_out = nullptr,
-                  std::vector<float> * embed_out = nullptr);
+                  std::vector<float> * embed_out = nullptr,
+                  std::vector<float> * hidden_all = nullptr);
 
     vqa::Capabilities caps_;
     vqa::Tokenizer tok_;
@@ -180,11 +181,12 @@ private:
     std::vector<float> spk_ref_mel;   // [400*80]
     bool load_talker(const std::string & gguf_path);
     bool synthesize_speech(const std::vector<int> & toks, const std::vector<int> & pos,
-                           const std::vector<int> & img_pos, const std::vector<int> & aud_pos,
-                           const std::vector<int> & gen_toks,
-                           const std::vector<std::vector<float>> & gen_hidden,
-                           const std::vector<std::vector<float>> & gen_embed,
-                           int next_pos, const char * wav_path);
+                            const std::vector<float> & prompt_hidden,
+                            const std::vector<float> & prompt_embed,
+                            const std::vector<int> & gen_toks,
+                            const std::vector<std::vector<float>> & gen_hidden,
+                            const std::vector<std::vector<float>> & gen_embed,
+                            int next_pos, const char * wav_path);
 
     int id_audio = 151646, id_audio_start = 151647, id_audio_end = 151648;
     int id_image_pad = 151655, id_video_pad = 151656;
@@ -902,15 +904,22 @@ bool Qwen25Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, int n_
     }
 
     if (for_talker) {
-        // talker consumes the pre-norm hidden plus the token embedding
-        g.hidden_out = x;
-        ggml_set_name(x, "t_hidden");
         g.embed_out = ggml_get_rows(g.ctx, tok_embd, g.tok_in);
         ggml_set_name(g.embed_out, "t_embed_out");
+        // HF reply track: hidden_states[-1]; the 5.x capture machinery may or
+        // may not include the final norm - switchable for parity bisecting
+        // HF 5.x capture: hidden_states[-1] = last-layer output, final norm NOT
+        // included - the talker reply track is the pre-norm hidden
+        // (QOMNI_TALK_POSTNORM=1 switches back for bisecting)
+        const bool pre = getenv("QOMNI_TALK_POSTNORM") == nullptr;
+        if (for_talker) fprintf(stderr, "text: hidden track %s" "\n", pre ? "PRENORM" : "POSTNORM");
+        // dup: without it gallocr reuses x's buffer for the final-norm result
+        g.hidden_out = pre ? ggml_dup(g.ctx, x) : nullptr;
     }
     x = ggml_rms_norm(g.ctx, x, rms_eps);
     x = ggml_mul(g.ctx, x, out_norm);
     ggml_set_name(x, "t_final_norm");
+    if (for_talker && !g.hidden_out) g.hidden_out = x;
 
     if (T > 1) {
         ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);
@@ -936,7 +945,8 @@ bool Qwen25Omni::run_text(TextGraph & g, const std::vector<int> & toks,
                           const std::vector<int> * img_pos, const std::vector<float> * aud_feats,
                           const std::vector<int> * aud_pos, std::vector<float> & logits,
                           int slot_base, std::vector<float> * hidden_out,
-                          std::vector<float> * embed_out) {
+                          std::vector<float> * embed_out,
+                          std::vector<float> * hidden_all) {
     const int T = (int)toks.size();
     ggml_backend_tensor_set(g.tok_in, toks.data(), 0, sizeof(int) * toks.size());
     ggml_backend_tensor_set(g.pos_in, pos4.data(), 0, sizeof(int) * pos4.size());
@@ -966,6 +976,11 @@ bool Qwen25Omni::run_text(TextGraph & g, const std::vector<int> & toks,
         const size_t off = g.hidden_out->ne[1] > 1
             ? (size_t)(g.hidden_out->ne[1] - 1) * g.hidden_out->nb[1] : 0;
         ggml_backend_tensor_get(g.hidden_out, hidden_out->data(), off, sizeof(float) * n_embd);
+    }
+    if (g.hidden_out && hidden_all) {
+        hidden_all->resize((size_t)n_embd * g.hidden_out->ne[1]);
+        ggml_backend_tensor_get(g.hidden_out, hidden_all->data(), 0,
+                                sizeof(float) * hidden_all->size());
     }
     if (g.embed_out && embed_out) {
         embed_out->resize((size_t)n_embd);
@@ -1050,13 +1065,15 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         }
     }
 
+    const bool want_talker = talker_loaded && gp.speak_wav;
     TextGraph g;
-    if (!build_text_graph(g, T, T, n_img, n_aud)) { ggml_free(g.ctx); return false; }
+    if (!build_text_graph(g, T, T, n_img, n_aud, want_talker)) { ggml_free(g.ctx); return false; }
     vqa::set_causal_mask(g.mask_in, 0, T);
-    std::vector<float> logits;
+    std::vector<float> logits, prompt_hidden_all;
     if (!run_text(g, toks, pos, n_img > 0 ? &img_feats : nullptr,
                   n_img > 0 ? &img_pos : nullptr, n_aud > 0 ? &aud_feats : nullptr,
-                  n_aud > 0 ? &aud_pos : nullptr, logits)) {
+                  n_aud > 0 ? &aud_pos : nullptr, logits, 0, nullptr, nullptr,
+                  want_talker ? &prompt_hidden_all : nullptr)) {
         ggml_free(g.ctx);
         return false;
     }
@@ -1072,7 +1089,6 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
 
     std::vector<int> out;
     std::vector<std::vector<float>> gen_hidden, gen_embed;
-    const bool want_talker = talker_loaded && gp.speak_wav;
     int cur = vqa::sample_logits(logits, gp, rng_state);
     auto emit = [&](int t) {
         std::string piece = tok_.decode({ t });
@@ -1105,20 +1121,31 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         emit(cur);
     }
     if (want_talker) {
-        synthesize_speech(toks, pos, img_pos, aud_pos, out, gen_hidden, gen_embed,
-                          next_pos, gp.speak_wav);
+        // HF feeds the talker the prompt's post-norm hidden plus the plain
+        // token embedding, with the image/audio rows of the embed track zeroed
+        std::vector<float> prompt_embed((size_t)n_embd * T, 0.0f);
+        if (prompt_hidden_all.size() == (size_t)n_embd * T) {
+            for (int i = 0; i < T; i++) {
+                if (toks[(size_t)i] == id_image_pad || toks[(size_t)i] == id_audio) continue;
+                read_emb_row(tok_embd, toks[(size_t)i],
+                             prompt_embed.data() + (size_t)n_embd * i);
+            }
+        }
+        synthesize_speech(toks, pos, prompt_hidden_all, prompt_embed, out,
+                          gen_hidden, gen_embed, next_pos, gp.speak_wav);
     }
     out_text = tok_.decode(out);
     return true;
 }
 
 bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vector<int> & pos,
-                                   const std::vector<int> & img_pos, const std::vector<int> & aud_pos,
+                                   const std::vector<float> & prompt_hidden,
+                                   const std::vector<float> & prompt_embed,
                                    const std::vector<int> & gen_toks,
                                    const std::vector<std::vector<float>> & gen_hidden,
                                    const std::vector<std::vector<float>> & gen_embed,
                                    int next_pos, const char * wav_path) {
-    (void)toks; (void)pos; (void)img_pos; (void)aud_pos; (void)gen_toks;
+    (void)gen_toks;
     // thinker embedding row of the speaker bos token
     std::vector<float> bos_emb((size_t)n_embd);
     read_emb_row(tok_embd, spk_bos_token, bos_emb.data());
@@ -1131,7 +1158,7 @@ bool Qwen25Omni::synthesize_speech(const std::vector<int> & toks, const std::vec
     if (const char * e = getenv("QOMNI_TALK_TOPP")) t_topp = atof(e);
     if (const char * e = getenv("QOMNI_TALK_REP")) t_rep = atof(e);
     std::vector<int> codec;
-    if (!talker.synthesize(std::vector<int>(), std::vector<int>(), std::vector<int>(),
+    if (!talker.synthesize(toks, pos, prompt_hidden, prompt_embed, std::vector<int>(),
                            next_pos, gen_toks, gen_hidden, gen_embed, tok_embd, id_eos,
                            151859, bos_emb, t_temp, t_topk, t_topp, t_rep, rng_state, codec)) {
         fprintf(stderr, "talker: synthesis failed\n");

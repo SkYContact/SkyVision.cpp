@@ -19,6 +19,11 @@ namespace qwen25omni {
 // weights (q8_0/q4_0 rows decoded via the type traits; rows are block-aligned)
 inline void read_emb_row(ggml_tensor * t, int row, float * dst) {
     const size_t n = (size_t)t->ne[0];
+    if (row < 0 || (size_t)row >= (size_t)t->ne[1]) {
+        fprintf(stderr, "read_emb_row OOB: %s row %d / %lld\n",
+                t->name ? t->name : "?", row, (long long)t->ne[1]);
+        row = 0;
+    }
     if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, dst, (size_t)row * t->nb[1], n * sizeof(float));
     } else if (t->type == GGML_TYPE_F16) {
@@ -63,10 +68,14 @@ public:
     //   prompt_toks / prompt_pos4 / mm_rows: the full prompt, its MRoPE
     //     positions and the rows whose embedding the talker must see as zero
     //   next_pos: the next free MRoPE index after the prompt
-    //   gen_hidden / gen_embed: per generated token, pre-norm hidden + embedding
+    //   prompt_hidden / prompt_embed: per prompt token, post-norm hidden and
+    //     plain token embedding (zeros at image/audio rows, HF masks those)
+    //   gen_hidden / gen_embed: per generated token, post-norm hidden + embedding
     //   thinker_eos / thinker_pad: token ids whose thinker embeddings close the
     //     reply stream
     bool synthesize(const std::vector<int> & prompt_toks, const std::vector<int> & prompt_pos4,
+                    const std::vector<float> & prompt_hidden,
+                    const std::vector<float> & prompt_embed,
                     const std::vector<int> & mm_rows, int next_pos,
                     const std::vector<int> & gen_toks,
                     const std::vector<std::vector<float>> & gen_hidden,
@@ -103,6 +112,7 @@ private:
     ggml_context * tctx = nullptr;
     ggml_cgraph * tgf = nullptr;
     ggml_tensor *g_emb_in = nullptr, *g_codec_in = nullptr, *g_pos_in = nullptr;
+    ggml_tensor *g_codec_emb = nullptr;   // host-fed codec embedding track [embw, T]
     ggml_tensor *g_slot_in = nullptr, *g_mask_in = nullptr, *g_reply_in = nullptr;
     ggml_tensor *g_logits = nullptr;
 

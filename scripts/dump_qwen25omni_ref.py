@@ -107,7 +107,7 @@ def main():
             inputs["input_ids"],
             inputs.get("image_grid_thw"),
             inputs.get("video_grid_thw"),
-            None,
+            torch.ones_like(inputs["input_ids"]),
             False,
             inputs.get("feature_attention_mask").sum(-1)
             if "feature_attention_mask" in inputs else None,
@@ -138,6 +138,7 @@ def main():
         with torch.no_grad():
             text_ids, wav = model.generate(
                 input_ids=inputs["input_ids"],
+                attention_mask=torch.ones_like(inputs["input_ids"]),
                 speaker=args.speaker,
                 use_audio_in_video=False,
                 thinker_max_new_tokens=args.max_new,
@@ -149,6 +150,8 @@ def main():
                 meta["wav_samples"] = int(wav.shape[-1])
                 meta["speaker"] = args.speaker
     except Exception as e:      # talker path is optional for thinker parity
+        import traceback
+        traceback.print_exc()
         meta["talker_error"] = str(e)
         print("talker/t2w skipped:", e)
 

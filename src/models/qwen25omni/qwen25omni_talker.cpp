@@ -91,8 +91,8 @@ bool TalkerLM::build_prefill(int T, int S) {
     const int HD = head_dim, NH = n_head, NKV = n_kv_head;
     g_emb_in = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, embw, T);      // text track
     ggml_set_name(g_emb_in, "tk_text");
-    g_codec_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, T);          // codec track ids
-    ggml_set_name(g_codec_in, "tk_codec_ids");
+    g_codec_emb = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, embw, T);    // codec track embeddings
+    ggml_set_name(g_codec_emb, "tk_codec_emb");
     g_reply_in = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, embw, T);    // hidden part of track 1
     ggml_set_name(g_reply_in, "tk_reply");
     g_pos_in = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, 4 * T);
@@ -104,7 +104,7 @@ bool TalkerLM::build_prefill(int T, int S) {
 
     // dual-track sum: text embed + hidden reply + codec embed, then project
     ggml_tensor * x = ggml_add(tctx, g_emb_in, g_reply_in);
-    x = ggml_add(tctx, x, ggml_get_rows(tctx, embed, g_codec_in));
+    x = ggml_add(tctx, x, g_codec_emb);
     x = ggml_mul_mat(tctx, to_proj_w, x);
     x = ggml_add(tctx, x, to_proj_b);
     ggml_set_name(x, "tk_in_proj");
@@ -171,6 +171,8 @@ bool TalkerLM::build_prefill(int T, int S) {
 }
 
 bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vector<int> & prompt_pos4,
+                          const std::vector<float> & prompt_hidden,
+                          const std::vector<float> & prompt_embed,
                           const std::vector<int> & mm_rows, int next_pos,
                           const std::vector<int> & gen_toks,
                           const std::vector<std::vector<float>> & gen_hidden,
@@ -193,53 +195,88 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         read_emb_row(thinker_embed, tok, out.data());
     };
 
-    // reply stream consumed at decode step k: h_{k+2}+e_{k+2}, then eos, pad
+    // reply stream: prefill consumes row A0; decode step k consumes row A_{k+1};
+    // after the reply runs out: thinker-eos row, then text-pad rows
     std::vector<std::vector<float>> stream;
-    for (int i = 2; i < m; i++) {
+    for (int i = 1; i < m; i++) {
         std::vector<float> v((size_t)embw);
         for (int d = 0; d < embw; d++)
             v[(size_t)d] = gen_hidden[(size_t)i][(size_t)d] + gen_embed[(size_t)i][(size_t)d];
         stream.push_back(std::move(v));
     }
+    std::vector<float> pad_row;
     {
         std::vector<float> e;
         thinker_row(thinker_eos, e);
         stream.push_back(e);
         thinker_row(thinker_pad, e);
         stream.push_back(e);
+        pad_row = e;   // HF keeps feeding the text-pad embedding after the reply
+                       // stream runs out; speech ends on codec_end, not text end
     }
 
-    // ---- prefill: [h0+e0, bos + codec_pad, h1+e1 + codec_bos] ----
-    const int T = 3;
+    // ---- prefill over the full prompt, HF semantics ----
+    // [prompt h+e (embed track zeroed at image/audio rows)] +
+    //   [bos + codec_pad] + [h(A1)+e(A1) + codec_bos]
+    const int Tp = (int)prompt_toks.size();
+    if (Tp == 0 || prompt_hidden.size() != (size_t)embw * Tp ||
+        prompt_embed.size() != (size_t)embw * Tp || prompt_pos4.size() != (size_t)4 * Tp) {
+        fprintf(stderr, "talker: bad prompt tracks\n");
+        return false;
+    }
+    const int T = Tp + 2;
     if (!build_prefill(T, T)) return false;
     {
-        std::vector<float> text((size_t)embw * T, 0.0f);
-        for (int d = 0; d < embw; d++) text[d] = gen_hidden[0][(size_t)d] + gen_embed[0][(size_t)d];
-        memcpy(text.data() + (size_t)embw, spk_bos_embed.data(), (size_t)embw * sizeof(float));
-        for (int d = 0; d < embw; d++)
-            text[(size_t)2 * embw + d] = gen_hidden[1][(size_t)d] + gen_embed[1][(size_t)d];
-        std::vector<float> cpad, cbos;
-        codec_row(id_codec_pad, cpad);
+        std::vector<float> etrack(prompt_embed);              // e track [embw, T]
+        std::vector<float> htrack(prompt_hidden);             // h track [embw, T]
+        etrack.resize((size_t)embw * T, 0.0f);
+        htrack.resize((size_t)embw * T, 0.0f);
+        std::vector<float> cbos, cpad;
         codec_row(id_codec_start, cbos);
-        for (int d = 0; d < embw; d++) {
-            text[(size_t)embw + d] += cpad[(size_t)d];
-            text[(size_t)2 * embw + d] += cbos[(size_t)d];
+        codec_row(id_codec_pad, cpad);
+        // position Tp: speaker bos + codec_pad (h track empty)
+        memcpy(etrack.data() + (size_t)embw * Tp, spk_bos_embed.data(),
+               (size_t)embw * sizeof(float));
+        for (int d = 0; d < embw; d++) etrack[(size_t)embw * Tp + d] += cpad[(size_t)d];
+        // position Tp+1: first reply row + codec_bos
+        for (int d = 0; d < embw; d++)
+            etrack[(size_t)embw * (Tp + 1) + d] =
+                gen_hidden[0][(size_t)d] + gen_embed[0][(size_t)d] + cbos[(size_t)d];
+        // codec track: zeros for the prompt, pad/bos on the last two rows
+        std::vector<float> ctrack((size_t)embw * T, 0.0f);
+        memcpy(ctrack.data() + (size_t)embw * Tp, cpad.data(), (size_t)embw * sizeof(float));
+        memcpy(ctrack.data() + (size_t)embw * (Tp + 1), cbos.data(), (size_t)embw * sizeof(float));
+
+        if (getenv("QOMNI_TALK_DEBUG")) {
+            double hn = 0, en = 0;
+            for (int d = 0; d < embw; d++) {
+                hn += (double)htrack[(size_t)Tp * embw - d - 1] * htrack[(size_t)Tp * embw - d - 1];
+                en += (double)etrack[(size_t)Tp * embw - d - 1] * etrack[(size_t)Tp * embw - d - 1];
+            }
+            fprintf(stderr, "talker: prefill T=%d |h_last|=%.2f |e_last|=%.2f h0=%.4f\n", T,
+                    sqrt(hn), sqrt(en), htrack[(size_t)Tp * embw - 1]);
         }
-        ggml_backend_tensor_set(g_emb_in, text.data(), 0, sizeof(float) * text.size());
-        std::vector<float> zero((size_t)embw * T, 0.0f);
-        ggml_backend_tensor_set(g_reply_in, zero.data(), 0, sizeof(float) * zero.size());
-        std::vector<int> ids = { id_codec_mask, id_codec_pad, id_codec_start };
-        // position 0 must have NO codec track: feed the mask id and cancel it
-        std::vector<float> cmask;
-        codec_row(id_codec_mask, cmask);
-        for (int d = 0; d < embw; d++) text[d] -= cmask[d];
-        ggml_backend_tensor_set(g_emb_in, text.data(), 0, sizeof(float) * text.size());
-        ggml_backend_tensor_set(g_codec_in, ids.data(), 0, sizeof(int) * ids.size());
-        std::vector<int> pos((size_t)4 * T);
-        for (int a = 0; a < 4; a++)
-            for (int i = 0; i < T; i++) pos[(size_t)a * T + i] = next_pos + i;
+        if (getenv("QOMNI_TALK_TRACKS_DUMP")) {
+            FILE * f = fopen(getenv("QOMNI_TALK_TRACKS_DUMP"), "wb");
+            if (f) {
+                fwrite(etrack.data(), 4, etrack.size(), f);
+                fwrite(htrack.data(), 4, htrack.size(), f);
+                fwrite(ctrack.data(), 4, ctrack.size(), f);
+                fclose(f);
+            }
+        }
+        ggml_backend_tensor_set(g_emb_in, etrack.data(), 0, sizeof(float) * etrack.size());
+        ggml_backend_tensor_set(g_reply_in, htrack.data(), 0, sizeof(float) * htrack.size());
+        ggml_backend_tensor_set(g_codec_emb, ctrack.data(), 0, sizeof(float) * ctrack.size());
+        std::vector<int> pos(prompt_pos4);                    // MRoPE of the prompt
+        pos.resize((size_t)4 * T);
+        for (int a = 0; a < 4; a++) {
+            pos[(size_t)a * T + Tp] = next_pos;
+            pos[(size_t)a * T + Tp + 1] = next_pos + 1;
+        }
         ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
-        std::vector<int> slots = { 0, 1, 2 };
+        std::vector<int> slots((size_t)T);
+        for (int i = 0; i < T; i++) slots[(size_t)i] = i;
         ggml_backend_tensor_set(g_slot_in, slots.data(), 0, sizeof(int) * slots.size());
         vqa::set_causal_mask(g_mask_in, 0, T);
     }
@@ -289,28 +326,35 @@ bool TalkerLM::synthesize(const std::vector<int> & prompt_toks, const std::vecto
         return false;
     }
     ggml_backend_tensor_get(g_logits, logits.data(), 0, sizeof(float) * n_vocab);
+    if (getenv("QOMNI_TALK_LOGITS_DUMP")) {
+        FILE * f = fopen(getenv("QOMNI_TALK_LOGITS_DUMP"), "wb");
+        if (f) { fwrite(logits.data(), sizeof(float), logits.size(), f); fclose(f); }
+    }
     n_past = T;
 
     std::vector<int> history;
     int cur = sample(logits, history);
-    codec_out.push_back(cur);
-    history.push_back(cur);
+    if (cur != id_codec_end && cur != id_codec_pad) {
+        codec_out.push_back(cur);
+        history.push_back(cur);
+    }
 
     const int max_codec = 25 * 120;   // 2 minutes of speech
-    for (int step = 0; step < (int)stream.size() && cur != id_codec_end && cur != id_codec_pad &&
+    for (int step = 0; cur != id_codec_end && cur != id_codec_pad &&
                        (int)codec_out.size() < max_codec; step++) {
         if (!build_prefill(1, n_past + 1)) return false;
         std::vector<float> cemb;
         codec_row(cur, cemb);
-        const std::vector<float> & rep = stream[(size_t)step];
-        std::vector<float> in((size_t)embw);
-        for (int d = 0; d < embw; d++) in[(size_t)d] = cemb[(size_t)d] + rep[(size_t)d];
-        ggml_backend_tensor_set(g_emb_in, in.data(), 0, sizeof(float) * embw);
+        const std::vector<float> & rep =
+            step < (int)stream.size() ? stream[(size_t)step] : pad_row;
+        std::vector<float> in((size_t)embw, 0.0f);
         std::vector<float> zero((size_t)embw, 0.0f);
+        // decode: e track = reply row, codec track = embed(cur), h track empty
+        for (int d = 0; d < embw; d++) in[(size_t)d] = rep[(size_t)d];
+        ggml_backend_tensor_set(g_emb_in, in.data(), 0, sizeof(float) * embw);
         ggml_backend_tensor_set(g_reply_in, zero.data(), 0, sizeof(float) * embw);
-        std::vector<int> id1 = { cur };
-        ggml_backend_tensor_set(g_codec_in, id1.data(), 0, sizeof(int));
-        std::vector<int> pos((size_t)4, next_pos + T + step);
+        ggml_backend_tensor_set(g_codec_emb, cemb.data(), 0, sizeof(float) * embw);
+        std::vector<int> pos((size_t)4, next_pos + 2 + step);
         ggml_backend_tensor_set(g_pos_in, pos.data(), 0, sizeof(int) * pos.size());
         std::vector<int> slot = { n_past };
         ggml_backend_tensor_set(g_slot_in, slot.data(), 0, sizeof(int));
