@@ -162,6 +162,12 @@ private:
     ggml_tensor *v_in = nullptr, *v_pos = nullptr, *v_mask = nullptr;
     ggml_tensor *v_idx_in = nullptr, *v_idx_out = nullptr;
     ggml_tensor *v_feats = nullptr;
+    ggml_tensor *v_patch_sink = nullptr;   // guards the patch-embed dump read
+    std::vector<std::string> v_layer_files;      // per-layer hidden dump paths
+    ggml_context * v_dump_ctx = nullptr;         // persistent dump buffers (the
+    ggml_backend_buffer_t v_dump_alloc = nullptr;// gallocr pool reuses dup sinks)
+    std::vector<ggml_tensor *> v_dump_bufs;
+    ggml_tensor * v_dump_rows = nullptr;
 
     vqa::KvCache kv;
     int n_past = 0;
@@ -537,12 +543,31 @@ bool Qwen25Omni::build_vision_graph(int gh, int gw) {
     }
     x = ggml_mul_mat(vctx, v_patch_w, x);               // [v_embd, N]
     ggml_set_name(x, "v_patch_out");
+    if (getenv("QOMNI_VPATCH_DUMP")) {   // dup: the bare buffer gets reused
+        v_patch_sink = ggml_dup(vctx, x);
+        ggml_build_forward_expand(vgf, v_patch_sink);
+    }
 
     // 4D M-RoPE sections: head_dim/4 each, positions (h, w, h, w)
     int vsec[4] = { v_hd / 4, v_hd / 4, v_hd / 4, v_hd / 4 };
 
     int v_max = v_layer;   // QOMNI_MAX_VLAYERS=N truncates the tower for bisecting
     if (const char * e = getenv("QOMNI_MAX_VLAYERS")) v_max = std::min(v_layer, atoi(e));
+    if (getenv("QOMNI_VLAYER_DUMP")) {   // persistent per-layer dump buffers,
+        if (v_dump_ctx) { ggml_free(v_dump_ctx); v_dump_ctx = nullptr; }
+        struct ggml_init_params dip = { (size_t)(v_layer * 2 + 8) * ggml_tensor_overhead(),
+                                        NULL, true };
+        v_dump_ctx = ggml_init(dip);
+        v_dump_bufs.assign(v_layer, nullptr);
+        for (int il = 0; il < v_layer; il++)
+            v_dump_bufs[il] = ggml_new_tensor_2d(v_dump_ctx, GGML_TYPE_F32, v_embd, N);
+        v_dump_rows = ggml_new_tensor_1d(v_dump_ctx, GGML_TYPE_I32, N);
+        v_dump_alloc = ggml_backend_alloc_ctx_tensors(v_dump_ctx, backend);
+        ggml_backend_buffer_clear(v_dump_alloc, 0);
+        std::vector<int> r(N);
+        for (int i = 0; i < N; i++) r[i] = i;
+        ggml_backend_tensor_set(v_dump_rows, r.data(), 0, sizeof(int) * N);
+    }
     for (int il = 0; il < v_max; il++) {
         VisLayer & L = vl[(size_t)il];
         const bool full_attn = !wa || ((il + 1) % n_wa_pattern == 0);
@@ -593,6 +618,14 @@ bool Qwen25Omni::build_vision_graph(int gh, int gw) {
         x = ggml_add(vctx, x, h);
         if (il == 0) ggml_set_name(x, "v_blk0_out");
         if (il == 15) ggml_set_name(x, "v_blk15_out");
+        if (v_dump_rows) {   // per-layer hidden copy into persistent buffers
+            char fn[256];
+            snprintf(fn, sizeof(fn), "%s_L%02d.bin", getenv("QOMNI_VLAYER_DUMP"), il);
+            v_layer_files.push_back(fn);
+            ggml_tensor * src2 = ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N);
+            ggml_build_forward_expand(vgf,
+                ggml_set_rows(vctx, v_dump_bufs[il], src2, v_dump_rows));
+        }
     }
     ggml_set_name(x, "v_final");
 
@@ -626,6 +659,12 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
     const int N = n_patches_x * n_patches_y;
     const int nm = N / (v_merge * v_merge);
 
+    if (const char * dp = getenv("QOMNI_VIN_DUMP")) {   // raw patchified input
+        FILE * f = fopen(dp, "wb");
+        if (f) { int r = 1, c = (int)patches.size();
+                 fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
+                 fwrite(patches.data(), 4, patches.size(), f); fclose(f); }
+    }
     ggml_backend_tensor_set(v_in, patches.data(), 0, sizeof(float) * patches.size());
 
     // positions: 4 arrays (h, w, h, w) in *window-major* patch order
@@ -697,6 +736,27 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
     if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vision compute failed\n");
         return false;
+    }
+    for (size_t i = 0; i < v_layer_files.size(); i++) {   // per-layer hiddens
+        std::vector<float> hv((size_t)ggml_nelements(v_dump_bufs[i]));
+        ggml_backend_tensor_get(v_dump_bufs[i], hv.data(), 0, sizeof(float) * hv.size());
+        FILE * f = fopen(v_layer_files[i].c_str(), "wb");
+        if (f) { int r = v_embd, c = N;
+                 fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
+                 fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
+    }
+    v_layer_files.clear();
+    if (v_patch_sink) {
+        const char * dp = getenv("QOMNI_VPATCH_DUMP");
+        ggml_tensor * pe = v_patch_sink;
+        if (pe) {
+            std::vector<float> hv((size_t)ggml_nelements(pe));
+            ggml_backend_tensor_get(pe, hv.data(), 0, sizeof(float) * hv.size());
+            FILE * f = fopen(dp, "wb");
+            if (f) { int r = v_embd, c = N;
+                     fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
+                     fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
+        }
     }
     const int n = (int)v_feats->ne[1], d = (int)v_feats->ne[0];
     feats.resize((size_t)n * d);
