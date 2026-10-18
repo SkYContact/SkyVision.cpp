@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <utility>
 
 namespace qwen25omni {
 

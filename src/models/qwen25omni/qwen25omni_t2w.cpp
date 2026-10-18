@@ -15,6 +15,8 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <string>
+#include <utility>
 
 // minimal work-stealing parallel-for for the host-side vocoder loops; the
 // per-index writes are disjoint in every call site (channels or positions)
