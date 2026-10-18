@@ -161,6 +161,12 @@ private:
     ggml_cgraph * dec_gf = nullptr;
     int dec_blk = 0;
     ggml_tensor * dec_tok = nullptr, * dec_pos = nullptr, * dec_mask = nullptr;
+    // the decode graph gets its OWN gallocr: a shared one re-reserves (and
+    // frees) the buffer under dec_tok/dec_pos/dec_mask whenever a later turn's
+    // prefill graph outgrows it, leaving these cached input pointers dangling
+    // (multi-turn crash: heap AV in the decode step from turn 2 on - same bug
+    // moss_vl hit, fixed there in 09c944a)
+    ggml_gallocr_t dec_allocr = nullptr;
     ggml_gallocr_t allocr = nullptr;
     int n_past = 0;
 
@@ -206,6 +212,7 @@ float VideoChat3::randf() {
 
 VideoChat3::~VideoChat3() {
     if (allocr) ggml_gallocr_free(allocr);
+    if (dec_allocr) ggml_gallocr_free(dec_allocr);
     if (bat_ctx) ggml_free(bat_ctx);
     if (dec_ctx) ggml_free(dec_ctx);
     kv.free();
@@ -220,7 +227,8 @@ bool VideoChat3::init_backend() {
     backend = vqa::init_backend(use_gpu, n_threads);
     if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return allocr != nullptr;
+    if (!dec_allocr) dec_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    return allocr != nullptr && dec_allocr != nullptr;
 }
 
 // ---------------------------------------------------------------- load
@@ -1033,7 +1041,7 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
             dg.ctx = dec_ctx;
             if (!build_text_graph(dg, 1, blk, 0)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
             dec_gf = dg.gf;
-            if (!ggml_gallocr_alloc_graph(allocr, dec_gf)) {
+            if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
                 return false;
