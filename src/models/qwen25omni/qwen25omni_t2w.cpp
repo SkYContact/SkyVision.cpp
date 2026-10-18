@@ -17,6 +17,7 @@
 #include <atomic>
 #include <string>
 #include <utility>
+#include <vector>
 
 // minimal work-stealing parallel-for for the host-side vocoder loops; the
 // per-index writes are disjoint in every call site (channels or positions)
@@ -52,7 +53,6 @@ static void par_for(int n, F f) {
 #include <cstring>
 #include <random>
 #include <numeric>
-#include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
