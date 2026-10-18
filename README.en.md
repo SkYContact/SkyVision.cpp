@@ -680,9 +680,19 @@ ggml/                  the only third-party dependency (clone it, not tracked)
   tensor→f32), `weight_load.hpp` (mmap binding, 1D→host-F32 promotion, and the CPU zero-copy /
   GPU upload buffer assignment), `load_util.hpp` (LoadOptions plumbing, the per-backend
   `<PREFIX>_DUMP_DIR` override, and chat-template token id resolution), `vit_block.hpp` (the one ViT block body, shared by moondream / VideoChat3 /
-  VideoMAE, differences via hooks), `resample.hpp` (smart_resize, PIL-semantics antialias
+  VideoMAE, differences via hooks), `llm_block.hpp` (the Qwen-style causal decoder layer body,
+  decoder-side sibling of `vit_block.hpp`: the hand-rolled per-layer decoder loops collapse into
+  one graph builder — VideoChat3 / SmolVLM / MOSS-VL (its cross-attention layers ride the
+  hooks.attention override) live here; null weight fields skip the corresponding op, and
+  backend-only behavior hangs off BlockHooks), `qwen2vl_tower.hpp` (the whole Qwen2.5-VL vision
+  tower shared op-for-op by the qwen2vl and qwen25omni engines: Conv3d patch embed, window
+  attention with periodic full-attention layers, 4-section 2D M-RoPE, the merger; call-site
+  differences are only cfg fields and nullable debug hooks), `resample.hpp` (smart_resize, PIL-semantics antialias
   bicubic resize, bilinear position-table interpolation — these used to live inside the
   videochat3 directory and get include'd back out of it by three other backends),
+  `audio_feats.hpp` (audio front-end primitives — FFT / Hann windows / mel filterbanks /
+  log-mel — where the Qwen2.5-Omni whisper-family and EmbedGemma-2 Gemma4-family implementations
+  sit side by side, numerically not interchangeable by design and not to be "unified"),
   `attention.hpp` (KV cache + masks), `stage_buf.hpp` (device-side staging), `ggml_dump.hpp`
   (parity dumps), `sampler.hpp`, `tokenizer.cpp`, `media_io.cpp`.
 - **Tokenizer data**: `scripts/gen_unicode_ranges.py` regenerates `src/core/unicode_ranges.inc`.

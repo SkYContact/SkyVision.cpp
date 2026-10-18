@@ -666,9 +666,17 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
   `gguf_util.hpp`（元数据读取 / 张量转 F32）、`weight_load.hpp`（mmap 绑定、1D 张量转
   host F32、CPU 零拷贝/GPU 上传的 buffer 归属）、`load_util.hpp`（LoadOptions 落地 +
   各后端 `<PREFIX>_DUMP_DIR` 覆盖 + 特殊 token id 解析）、`vit_block.hpp`（所有 ViT 塔共用的 block 体，
-  moondream / VideoChat3 / VideoMAE 三家都用它，差异走 hooks）、`resample.hpp`（smart_resize、
+  moondream / VideoChat3 / VideoMAE 三家都用它，差异走 hooks）、`llm_block.hpp`（Qwen 系因果解码层的
+  共享 block 体，vit_block 的解码侧姊妹篇：把各后端手写的逐层解码循环收进同一个建图函数，
+  VideoChat3 / SmolVLM / MOSS-VL（cross-attention 等特殊层走 hooks.attention 覆写）已入住，
+  权重字段为空即跳过对应 op，后端私有行为一律挂 BlockHooks）、`qwen2vl_tower.hpp`（Qwen2.5-VL 视觉塔
+  整塔共享：Conv3d patch embed、窗口注意力 + 周期性全注意力层、四段 2D M-RoPE、merger，
+  qwen2vl 与 qwen25omni 两个引擎逐 op 一致，差异只落在 cfg 字段与可空调试 hook 上）、
+  `resample.hpp`（smart_resize、
   PIL 语义 antialias bicubic 缩放、位置表双线性插值——原来寄居在 videochat3 目录里被另外三个
-  模型反向 include）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
+  模型反向 include）、`audio_feats.hpp`（音频前端原语：FFT / Hann 窗 / mel 滤波器组 / log-mel，
+  Qwen2.5-Omni 的 whisper 系与 EmbedGemma-2 的 Gemma4 系两套数值上不可互换的实现并排共存，
+  禁止跨族"统一"浮点行为）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
   `ggml_dump.hpp`（对拍导出）、`sampler.hpp`、`tokenizer.cpp`、`media_io.cpp`。
 - **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/unicode_ranges.inc`。
 
