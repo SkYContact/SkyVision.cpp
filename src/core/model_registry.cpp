@@ -167,7 +167,9 @@ bool path_exists(const std::string & path) {
 
 std::string ModelRegistry::pick_tokenizer(const std::string & base_dir, const std::string & stem,
                                           const std::string & arch, size_t vocab) const {
-    if (!tokenizer_override_.empty() && path_exists(tokenizer_override_)) return tokenizer_override_;
+    // discover() normalises the override through resolve_tokenizer_path, so an
+    // override here is always an existing tokenizer.json file (or empty)
+    if (!tokenizer_override_.empty()) return tokenizer_override_;
     // candidate directories: the model's own directory first, then the scanned
     // models dir (they differ when a single path was registered explicitly)
     std::vector<std::string> dirs = { base_dir };
@@ -273,7 +275,13 @@ bool ModelRegistry::build_entry(const std::string & path, ModelEntry & e, std::s
 void ModelRegistry::discover(const std::string & dir, const std::string & tokenizer_override) {
     dir_ = dir.empty() ? std::string(".") : dir;
     while (dir_.size() > 1 && (dir_.back() == '/' || dir_.back() == '\\')) dir_.pop_back();
-    tokenizer_override_ = tokenizer_override;
+    // -t takes a directory exactly like the CLI's resolve_tokenizer_path (the
+    // server used to store the argument verbatim: path_exists() answers true
+    // for a directory, the override beat every per-model probe, and the first
+    // load died with "tokenizer.json not found: <dir>"). An argument that
+    // resolves to nothing is dropped so discovery falls back to the per-model
+    // probe instead of failing every load later.
+    tokenizer_override_ = resolve_tokenizer_path(tokenizer_override);
     entries_.clear();
     vision_path_.clear();
 
@@ -301,6 +309,23 @@ void ModelRegistry::discover(const std::string & dir, const std::string & tokeni
         std::string why;
         if (!build_entry(dir_ + "/" + g, e, why)) {
             fprintf(stderr, "models: skip %s (%s)\n", g.c_str(), why.c_str());
+            continue;
+        }
+        // one id is one addressable model: a root gguf and a checkpoint-subdir
+        // copy with the same stem used to both land in the list (two
+        // /api/models rows for one id) while find() kept resolving to the
+        // first, so the second row could never be reached. Dedup on id,
+        // keeping the first in scan order (root files sort before
+        // subdirectory files): the root-level file is the published artifact,
+        // and scan order is deterministic across runs. mtime is deliberately
+        // not consulted - a copied file carries a fresh mtime, so "newest
+        // wins" would silently re-point the id whenever a file is touched.
+        bool dup = false;
+        for (const auto & old : entries_)
+            if (old.id == e.id) { dup = true; break; }
+        if (dup) {
+            fprintf(stderr, "models: skip %s (duplicate id '%s', keeping the first registered)\n",
+                    g.c_str(), e.id.c_str());
             continue;
         }
         entries_.push_back(std::move(e));

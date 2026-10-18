@@ -29,8 +29,11 @@ struct ModelEntry {
     std::string tokenizer;     // resolved tokenizer.json ("" for pure video towers)
 };
 
-// Scan `dir` for *.gguf and keep the runnable ones. `tokenizer_override` (a
-// file path) wins over the per-model probe; it is the Web UI's --tokenizer.
+// Scan `dir` for *.gguf and keep the runnable ones, one entry per id (a same-
+// stem gguf in a checkpoint subdirectory is skipped in favour of the first
+// registered). `tokenizer_override` - the Web UI/MCP --tokenizer - wins over
+// the per-model probe; a directory is accepted and resolved to the
+// tokenizer.json inside it, exactly like the CLI's -t.
 class ModelRegistry {
 public:
     void discover(const std::string & dir, const std::string & tokenizer_override = std::string());
