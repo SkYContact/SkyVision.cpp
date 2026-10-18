@@ -16,6 +16,7 @@
 //   * text KV exists only for the 6 full-attention layers.
 #include "vqa.hpp"
 #include "vit_block.hpp"
+#include "llm_block.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -816,6 +817,165 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
 }
 
 // ---------------------------------------------------------------- text
+
+// closure for the shared vqa::llm::block call on the linear-attention layers
+// (build_text_graph): what LayerCtx cannot carry - the persistent conv/ssm
+// states (caller asset: 2 buffers x 3 rollback slots), the speculative-verify
+// flags and the running linear-layer index. The gated-delta branch has no
+// rope/KV cache of its own, so only hooks.attention is overridden; norm + MLP
+// stay inside llm_block.
+struct LaHookCtx {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    const std::vector<TxtLayer> * tl = nullptr;
+    const std::vector<ggml_tensor *> * conv_state = nullptr, * conv_state_b = nullptr, * conv_state_c = nullptr;
+    const std::vector<ggml_tensor *> * ssm_state = nullptr, * ssm_state_b = nullptr, * ssm_state_c = nullptr;
+    int si = 0;            // running linear-layer index (the old ssm_idx)
+    int state_slot = 0;    // which rollback slot this graph reads its states from
+    bool spec = false;     // speculative verify graph (logits_all && T > 1)
+    int T = 0;
+    int kv_dim = 0, k_conv = 0, Sk = 0, Hv = 0, d_inner = 0, n_group = 0;
+};
+
+// the linear-attention branch (gated delta net), moved VERBATIM out of the
+// build_text_graph loop (same ops, same order - the tie_state +0 dependency
+// edges and their interleaving with the main chain are load-bearing: the CUDA
+// multi-stream scheduler may not reorder the persistent-state copies ahead of
+// nodes that reuse their source buffers). block() adds the returned [D, T]
+// branch to the residual stream. Layer-0 probe names: t_l0_la_* are stamped
+// here; llm_block's dbg_layer0 covers t_l0_norm/t_l0_swiglu/t_l0_out (dbg_name
+// stays null - the two name sources are mutually exclusive and the dump sink
+// list needs t_l0_swiglu).
+static ggml_tensor * qwen35_la_attn(void * ud, int il, ggml_tensor * l,
+                                    const vqa::llm::LayerCtx & c) {
+    LaHookCtx * hc = (LaHookCtx *)ud;
+    ggml_context * ctx = hc->ctx;
+    const TxtLayer & L = (*hc->tl)[il];
+    const int si = hc->si++;
+    const int T = hc->T, kv_dim = hc->kv_dim, k_conv = hc->k_conv;
+    const int Sk = hc->Sk, Hv = hc->Hv, n_group = hc->n_group;
+    const bool spec = hc->spec;
+    const int state_slot = hc->state_slot;
+
+    // projections
+    ggml_tensor * qkv = ggml_mul_mat(ctx, L.la_qkv, l);      // [kv_dim, T]
+    ggml_tensor * z = ggml_mul_mat(ctx, L.la_gate, l);       // [d_inner, T]
+    if (il == 0) { ggml_set_name(qkv, "t_l0_la_qkv"); ggml_set_name(z, "t_l0_la_z"); }
+
+    ggml_tensor * beta = ggml_mul_mat(ctx, L.la_beta, l);    // [Hv, T]
+    beta = ggml_sigmoid(ctx, beta);
+    beta = ggml_reshape_4d(ctx, beta, 1, Hv, T, 1);
+    ggml_tensor * alpha = ggml_mul_mat(ctx, L.la_alpha, l);  // [Hv, T]
+    alpha = ggml_reshape_3d(ctx, alpha, Hv, T, 1);
+    ggml_tensor * a_bias = ggml_add(ctx, alpha, L.la_dt);    // bcast [Hv] over T
+    ggml_tensor * gk = ggml_mul(ctx, ggml_softplus(ctx, a_bias), L.la_a);
+    gk = ggml_reshape_4d(ctx, gk, 1, Hv, T, 1);
+    if (il == 0) { ggml_set_name(beta, "t_l0_la_beta"); ggml_set_name(gk, "t_l0_la_g"); }
+
+    // causal conv: prepend the persistent state, roll it forward
+    // (ggml_ssm_conv: sx 3d [k-1+T, conv_dim, 1], c [k, conv_dim],
+    //  result [conv_dim, T, 1])
+    ggml_tensor * qkv3 = ggml_reshape_3d(ctx, qkv, kv_dim, T, 1);
+    ggml_tensor * qkv_t = ggml_transpose(ctx, qkv3);              // [T, kv_dim, 1]
+    ggml_tensor * conv_in_state =
+        (state_slot == 1 ? *hc->conv_state_b : state_slot == 2 ? *hc->conv_state_c : *hc->conv_state)[si];
+    ggml_tensor * conv_st = ggml_reshape_3d(ctx, conv_in_state, k_conv - 1, kv_dim, 1);
+    ggml_tensor * conv_in = ggml_concat(ctx, conv_st, qkv_t, 0);  // [k-1+T, kv_dim, 1]
+    ggml_tensor * conv_state_last =
+        ggml_view_3d(ctx, conv_in, k_conv - 1, kv_dim, 1,
+                     conv_in->nb[1], conv_in->nb[2],
+                     (size_t)(conv_in->ne[0] - (k_conv - 1)) * conv_in->nb[0]);
+    // state writes hang off the layer chain; without a dependency edge
+    // into the main path, CUDA multi-stream scheduling can overlap the
+    // copy with later nodes that REUSE the source buffer (observed as
+    // ~1e-2-slot-state corruption from the first post-attention layer
+    // on). Tie every state copy into the layer output via +0.
+    ggml_tensor * state_dep = nullptr;
+    auto tie_state = [&](ggml_tensor * cpy_out) {
+        ggml_build_forward_expand(hc->gf, cpy_out);
+        ggml_tensor * s = ggml_scale(ctx, ggml_sum(ctx, cpy_out), 0.0f);
+        state_dep = state_dep ? ggml_add(ctx, state_dep, s) : s;
+    };
+    // the rolled conv window ALWAYS goes to the MAIN conv_state (the
+    // pre-fix code wrote it into `conv_st`, which on the slot-1
+    // rejection path is a view of conv_state_b - so main never
+    // advanced and the next round read a stale window)
+    tie_state(ggml_cpy(ctx, conv_state_last,
+                       ggml_reshape_3d(ctx, (*hc->conv_state)[si], k_conv - 1, kv_dim, 1)));
+    if (spec) {
+        // rollback windows: state after 1 token (slot 1) and after 0 (slot 2,
+        // the untouched input state, needed when the whole draft is rejected)
+        ggml_tensor * cs1 = ggml_view_3d(ctx, conv_in, k_conv - 1, kv_dim, 1,
+                                         conv_in->nb[1], conv_in->nb[2], 1 * conv_in->nb[0]);
+        tie_state(ggml_cpy(ctx, cs1, ggml_reshape_3d(ctx, (*hc->conv_state_b)[si], k_conv - 1, kv_dim, 1)));
+        tie_state(ggml_cpy(ctx, conv_st,
+                           ggml_reshape_3d(ctx, (*hc->conv_state_c)[si], k_conv - 1, kv_dim, 1)));
+    }
+    ggml_tensor * conv = ggml_ssm_conv(ctx, conv_in, L.la_conv1d); // [kv_dim, T, 1]
+    conv = ggml_silu(ctx, conv);
+    if (il == 0) ggml_set_name(conv, "t_l0_la_conv");
+
+    // split q/k/v heads (channels: q 2*group*Sk? no: q,k = group*Sk each, v = inner)
+    const int qk_dim = n_group * Sk;
+    auto head_view = [&](int block, int dim, int heads) {
+        return ggml_view_3d(ctx, conv, dim, heads, T,
+                            (size_t)dim * ggml_element_size(conv),
+                            (size_t)kv_dim * ggml_element_size(conv),
+                            (size_t)block * qk_dim * ggml_element_size(conv));
+    };
+    ggml_tensor * q_conv = head_view(0, Sk, n_group);
+    ggml_tensor * k_conv2 = head_view(1, Sk, n_group);
+    ggml_tensor * v_conv = head_view(2, Sk, Hv);               // v block offset 2*qk_dim
+    // l2 norm over the head dim (FLA kernel semantics)
+    auto l2n = [&](ggml_tensor * t) {
+        const float n = (float)t->ne[0];
+        return ggml_scale(ctx, ggml_rms_norm(ctx, t, 1e-6f / n), 1.0f / sqrtf(n));
+    };
+    q_conv = l2n(q_conv);
+    k_conv2 = l2n(k_conv2);
+    q_conv = ggml_reshape_4d(ctx, q_conv, Sk, n_group, T, 1);
+    k_conv2 = ggml_reshape_4d(ctx, k_conv2, Sk, n_group, T, 1);
+    v_conv = ggml_cont(ctx, v_conv);      // head_view leaves a strided view
+    v_conv = ggml_reshape_4d(ctx, v_conv, Sk, Hv, T, 1);
+
+    // fused gated delta net; the result packs scores + K=1 state snapshot
+    ggml_tensor * ssm_in =
+        (state_slot == 1 ? *hc->ssm_state_b : state_slot == 2 ? *hc->ssm_state_c : *hc->ssm_state)[si];
+    ggml_tensor * s0 = ggml_reshape_4d(ctx, ssm_in, Sk, Sk, Hv, 1);
+    ggml_tensor * res = ggml_gated_delta_net(ctx, q_conv, k_conv2, v_conv, gk, beta,
+                                             s0, /*K=*/(spec && getenv("QWEN35_SPEC_K1") == nullptr) ? 2 : 1);
+    ggml_tensor * out = ggml_view_4d(ctx, res, Sk, Hv, T, 1,
+                                     ggml_row_size(res->type, Sk),
+                                     ggml_row_size(res->type, Sk * Hv),
+                                     ggml_row_size(res->type, Sk * Hv * T), 0);
+    ggml_tensor * new_state = ggml_view_3d(ctx, res, Sk, Sk, Hv,
+                                           ggml_row_size(res->type, Sk),
+                                           ggml_row_size(res->type, Sk * Sk),
+                                           ggml_row_size(res->type, Sk * Hv * T));
+    tie_state(ggml_cpy(ctx, new_state, (*hc->ssm_state)[si]));
+    if (spec) {
+        // snapshot layout: [scores T cols][slot0 = final][slot1 = one token back]
+        ggml_tensor * snap1 = ggml_view_3d(ctx, res, Sk, Sk, Hv,
+                Sk * ggml_element_size(res), Sk * Sk * ggml_element_size(res),
+                ggml_row_size(res->type, Sk * Hv * (T + Sk)));
+        tie_state(ggml_cpy(ctx, snap1, (*hc->ssm_state_b)[si]));
+        tie_state(ggml_cpy(ctx, s0,
+                           ggml_reshape_3d(ctx, (*hc->ssm_state_c)[si], Sk, Sk, Hv)));
+    }
+    if (il == 0) ggml_set_name(out, "t_l0_la_core");
+
+    // gated RMSNorm over the head dim, gated by silu(z)
+    ggml_tensor * zn = ggml_reshape_3d(ctx, z, Sk, Hv, T);
+    ggml_tensor * on = ggml_rms_norm(ctx, out, c.rms_eps);
+    on = ggml_mul(ctx, on, L.la_norm);
+    on = ggml_mul(ctx, on, ggml_silu(ctx, zn));
+    ggml_tensor * flat = ggml_reshape_2d(ctx, on, hc->d_inner, T);
+    ggml_tensor * attn_out = ggml_mul_mat(ctx, L.la_out, flat);
+    if (state_dep)   // serialize the state copies into the main chain (+0)
+        attn_out = ggml_add(ctx, attn_out, state_dep);
+    return attn_out;
+}
+
 bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state_slot,
                                bool logits_all, const ScoreTap * tap) {
     // new graph -> previous dump registry/sink buffers are stale
@@ -853,16 +1013,59 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
     ggml_tensor * pos_rope = ggml_view_1d(g.ctx, g.mpos_in, 4 * T, 0);
     ggml_tensor * pos_slot = ggml_view_1d(g.ctx, g.mpos_in, T, (size_t)3 * T * sizeof(int));
 
-    int kv_idx = 0, ssm_idx = 0;
+    int kv_idx = 0;
     int max_layers = n_layer;
     if (const char * e = getenv("QWEN35_MAX_LAYERS")) max_layers = std::min(max_layers, atoi(e));
+
+    // shared-block plumbing for the linear-attention layers; the persistent
+    // states are the CALLER's asset, captured by the hook closure (never in
+    // LayerCtx), and si restarts at 0 with every graph build like ssm_idx did
+    LaHookCtx hc;
+    hc.ctx = g.ctx;
+    hc.gf = g.gf;
+    hc.tl = &tl;
+    hc.conv_state = &conv_state; hc.conv_state_b = &conv_state_b; hc.conv_state_c = &conv_state_c;
+    hc.ssm_state = &ssm_state;   hc.ssm_state_b = &ssm_state_b;   hc.ssm_state_c = &ssm_state_c;
+    hc.state_slot = state_slot;
+    hc.spec = logits_all && T > 1;
+    hc.T = T;
+    hc.kv_dim = kv_dim; hc.k_conv = k_conv; hc.Sk = Sk; hc.Hv = Hv;
+    hc.d_inner = ssm_d_inner; hc.n_group = ssm_n_group;
+
+    vqa::llm::LayerCtx lc;
+    lc.gf = g.gf;
+    lc.T = T; lc.S = S;
+    lc.n_head = NH; lc.n_kv_head = NKV; lc.head_dim = HD;
+    lc.n_ctx = n_ctx;
+    lc.rms_eps = rms_eps;
+    lc.rope_theta = rope_theta;
+
     for (int il = 0; il < max_layers; il++) {
         TxtLayer & L = tl[il];
+        if (!L.full) {
+            // gated-delta linear-attention layer: norm + MLP come from the
+            // shared vqa::llm::block (core/llm_block.hpp); the whole recurrent
+            // attention branch - projections, conv/state rolling, delta scan,
+            // gated norm and the persistent-state write-back - hangs off
+            // hooks.attention (qwen35_la_attn above, moved verbatim).
+            vqa::llm::LayerWeights w;
+            w.norm = L.norm;
+            w.ffn_norm = L.post_norm;   // attn_post_norm doubles as the FFN norm
+            w.gate = L.gate; w.up = L.up; w.down = L.down;
+            vqa::llm::BlockHooks lh;
+            lh.ud = &hc;
+            lh.dbg_layer0 = true;       // llm_block stamps t_l0_norm/swiglu/out
+            lh.attention = qwen35_la_attn;
+            x = vqa::llm::block(g.ctx, x, il, w, lc, lh);
+            continue;
+        }
         ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
         l = ggml_mul(g.ctx, l, L.norm);
 
         ggml_tensor * attn_out = nullptr;
-        if (L.full) {
+        {   // full-attention layer, kept handwritten: interleaved q|gate
+            // projection + IMROPE + the per-token verify FA are shapes the
+            // block has no opinion on (core/llm_block.hpp header note)
             const int ki = kv_idx++;
             ggml_tensor * q_full = ggml_mul_mat(g.ctx, L.q, l);      // [NH*2*HD, T]
             ggml_tensor * k = ggml_mul_mat(g.ctx, L.k, l);
@@ -933,123 +1136,6 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
             if (il == 0) ggml_set_name(attn, "t_l0_attn");
             attn = ggml_mul(g.ctx, attn, ggml_sigmoid(g.ctx, gate));    // output gating
             attn_out = ggml_mul_mat(g.ctx, L.o, attn);
-        } else {
-            const int si = ssm_idx++;
-            // projections
-            ggml_tensor * qkv = ggml_mul_mat(g.ctx, L.la_qkv, l);      // [kv_dim, T]
-            ggml_tensor * z = ggml_mul_mat(g.ctx, L.la_gate, l);       // [d_inner, T]
-            if (il == 0) { ggml_set_name(qkv, "t_l0_la_qkv"); ggml_set_name(z, "t_l0_la_z"); }
-
-            ggml_tensor * beta = ggml_mul_mat(g.ctx, L.la_beta, l);    // [Hv, T]
-            beta = ggml_sigmoid(g.ctx, beta);
-            beta = ggml_reshape_4d(g.ctx, beta, 1, Hv, T, 1);
-            ggml_tensor * alpha = ggml_mul_mat(g.ctx, L.la_alpha, l);  // [Hv, T]
-            alpha = ggml_reshape_3d(g.ctx, alpha, Hv, T, 1);
-            ggml_tensor * a_bias = ggml_add(g.ctx, alpha, L.la_dt);    // bcast [Hv] over T
-            ggml_tensor * gk = ggml_mul(g.ctx, ggml_softplus(g.ctx, a_bias), L.la_a);
-            gk = ggml_reshape_4d(g.ctx, gk, 1, Hv, T, 1);
-            if (il == 0) { ggml_set_name(beta, "t_l0_la_beta"); ggml_set_name(gk, "t_l0_la_g"); }
-
-            // causal conv: prepend the persistent state, roll it forward
-            // (ggml_ssm_conv: sx 3d [k-1+T, conv_dim, 1], c [k, conv_dim],
-            //  result [conv_dim, T, 1])
-            ggml_tensor * qkv3 = ggml_reshape_3d(g.ctx, qkv, kv_dim, T, 1);
-            ggml_tensor * qkv_t = ggml_transpose(g.ctx, qkv3);              // [T, kv_dim, 1]
-            const bool spec = logits_all && T > 1;   // speculative verify graph
-            ggml_tensor * conv_in_state = (state_slot == 1 ? conv_state_b : state_slot == 2 ? conv_state_c : conv_state)[si];
-            ggml_tensor * conv_st = ggml_reshape_3d(g.ctx, conv_in_state, k_conv - 1, kv_dim, 1);
-            ggml_tensor * conv_in = ggml_concat(g.ctx, conv_st, qkv_t, 0);  // [k-1+T, kv_dim, 1]
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
-                             conv_in->nb[1], conv_in->nb[2],
-                             (size_t)(conv_in->ne[0] - (k_conv - 1)) * conv_in->nb[0]);
-            // state writes hang off the layer chain; without a dependency edge
-            // into the main path, CUDA multi-stream scheduling can overlap the
-            // copy with later nodes that REUSE the source buffer (observed as
-            // ~1e-2-slot-state corruption from the first post-attention layer
-            // on). Tie every state copy into the layer output via +0.
-            ggml_tensor * state_dep = nullptr;
-            auto tie_state = [&](ggml_tensor * cpy_out) {
-                ggml_build_forward_expand(g.gf, cpy_out);
-                ggml_tensor * s = ggml_scale(g.ctx, ggml_sum(g.ctx, cpy_out), 0.0f);
-                state_dep = state_dep ? ggml_add(g.ctx, state_dep, s) : s;
-            };
-            // the rolled conv window ALWAYS goes to the MAIN conv_state (the
-            // pre-fix code wrote it into `conv_st`, which on the slot-1
-            // rejection path is a view of conv_state_b - so main never
-            // advanced and the next round read a stale window)
-            tie_state(ggml_cpy(g.ctx, conv_state_last,
-                               ggml_reshape_3d(g.ctx, conv_state[si], k_conv - 1, kv_dim, 1)));
-            if (spec) {
-                // rollback windows: state after 1 token (slot 1) and after 0 (slot 2,
-                // the untouched input state, needed when the whole draft is rejected)
-                ggml_tensor * cs1 = ggml_view_3d(g.ctx, conv_in, k_conv - 1, kv_dim, 1,
-                                                 conv_in->nb[1], conv_in->nb[2], 1 * conv_in->nb[0]);
-                tie_state(ggml_cpy(g.ctx, cs1, ggml_reshape_3d(g.ctx, conv_state_b[si], k_conv - 1, kv_dim, 1)));
-                tie_state(ggml_cpy(g.ctx, conv_st,
-                                                         ggml_reshape_3d(g.ctx, conv_state_c[si], k_conv - 1, kv_dim, 1)));
-            }
-            ggml_tensor * conv = ggml_ssm_conv(g.ctx, conv_in, L.la_conv1d); // [kv_dim, T, 1]
-            conv = ggml_silu(g.ctx, conv);
-            if (il == 0) ggml_set_name(conv, "t_l0_la_conv");
-
-            // split q/k/v heads (channels: q 2*group*Sk? no: q,k = group*Sk each, v = inner)
-            const int qk_dim = ssm_n_group * Sk;
-            auto head_view = [&](int block, int dim, int heads) {
-                return ggml_view_3d(g.ctx, conv, dim, heads, T,
-                                    (size_t)dim * ggml_element_size(conv),
-                                    (size_t)kv_dim * ggml_element_size(conv),
-                                    (size_t)block * qk_dim * ggml_element_size(conv));
-            };
-            ggml_tensor * q_conv = head_view(0, Sk, ssm_n_group);
-            ggml_tensor * k_conv2 = head_view(1, Sk, ssm_n_group);
-            ggml_tensor * v_conv = head_view(2, Sk, Hv);               // v block offset 2*qk_dim
-            // l2 norm over the head dim (FLA kernel semantics)
-            auto l2n = [&](ggml_tensor * t) {
-                const float n = (float)t->ne[0];
-                return ggml_scale(g.ctx, ggml_rms_norm(g.ctx, t, 1e-6f / n), 1.0f / sqrtf(n));
-            };
-            q_conv = l2n(q_conv);
-            k_conv2 = l2n(k_conv2);
-            q_conv = ggml_reshape_4d(g.ctx, q_conv, Sk, ssm_n_group, T, 1);
-            k_conv2 = ggml_reshape_4d(g.ctx, k_conv2, Sk, ssm_n_group, T, 1);
-            v_conv = ggml_cont(g.ctx, v_conv);      // head_view leaves a strided view
-            v_conv = ggml_reshape_4d(g.ctx, v_conv, Sk, Hv, T, 1);
-
-            // fused gated delta net; the result packs scores + K=1 state snapshot
-            ggml_tensor * ssm_in = (state_slot == 1 ? ssm_state_b : state_slot == 2 ? ssm_state_c : ssm_state)[si];
-            ggml_tensor * s0 = ggml_reshape_4d(g.ctx, ssm_in, Sk, Sk, Hv, 1);
-            ggml_tensor * res = ggml_gated_delta_net(g.ctx, q_conv, k_conv2, v_conv, gk, beta,
-                                                     s0, /*K=*/(spec && getenv("QWEN35_SPEC_K1") == nullptr) ? 2 : 1);
-            ggml_tensor * out = ggml_view_4d(g.ctx, res, Sk, Hv, T, 1,
-                                             ggml_row_size(res->type, Sk),
-                                             ggml_row_size(res->type, Sk * Hv),
-                                             ggml_row_size(res->type, Sk * Hv * T), 0);
-            ggml_tensor * new_state = ggml_view_3d(g.ctx, res, Sk, Sk, Hv,
-                                                   ggml_row_size(res->type, Sk),
-                                                   ggml_row_size(res->type, Sk * Sk),
-                                                   ggml_row_size(res->type, Sk * Hv * T));
-            tie_state(ggml_cpy(g.ctx, new_state, ssm_state[si]));
-            if (spec) {
-                // snapshot layout: [scores T cols][slot0 = final][slot1 = one token back]
-                ggml_tensor * snap1 = ggml_view_3d(g.ctx, res, Sk, Sk, Hv,
-                        Sk * ggml_element_size(res), Sk * Sk * ggml_element_size(res),
-                        ggml_row_size(res->type, Sk * Hv * (T + Sk)));
-                tie_state(ggml_cpy(g.ctx, snap1, ssm_state_b[si]));
-                tie_state(ggml_cpy(g.ctx, s0,
-                                                         ggml_reshape_3d(g.ctx, ssm_state_c[si], Sk, Sk, Hv)));
-            }
-            if (il == 0) ggml_set_name(out, "t_l0_la_core");
-
-            // gated RMSNorm over the head dim, gated by silu(z)
-            ggml_tensor * zn = ggml_reshape_3d(g.ctx, z, Sk, Hv, T);
-            ggml_tensor * on = ggml_rms_norm(g.ctx, out, rms_eps);
-            on = ggml_mul(g.ctx, on, L.la_norm);
-            on = ggml_mul(g.ctx, on, ggml_silu(g.ctx, zn));
-            ggml_tensor * flat = ggml_reshape_2d(g.ctx, on, ssm_d_inner, T);
-            attn_out = ggml_mul_mat(g.ctx, L.la_out, flat);
-            if (state_dep)   // serialize the state copies into the main chain (+0)
-                attn_out = ggml_add(g.ctx, attn_out, state_dep);
         }
 
         x = ggml_add(g.ctx, x, attn_out);

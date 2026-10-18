@@ -27,12 +27,16 @@
 //         (cq/cqn/co + tanh gates ga/gm + the xattn flag). ck/cv/ckn stay
 //         backend-side: the cross KV is projected once at load/media time into
 //         the caller's own caches, never written from the text graph.
-//   * qwen3_5 (delta-net linear-attention hybrid layers): its recurrent layers
-//         share norm/wo/SwiGLU but replace rope+FA+cache entirely with a
-//         chunked delta-rule scan; needs the same hooks.attention override
-//         (plus hooks.attention_in to feed it the post-norm stream rather
-//         than per-head q/k/v, or a weights.fused_qkv_null fast path), and a
-//         BlockHooks::after_layer for its per-layer recurrent state plumbing.
+//   * qwen3_5: DONE - the 18 gated-delta linear-attention layers go through
+//         hooks.attention (the hook receives the post-norm stream, exactly the
+//         moss precedent; the "attention_in" split and after_layer plumbing
+//         this note once asked for proved unnecessary). The recurrent states
+//         (conv/ssm, 3 rollback slots) stay the caller's and are captured by
+//         the hook closure; the 6 full-attention layers remain handwritten
+//         in the backend (interleaved q|gate projection + IMROPE + the
+//         per-token verify FA are shapes the block has no opinion on).
+//         Attention-only layers (videojev trim: no post-norm/MLP at all) are
+//         served by the !L.gate skip in block().
 //   * smolvlm: DONE - it needed qn/kn null (no per-head norms) and that is all.
 //         The "no rope" note here was wrong: SmolLM2 ropes (NEOX, theta 1e5), so
 //         it passes pos like VideoChat3. mask==nullptr still always means an
@@ -232,6 +236,10 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     if (dbg) ggml_set_name(x, "t_l0_resid");
     }   // ---- end of the non-hook attention segment (kept verbatim)
 
+    // attention-only layer (qwen3_5's VideoJev trim): no post-norm/MLP at all
+    // - the block ends after the attention residual. Existing tenants always
+    // pass both, so the guard never fires on their node streams.
+    if (!L.ffn_norm || !L.gate) return x;
     ggml_tensor * m = ggml_rms_norm(ctx, x, c.rms_eps);
     m = ggml_mul(ctx, m, L.ffn_norm);
     ggml_tensor * gate = ggml_mul_mat(ctx, L.gate, m);
