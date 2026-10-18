@@ -105,6 +105,7 @@ struct LoadOptions {
 struct Capabilities {
     bool image = true;
     bool video = false;
+    bool audio = false;          // consumes audio tracks (omni / embgemma2)
     // moondream3.1 skill surface
     bool caption = false;        // short / normal / long
     bool detect = false;         // bounding boxes
@@ -198,6 +199,7 @@ struct ArchInfo {
     bool needs_tokenizer = true;      // tokenizer.json (or an HF checkpoint dir)
     bool needs_vision_gguf = false;   // moondream3: a *-vision.gguf sibling
     bool pure_vision = false;         // video tower: no tokenizer, no text side
+    const char * web_page = "vc3.html";  // generic web UI page for this arch
 };
 
 ArchInfo arch_info(const std::string & arch);

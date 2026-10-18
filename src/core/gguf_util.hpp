@@ -9,7 +9,9 @@
 #include "gguf.h"
 
 #include <cstring>
+#include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vqa {
@@ -69,6 +71,23 @@ inline void tensor_to_f32(ggml_tensor * t, float * dst) {
     } else {
         const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
         tt->to_float(t->data, dst, n);
+    }
+}
+
+// Per-layer tensor binding: every backend has the same "char b[96]; snprintf
+// name; ggml_get_tensor; assign to field" loop for its layer structs. Fields
+// are (suffix, target) pairs; the layer index is substituted into `prefix`
+// (printf style, one %d). A missing tensor is reported once and leaves the
+// target null - callers keep their own null-check loop for the return value.
+inline void bind_layer(ggml_context * ctx, const char * prefix, int idx,
+                       std::initializer_list<std::pair<const char *, ggml_tensor **>> fields) {
+    for (auto & f : fields) {
+        char name[128];
+        snprintf(name, sizeof(name), prefix, idx);
+        const size_t len = strlen(name);
+        snprintf(name + len, sizeof(name) - len, ".%s", f.first);
+        *f.second = ggml_get_tensor(ctx, name);
+        if (!*f.second) fprintf(stderr, "missing tensor: %s\n", name);
     }
 }
 

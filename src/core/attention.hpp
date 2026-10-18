@@ -82,6 +82,23 @@ inline void set_window_mask(ggml_tensor * dst, const std::vector<int> & lo,
     ggml_backend_tensor_set(dst, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
 }
 
+// block-diagonal mask for bidirectional chunk-local attention (windowed ViT
+// blocks, audio chunk attention): query t attends every key inside its own
+// span and nothing outside. spans is a sorted list of span start offsets; the
+// last span runs to S.
+inline void set_blockdiag_mask(ggml_tensor * dst, const std::vector<int> & spans) {
+    const int S = (int)dst->ne[0];
+    std::vector<ggml_fp16_t> mv((size_t)S * S, ggml_fp32_to_fp16(-INFINITY));
+    for (size_t i = 0; i < spans.size(); i++) {
+        const int lo = spans[i];
+        const int hi = (i + 1 < spans.size()) ? spans[i + 1] : S;
+        for (int t = lo; t < hi; t++)
+            for (int s = lo; s < hi; s++)
+                mv[(size_t)t * S + s] = ggml_fp32_to_fp16(0.0f);
+    }
+    ggml_backend_tensor_set(dst, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
+}
+
 // static decode graphs want fixed-size KV windows: round the context up to a
 // block so the graph object stays identical across steps (required for ggml CUDA
 // graph capture) while attention still only streams the used part of the block.

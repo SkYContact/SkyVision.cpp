@@ -279,11 +279,9 @@ std::string run_ask(vqa::Model * m, const vqa::MediaInput & media, const std::st
     return out;
 }
 
-// moondream's adapter reports only image/video in Capabilities (its skills are
-// gated at call time by the region head being loaded), so the skill surface is
-// arch-derived here instead of trusting the flags alone.
-bool has_skill(const vqa::ModelEntry & e, const vqa::Capabilities & c, const char * skill) {
-    if (e.arch == "moondream3" && strcmp(skill, "video") != 0) return true;
+// the skill surface comes from the backend's Capabilities; moondream's adapter
+// sets the skill flags from which side heads actually loaded.
+bool has_skill(const vqa::Capabilities & c, const char * skill) {
     if (!strcmp(skill, "caption")) return c.caption;
     if (!strcmp(skill, "detect")) return c.detect;
     if (!strcmp(skill, "point")) return c.point;
@@ -295,11 +293,12 @@ bool has_skill(const vqa::ModelEntry & e, const vqa::Capabilities & c, const cha
 vqa::json::Value caps_json(const vqa::ModelEntry & e, const vqa::Capabilities & c) {
     auto o = vqa::json::Value::make_object();
     o.set("image", vqa::json::Value::make_bool(c.image));
-    o.set("video", vqa::json::Value::make_bool(has_skill(e, c, "video")));
-    o.set("caption", vqa::json::Value::make_bool(has_skill(e, c, "caption")));
-    o.set("detect", vqa::json::Value::make_bool(has_skill(e, c, "detect")));
-    o.set("point", vqa::json::Value::make_bool(has_skill(e, c, "point")));
-    o.set("gaze", vqa::json::Value::make_bool(has_skill(e, c, "gaze")));
+    o.set("video", vqa::json::Value::make_bool(has_skill(c, "video")));
+    o.set("audio", vqa::json::Value::make_bool(c.audio));
+    o.set("caption", vqa::json::Value::make_bool(has_skill(c, "caption")));
+    o.set("detect", vqa::json::Value::make_bool(has_skill(c, "detect")));
+    o.set("point", vqa::json::Value::make_bool(has_skill(c, "point")));
+    o.set("gaze", vqa::json::Value::make_bool(has_skill(c, "gaze")));
     return o;
 }
 
@@ -415,7 +414,7 @@ bool tool_describe_image(const vqa::json::Value & a, std::string & out, std::str
     if (!m) return false;
     if (!m->caps().image) { err = "backend '" + e->arch + "' does not take image input"; return false; }
     // caption is moondream's dedicated skill; otherwise ask for a description
-    const bool caption = has_skill(*e, m->caps(), "caption");
+    const bool caption = has_skill(m->caps(), "caption");
     out = run_ask(m, media, caption ? length : std::string("Describe this image in detail."),
                   caption ? std::string("caption") : std::string(), a, err);
     return err.empty();
@@ -446,7 +445,7 @@ bool tool_detect_objects(const vqa::json::Value & a, std::string & out, std::str
     if (!load_image_param(image, media, err)) return false;
     vqa::Model * m = ensure_model(*e, a, err);
     if (!m) return false;
-    if (!has_skill(*e, m->caps(), "detect")) {
+    if (!has_skill(m->caps(), "detect")) {
         err = "backend '" + e->arch + "' has no detect skill (needs moondream3 + *-region.gguf)";
         return false;
     }
@@ -491,7 +490,7 @@ bool tool_point_objects(const vqa::json::Value & a, std::string & out, std::stri
     if (!load_image_param(image, media, err)) return false;
     vqa::Model * m = ensure_model(*e, a, err);
     if (!m) return false;
-    if (!has_skill(*e, m->caps(), "point")) {
+    if (!has_skill(m->caps(), "point")) {
         err = "backend '" + e->arch + "' has no point skill (needs moondream3 + *-region.gguf)";
         return false;
     }
@@ -537,7 +536,7 @@ bool tool_gaze_point(const vqa::json::Value & a, std::string & out, std::string 
     if (!load_image_param(image, media, err)) return false;
     vqa::Model * m = ensure_model(*e, a, err);
     if (!m) return false;
-    if (!has_skill(*e, m->caps(), "gaze")) {
+    if (!has_skill(m->caps(), "gaze")) {
         err = "backend '" + e->arch + "' has no gaze skill (needs moondream3 + *-region.gguf)";
         return false;
     }
@@ -581,7 +580,7 @@ bool tool_analyze_video(const vqa::json::Value & a, std::string & out, std::stri
     if (!load_video_param(video, fps, max_frames, media, err)) return false;
     vqa::Model * m = ensure_model(*e, a, err);
     if (!m) return false;
-    if (!has_skill(*e, m->caps(), "video")) {
+    if (!has_skill(m->caps(), "video")) {
         err = "backend '" + e->arch + "' does not take video input (use VideoChat3 / Qwen3.5 / "
               "Marlin / MOSS-VL / VideoMAE)";
         return false;

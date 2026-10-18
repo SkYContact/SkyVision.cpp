@@ -69,42 +69,43 @@ struct ArchEntry {
     size_t vocab_target;           // fallback when the GGUF has no vocab_size
     bool needs_vision_gguf;        // moondream3: a *-vision.gguf sibling
     bool pure_vision;              // video tower: no tokenizer, no text side
+    const char * web_page;         // dedicated web UI page ("" = generic vc3.html)
 };
 
 const ArchEntry kArchs[] = {
     // The moondream3 engine lives behind the same interface via its adapter
     // (moondream_vqa_adapter.inc), so every backend is reachable from one binary.
     { { "moondream3", "moondream", nullptr }, create_moondream,
-      TokenizerMode::PlainGpt2, "models/moondream3.1", 51200, /*vision_gguf*/ true, false },
+      TokenizerMode::PlainGpt2, "models/moondream3.1", 51200, /*vision_gguf*/ true, false, "moondream.html" },
     { { "videochat3", nullptr }, create_videochat3,
-      TokenizerMode::Qwen2Regex, "models/VideoChat3-4B", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "models/VideoChat3-4B", 151936, false, false, "" },
     // marlin = legacy GGUF label for the same qwen3.5 backbone; videojev =
     // qwen3.5 + a cosine decision head (score-only inference)
     { { "qwen3_5", "marlin", "videojev" }, create_qwen3_5,
-      TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 151936, false, false, "" },
     { { "moss_vl", nullptr }, create_moss_vl,
-      TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false, "moss.html" },
     // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk
     { { "smolvlm", "idefics3", nullptr }, create_smolvlm,
-      TokenizerMode::Gpt2Regex, "", 151936, false, false },
+      TokenizerMode::Gpt2Regex, "", 151936, false, false, "" },
     { { "qwen2vl", "qwen2_5_vl", nullptr }, create_qwen2vl,
-      TokenizerMode::Qwen2Regex, "", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "", 151936, false, false, "" },
     // video towers: labels or pooled embedding. ViViT is the same graph with a
     // cls token + learned position table, so it reuses the videomae backend.
     { { "videomae", "vivit", nullptr }, create_videomae,
-      TokenizerMode::Qwen2Regex, "", 0, false, true },
+      TokenizerMode::Qwen2Regex, "", 0, false, true, "" },
     // Mage-VL-4B: Mage-ViT codec ViT + Qwen3-4B trunk; realtime gate gguf
     // (mage-gate-f16.gguf) sits next to the model gguf and loads when present
     { { "mage_vl", nullptr }, create_mage_vl,
-      TokenizerMode::Qwen2Regex, "models/Mage-VL", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "models/Mage-VL", 151936, false, false, "" },
     // Qwen2.5-Omni thinker: Qwen2.5 trunk + Qwen2.5-VL tower + Whisper audio;
     // the talker gguf (speech output) is an optional sibling of the gguf
     { { "qwen25omni", "qwen2_5_omni", nullptr }, create_qwen25omni,
-      TokenizerMode::Qwen2Regex, "", 151936, false, false },
+      TokenizerMode::Qwen2Regex, "", 151936, false, false, "" },
     // EmbeddingGemma-2: bidirectional text encoder (PLE) + Gemma4 vision/audio
     // towers fused as soft tokens; embedding output via Model::embed
     { { "embgemma2", nullptr }, create_embedgemma2,
-      TokenizerMode::GemmaSP, "models/embeddinggemma-2", 262144, false, false },
+      TokenizerMode::GemmaSP, "models/embeddinggemma-2", 262144, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {
@@ -132,13 +133,19 @@ ArchInfo arch_info(const std::string & arch) {
     a.needs_vision_gguf = e->needs_vision_gguf;
     a.pure_vision = e->pure_vision;
     a.needs_tokenizer = !e->pure_vision;
+    a.web_page = (e->web_page && e->web_page[0]) ? e->web_page : "vc3.html";
     return a;
 }
 
+// qwen3.5 aliases that ship as their own checkpoints get their own tokenizer
+// dir instead of the shared default_dir above them in the arch table
 std::string default_tokenizer_dir(const std::string & arch) {
-    // qwen3.5 aliases that ship as their own checkpoints get their own dir
-    if (arch == "marlin")   return "models/Marlin-2B";
-    if (arch == "videojev") return "models/VideoJev-4B";
+    static const struct { const char * name, * dir; } kAliasDirs[] = {
+        { "marlin",   "models/Marlin-2B" },
+        { "videojev", "models/VideoJev-4B" },
+    };
+    for (const auto & a : kAliasDirs)
+        if (arch == a.name) return a.dir;
     const ArchEntry * e = find_arch(arch);
     return (e && e->default_dir[0]) ? std::string(e->default_dir) : std::string();
 }

@@ -144,5 +144,14 @@ inline Bound bind_to_backend(ggml_context * wctx, ggml_backend_t backend, const 
     return out;
 }
 
+// Host f32 copy of a weight tensor. Needed when a graph builder reads weight
+// values on the host (mel filterbanks, mm_proj snapshots) but the tensor now
+// lives in a device buffer after bind_to_backend - its ->data is a device
+// pointer that must not be dereferenced.
+inline void snapshot_to_f32_host(ggml_tensor * t, std::vector<float> & out) {
+    out.resize((size_t)ggml_nelements(t));
+    gguf::tensor_to_f32(t, out.data());
+}
+
 }  // namespace weights
 }  // namespace vqa

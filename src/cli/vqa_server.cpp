@@ -651,9 +651,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         const ModelEntry * e = find_model(id);
         if (!e) { send(c, "404 Not Found", "text/plain", "unknown model"); return true; }
         g_arch_placeholder = e->arch;
-        serve_page(e->arch == "moondream3" ? "moondream.html"
-                 : e->arch == "moss_vl" ? "moss.html"
-                 : "vc3.html");   // videochat3 / qwen3_5 / marlin / videomae
+        serve_page(vqa::arch_info(e->arch).web_page);   // per-arch page from the arch table
         return true;
     }
     send(c, "404 Not Found", "text/plain", "not found");
