@@ -24,6 +24,7 @@
 #include "gguf.h"
 #include "gguf_util.hpp"
 #include "load_util.hpp"
+#include "qwen2vl_tower.hpp"
 #include "resample.hpp"
 #include "sampler.hpp"
 #include "weight_load.hpp"
@@ -57,15 +58,6 @@ struct TxtLayer {
     ggml_tensor *wv = nullptr, *bv = nullptr;
     ggml_tensor *wo = nullptr;
     ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-};
-
-struct VisLayer {
-    ggml_tensor *ln1 = nullptr, *ln2 = nullptr;
-    ggml_tensor *wqkv = nullptr, *bqkv = nullptr;
-    ggml_tensor *wo = nullptr, *bo = nullptr;
-    ggml_tensor *wg = nullptr, *bg = nullptr;
-    ggml_tensor *wu = nullptr, *bu = nullptr;
-    ggml_tensor *wd = nullptr, *bd = nullptr;
 };
 
 // one text graph: prefill (T tokens) or one decode step (T=1)
@@ -111,6 +103,17 @@ private:
 
     bool encode_audio(const vqa::MediaInput & media, std::vector<float> & feats, int * n_tokens);
 
+    // shared-tower debug hooks (see qwen2vl_tower.hpp)
+    static void tower_after_patch_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                   int v_embd, int N, ggml_tensor * x);
+    static void tower_before_layers_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                     int v_layer, int v_embd, int N);
+    static void tower_after_layer0_attn_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                         int v_embd, int N, ggml_tensor * x);
+    static void tower_after_layer_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                   int il, int v_embd, int N, ggml_tensor * x);
+    static void tower_after_run_(void * ud, ggml_cgraph * gf);
+
     bool build_text_graph(TextGraph & g, int T, int S, int n_img, int n_aud,
                           bool for_talker = false);
     bool run_text(TextGraph & g, const std::vector<int> & toks, const std::vector<int> & pos4,
@@ -137,7 +140,11 @@ private:
     float v_eps = 1e-6f, v_rope_theta = 10000.0f;
     float v_mean[3] = { 0.48145466f, 0.4578275f, 0.40821073f };   // CLIP stats (processor config)
     float v_std[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
-    int n_patches_x = 0, n_patches_y = 0;
+
+    // shared Qwen2.5-VL vision tower (graph, weights, config) - see
+    // core/qwen2vl_tower.hpp; the v_* fields above mirror tower_.cfg and stay
+    // in sync from the gguf metadata in load_weights()
+    vqa::qwen2vl_tower::Tower tower_;
 
     AudioTower audio;
 
@@ -151,17 +158,6 @@ private:
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr, *out_head = nullptr;
     std::vector<TxtLayer> tl;
 
-    ggml_tensor *v_patch_w = nullptr;
-    ggml_tensor *v_merger_ln = nullptr, *v_mm1_w = nullptr, *v_mm1_b = nullptr;
-    ggml_tensor *v_mm2_w = nullptr, *v_mm2_b = nullptr;
-    std::vector<VisLayer> vl;
-
-    // vision graph (rebuilt per image)
-    ggml_context * vctx = nullptr;
-    ggml_cgraph * vgf = nullptr;
-    ggml_tensor *v_in = nullptr, *v_pos = nullptr, *v_mask = nullptr;
-    ggml_tensor *v_idx_in = nullptr, *v_idx_out = nullptr;
-    ggml_tensor *v_feats = nullptr;
     ggml_tensor *v_patch_sink = nullptr;   // guards the patch-embed dump read
     ggml_context * v_dump_ctx2 = nullptr, * v_dump_ctx3 = nullptr;   // layer-0 probes
     ggml_tensor * v_probe0 = nullptr, * v_probe1 = nullptr, * v_probe2 = nullptr;
@@ -208,7 +204,7 @@ private:
 
 Qwen25Omni::~Qwen25Omni() {
     kv.free();
-    if (vctx) ggml_free(vctx);
+    tower_.free();
     if (allocr) ggml_gallocr_free(allocr);
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wctx) ggml_free(wctx);
@@ -283,6 +279,24 @@ bool Qwen25Omni::load_weights(const char * path) {
     }
     v_hd = v_embd / (v_head > 0 ? v_head : 1);
 
+    tower_.cfg.n_layer = v_layer;  tower_.cfg.n_embd = v_embd;
+    tower_.cfg.n_head = v_head;    tower_.cfg.n_hd = v_hd;
+    tower_.cfg.n_patch = v_patch;  tower_.cfg.n_temporal = v_temporal;
+    tower_.cfg.n_merge = v_merge;  tower_.cfg.n_out = v_out;
+    tower_.cfg.n_window = v_window; tower_.cfg.n_wa_pattern = n_wa_pattern;
+    tower_.cfg.eps = v_eps;        tower_.cfg.rope_theta = v_rope_theta;
+    for (int c = 0; c < 3; c++) {
+        tower_.cfg.img_mean[c] = v_mean[c];
+        tower_.cfg.img_std[c] = v_std[c];
+    }
+    tower_.hooks.max_layers_env = "QOMNI_MAX_VLAYERS";
+    tower_.hooks.ud = this;
+    tower_.hooks.after_patch = &Qwen25Omni::tower_after_patch_;
+    tower_.hooks.before_layers = &Qwen25Omni::tower_before_layers_;
+    tower_.hooks.after_layer0_attn = &Qwen25Omni::tower_after_layer0_attn_;
+    tower_.hooks.after_layer = &Qwen25Omni::tower_after_layer_;
+    tower_.hooks.after_run = &Qwen25Omni::tower_after_run_;
+
     audio.n_layer = vqa::gguf::u32(gu, "qwen25omni.audio.block_count", audio.n_layer);
     audio.n_embd  = vqa::gguf::u32(gu, "qwen25omni.audio.embedding_length", audio.n_embd);
     audio.n_ff    = vqa::gguf::u32(gu, "qwen25omni.audio.feed_forward_length", audio.n_ff);
@@ -331,15 +345,15 @@ bool Qwen25Omni::load_weights(const char * path) {
         if (!L.norm || !L.wq || !L.wk || !L.wv || !L.wo || !L.ffn_norm || !L.gate || !L.up || !L.down)
             return false;
     }
-    v_patch_w = gt("v.patch_embed.weight");
-    v_merger_ln = gt("v.merger.ln.weight");
-    v_mm1_w = gt("v.merger.fc1.weight"); v_mm1_b = gt("v.merger.fc1.bias");
-    v_mm2_w = gt("v.merger.fc2.weight"); v_mm2_b = gt("v.merger.fc2.bias");
-    vl.resize((size_t)v_layer);
+    tower_.w.patch_w = gt("v.patch_embed.weight");
+    tower_.w.merger_ln = gt("v.merger.ln.weight");
+    tower_.w.mm1_w = gt("v.merger.fc1.weight"); tower_.w.mm1_b = gt("v.merger.fc1.bias");
+    tower_.w.mm2_w = gt("v.merger.fc2.weight"); tower_.w.mm2_b = gt("v.merger.fc2.bias");
+    tower_.w.layers.resize((size_t)v_layer);
     for (int i = 0; i < v_layer; i++) {
         char b[96];
         auto g = [&](const char * suf) { snprintf(b, sizeof(b), "v.blk.%d.%s", i, suf); return gt(b); };
-        VisLayer & L = vl[(size_t)i];
+        vqa::qwen2vl_tower::Layer & L = tower_.w.layers[(size_t)i];
         L.ln1 = g("norm1.weight"); L.ln2 = g("norm2.weight");
         L.wqkv = g("wqkv.weight"); L.bqkv = g("wqkv.bias");
         L.wo = g("wo.weight"); L.bo = g("wo.bias");
@@ -487,6 +501,7 @@ bool Qwen25Omni::load(const std::string & gguf_path, const std::string & tokeniz
     id_eos = id_im_end;
     caps_.image = true;
     caps_.video = false;
+    caps_.audio = true;   // whisper encoder consumes audio tracks
     // optional talker sibling: any qwen25omni-talker-*.gguf next to the thinker
     {
         std::string dir = gguf_path;
@@ -512,176 +527,10 @@ bool Qwen25Omni::load(const std::string & gguf_path, const std::string & tokeniz
 // bakes the same tensor names.
 
 bool Qwen25Omni::build_vision_graph(int gh, int gw) {
-    if (vctx) { ggml_free(vctx); vctx = nullptr; }
-    const int N = gh * gw;
-    const int nm = N / (v_merge * v_merge);
-    const int C3 = 3 * v_temporal * v_patch * v_patch;
-
-    struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, /*no_alloc*/ true };
-    vctx = ggml_init(ip);
-    if (!vctx) return false;
-    vgf = ggml_new_graph_custom(vctx, 65536, false);
-
-    v_in = ggml_new_tensor_2d(vctx, GGML_TYPE_F32, C3, N);
-    ggml_set_name(v_in, "v_patches");
-    v_pos = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, 4 * N);
-    ggml_set_name(v_pos, "v_pos");
-    const bool wa = n_wa_pattern > 0;
-    if (wa) {
-        v_mask = ggml_new_tensor_2d(vctx, GGML_TYPE_F16, N, N);
-        ggml_set_name(v_mask, "v_mask");
-        v_idx_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, nm);
-        ggml_set_name(v_idx_in, "v_idx_in");
-        v_idx_out = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, nm);
-        ggml_set_name(v_idx_out, "v_idx_out");
-    }
-
-    // window-major reorder, applied to the 2x2 groups (4 patch rows at a time)
-    ggml_tensor * x = v_in;
-    if (wa) {
-        x = ggml_reshape_2d(vctx, x, C3 * 4, nm);
-        x = ggml_get_rows(vctx, x, v_idx_in);
-        x = ggml_reshape_2d(vctx, x, C3, N);
-    }
-    x = ggml_mul_mat(vctx, v_patch_w, x);               // [v_embd, N]
-    ggml_set_name(x, "v_patch_out");
-    if (getenv("QOMNI_VB0_DUMP")) {   // layer-0 bisection probes (persistent
-        v_dump_ctx2 = v_dump_ctx2 ? v_dump_ctx2 : ggml_init(   // buffer trick)
-            { (size_t)8 * ggml_tensor_overhead(), NULL, true });
-        if (!v_probe0) {
-            v_probe0 = ggml_new_tensor_2d(v_dump_ctx2, GGML_TYPE_F32, v_embd, N);
-            v_probe1 = ggml_new_tensor_1d(v_dump_ctx2, GGML_TYPE_I32, N);
-            ggml_backend_alloc_ctx_tensors(v_dump_ctx2, backend);
-            std::vector<int> r(N);
-            for (int i = 0; i < N; i++) r[i] = i;
-            ggml_backend_tensor_set(v_probe1, r.data(), 0, sizeof(int) * N);
-        }
-        ggml_build_forward_expand(vgf, ggml_set_rows(vctx, v_probe0,
-            ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N), v_probe1));
-    }
-    if (getenv("QOMNI_VPATCH_DUMP")) {   // dup: the bare buffer gets reused
-        v_patch_sink = ggml_dup(vctx, x);
-        ggml_build_forward_expand(vgf, v_patch_sink);
-    }
-
-    // 4D M-RoPE sections: head_dim/4 each, positions (h, w, h, w)
-    int vsec[4] = { v_hd / 4, v_hd / 4, v_hd / 4, v_hd / 4 };
-
-    int v_max = v_layer;   // QOMNI_MAX_VLAYERS=N truncates the tower for bisecting
-    if (const char * e = getenv("QOMNI_MAX_VLAYERS")) v_max = std::min(v_layer, atoi(e));
-    if (getenv("QOMNI_VLAYER_DUMP")) {   // persistent per-layer dump buffers,
-        if (v_dump_ctx) { ggml_free(v_dump_ctx); v_dump_ctx = nullptr; }
-        struct ggml_init_params dip = { (size_t)(v_layer * 2 + 8) * ggml_tensor_overhead(),
-                                        NULL, true };
-        v_dump_ctx = ggml_init(dip);
-        v_dump_bufs.assign(v_layer, nullptr);
-        for (int il = 0; il < v_layer; il++)
-            v_dump_bufs[il] = ggml_new_tensor_2d(v_dump_ctx, GGML_TYPE_F32, v_embd, N);
-        v_dump_rows = ggml_new_tensor_1d(v_dump_ctx, GGML_TYPE_I32, N);
-        v_dump_alloc = ggml_backend_alloc_ctx_tensors(v_dump_ctx, backend);
-        ggml_backend_buffer_clear(v_dump_alloc, 0);
-        std::vector<int> r(N);
-        for (int i = 0; i < N; i++) r[i] = i;
-        ggml_backend_tensor_set(v_dump_rows, r.data(), 0, sizeof(int) * N);
-    }
-    for (int il = 0; il < v_max; il++) {
-        VisLayer & L = vl[(size_t)il];
-        const bool full_attn = !wa || ((il + 1) % n_wa_pattern == 0);
-
-        ggml_tensor * h = ggml_rms_norm(vctx, x, v_eps);
-        h = ggml_mul(vctx, h, L.ln1);
-        ggml_tensor * qkv = ggml_mul_mat(vctx, L.wqkv, h);   // [3*v_embd, N]
-        qkv = ggml_add(vctx, qkv, L.bqkv);
-        if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
-
-        const size_t row = qkv->nb[1];
-        ggml_tensor * q = ggml_view_2d(vctx, qkv, v_embd, N, row, 0);
-        ggml_tensor * k = ggml_view_2d(vctx, qkv, v_embd, N, row,
-                                       (size_t)v_embd * sizeof(float));
-        ggml_tensor * v = ggml_view_2d(vctx, qkv, v_embd, N, row,
-                                       (size_t)2 * v_embd * sizeof(float));
-        ggml_tensor * q3 = ggml_reshape_3d(vctx, ggml_cont(vctx, q), v_hd, v_head, N);
-        ggml_tensor * k3 = ggml_reshape_3d(vctx, ggml_cont(vctx, k), v_hd, v_head, N);
-        ggml_tensor * v3 = ggml_reshape_3d(vctx, ggml_cont(vctx, v), v_hd, v_head, N);
-
-        q3 = ggml_rope_multi(vctx, q3, v_pos, nullptr, v_hd / 2, vsec,
-                             GGML_ROPE_TYPE_VISION, 32768, v_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_multi(vctx, k3, v_pos, nullptr, v_hd / 2, vsec,
-                             GGML_ROPE_TYPE_VISION, 32768, v_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (il == 0) ggml_set_name(q3, "v_blk0_q_rope");
-
-        ggml_tensor * qf = ggml_cont(vctx, ggml_permute(vctx, q3, 0, 2, 1, 3));   // [hd, N, head]
-        ggml_tensor * kf = ggml_cont(vctx, ggml_permute(vctx, k3, 0, 2, 1, 3));
-        ggml_tensor * vf = ggml_cont(vctx, ggml_permute(vctx, v3, 0, 2, 1, 3));
-        ggml_tensor * mask = full_attn ? nullptr : v_mask;
-        ggml_tensor * fa = ggml_flash_attn_ext(vctx, qf, kf, vf, mask,
-                                               1.0f / sqrtf((float)v_hd), 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(vctx, ggml_cont(vctx, fa), v_embd, N);
-        attn = ggml_mul_mat(vctx, L.wo, attn);
-        attn = ggml_add(vctx, attn, L.bo);
-        x = ggml_add(vctx, x, attn);
-        if (il == 0) ggml_set_name(x, "v_blk0_attn_out");
-        if (il == 0 && getenv("QOMNI_VB0_DUMP")) {
-            v_dump_ctx3 = ggml_init({ (size_t)4 * ggml_tensor_overhead(), NULL, true });
-            v_probe2 = ggml_new_tensor_2d(v_dump_ctx3, GGML_TYPE_F32, v_embd, N);
-            ggml_backend_alloc_ctx_tensors(v_dump_ctx3, backend);
-            ggml_build_forward_expand(vgf, ggml_set_rows(vctx, v_probe2,
-                ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N), v_probe1));
-        }
-
-        h = ggml_rms_norm(vctx, x, v_eps);
-        h = ggml_mul(vctx, h, L.ln2);
-        ggml_tensor * g = ggml_mul_mat(vctx, L.wg, h);
-        g = ggml_add(vctx, g, L.bg);
-        ggml_tensor * u = ggml_mul_mat(vctx, L.wu, h);
-        u = ggml_add(vctx, u, L.bu);
-        h = ggml_mul(vctx, ggml_silu(vctx, g), u);
-        h = ggml_mul_mat(vctx, L.wd, h);
-        h = ggml_add(vctx, h, L.bd);
-        x = ggml_add(vctx, x, h);
-        if (il == 0) ggml_set_name(x, "v_blk0_out");
-        if (il == 15) ggml_set_name(x, "v_blk15_out");
-        if (v_dump_rows) {   // per-layer hidden copy into persistent buffers
-            char fn[256];
-            snprintf(fn, sizeof(fn), "%s_L%02d.bin", getenv("QOMNI_VLAYER_DUMP"), il);
-            v_layer_files.push_back(fn);
-            ggml_tensor * src2 = ggml_reshape_2d(vctx, ggml_cont(vctx, x), v_embd, N);
-            ggml_build_forward_expand(vgf,
-                ggml_set_rows(vctx, v_dump_bufs[il], src2, v_dump_rows));
-        }
-    }
-    ggml_set_name(x, "v_final");
-
-    // merger: normalize per token over context_dim (1280) before folding the
-    // 2x2 group into one 4*1280 row
-    ggml_tensor * xn = ggml_rms_norm(vctx, x, v_eps);
-    xn = ggml_mul(vctx, xn, v_merger_ln);
-    ggml_tensor * m = ggml_reshape_2d(vctx, xn, v_embd * v_merge * v_merge, nm);
-    ggml_set_name(m, "v_merge");
-    m = ggml_mul_mat(vctx, v_mm1_w, m);
-    m = ggml_add(vctx, m, v_mm1_b);
-    m = ggml_gelu_erf(vctx, m);
-    m = ggml_mul_mat(vctx, v_mm2_w, m);
-    m = ggml_add(vctx, m, v_mm2_b);
-    ggml_set_name(m, "v_proj_out");
-    if (wa) m = ggml_get_rows(vctx, m, v_idx_out);   // window-major -> raster
-    ggml_set_name(m, "v_feats");
-    v_feats = m;
-    ggml_build_forward_expand(vgf, m);
-
-    if (!ggml_gallocr_alloc_graph(allocr, vgf)) {
-        fprintf(stderr, "vision graph allocation failed\n");
-        return false;
-    }
-    n_patches_x = gw;
-    n_patches_y = gh;
-    return true;
+    return tower_.build(gh, gw, allocr, backend);
 }
 
 bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<float> & feats) {
-    const int N = n_patches_x * n_patches_y;
-    const int nm = N / (v_merge * v_merge);
-
     if (const char * dp = getenv("QOMNI_VIN_DUMP")) {   // raw patchified input
         FILE * f = fopen(dp, "wb");
         if (f) { int r = 1, c = (int)patches.size();
@@ -699,88 +548,93 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
             fclose(f);
         }
     }
-    ggml_backend_tensor_set(v_in, patches.data(), 0, sizeof(float) * patches.size());
+    return tower_.run(backend, patches, feats);
+}
 
-    // positions: 4 arrays (h, w, h, w) in *window-major* patch order
-    {
-        std::vector<int> pos((size_t)4 * N, 0);
-        std::vector<int> idx((size_t)nm), inv((size_t)nm);
-        const int gw = n_patches_x, gh = n_patches_y;
-        const int mw = gw / v_merge, mh = gh / v_merge;
-        const int wgrid = v_window / v_patch / v_merge;   // 4 merged tokens per window side
-        int dst = 0;
-        if (n_wa_pattern > 0) {
-            for (int y = 0; y < mh; y += wgrid) {
-                for (int x = 0; x < mw; x += wgrid) {
-                    const int wh = std::min(wgrid, mh - y), ww = std::min(wgrid, mw - x);
-                    for (int dy = 0; dy < wh; dy++)
-                        for (int dx = 0; dx < ww; dx++) {
-                            const int src = (y + dy) * mw + (x + dx);
-                            idx[(size_t)src] = dst;
-                            inv[(size_t)dst] = src;
-                            dst++;
-                        }
-                }
-            }
-        } else {
-            for (int i = 0; i < nm; i++) { idx[(size_t)i] = i; inv[(size_t)i] = i; }
-        }
-        // patch j of merge group g (raster) sits at window-major slot idx[g]*4 + (j%4)
-        for (int g = 0; g < nm; g++) {
-            const int r = g / mw, c = g % mw;
-            for (int j = 0; j < v_merge * v_merge; j++) {
-                const int dy = j / v_merge, dx = j % v_merge;
-                const int p = idx[(size_t)g] * v_merge * v_merge + j;
-                const int py = r * v_merge + dy, px = c * v_merge + dx;
-                pos[(size_t)p] = py;
-                pos[(size_t)N + p] = px;
-                pos[(size_t)2 * N + p] = py;
-                pos[(size_t)3 * N + p] = px;
-            }
-        }
-        ggml_backend_tensor_set(v_pos, pos.data(), 0, sizeof(int) * pos.size());
-        if (n_wa_pattern > 0) {
-            ggml_backend_tensor_set(v_idx_in, inv.data(), 0, sizeof(int) * inv.size());
-            ggml_backend_tensor_set(v_idx_out, idx.data(), 0, sizeof(int) * idx.size());
-            // block-diagonal mask over the reordered patch tokens
-            std::vector<ggml_fp16_t> mask((size_t)N * N, ggml_fp32_to_fp16(-INFINITY));
-            for (int y = 0; y < mh; y += wgrid) {
-                for (int x = 0; x < mw; x += wgrid) {
-                    const int wh = std::min(wgrid, mh - y), ww = std::min(wgrid, mw - x);
-                    const int got = wh * ww;   // merged tokens in this window
-                    int lo = -1;
-                    for (int dy = 0; dy < wh && lo < 0; dy++)
-                        for (int dx = 0; dx < ww; dx++)
-                            if (idx[(size_t)((y + dy) * mw + (x + dx))] >= 0) {
-                                lo = idx[(size_t)((y + dy) * mw + (x + dx))];
-                                break;
-                            }
-                    if (lo < 0) continue;
-                    const int p0 = lo * v_merge * v_merge;
-                    const int p1 = p0 + got * v_merge * v_merge;
-                    for (int r = p0; r < p1; r++)
-                        for (int s = p0; s < p1; s++)
-                            mask[(size_t)r * N + s] = ggml_fp32_to_fp16(0.0f);
-                }
-            }
-            ggml_backend_tensor_set(v_mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
-        }
-    }
+// ------------------------------------------------------------------ tower hooks
 
-    if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vision compute failed\n");
-        return false;
+void Qwen25Omni::tower_after_patch_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                    int v_embd, int N, ggml_tensor * x) {
+    Qwen25Omni * m = (Qwen25Omni *)ud;
+    if (getenv("QOMNI_VB0_DUMP")) {   // layer-0 bisection probes (persistent
+        m->v_dump_ctx2 = m->v_dump_ctx2 ? m->v_dump_ctx2 : ggml_init(   // buffer trick
+            { (size_t)8 * ggml_tensor_overhead(), NULL, true });
+        if (!m->v_probe0) {
+            m->v_probe0 = ggml_new_tensor_2d(m->v_dump_ctx2, GGML_TYPE_F32, v_embd, N);
+            m->v_probe1 = ggml_new_tensor_1d(m->v_dump_ctx2, GGML_TYPE_I32, N);
+            ggml_backend_alloc_ctx_tensors(m->v_dump_ctx2, m->backend);
+            std::vector<int> r(N);
+            for (int i = 0; i < N; i++) r[i] = i;
+            ggml_backend_tensor_set(m->v_probe1, r.data(), 0, sizeof(int) * N);
+        }
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, m->v_probe0,
+            ggml_reshape_2d(ctx, ggml_cont(ctx, x), v_embd, N), m->v_probe1));
     }
-    for (size_t i = 0; i < v_layer_files.size(); i++) {   // per-layer hiddens
-        std::vector<float> hv((size_t)ggml_nelements(v_dump_bufs[i]));
-        ggml_backend_tensor_get(v_dump_bufs[i], hv.data(), 0, sizeof(float) * hv.size());
-        FILE * f = fopen(v_layer_files[i].c_str(), "wb");
+    if (getenv("QOMNI_VPATCH_DUMP")) {   // dup: the bare buffer gets reused
+        m->v_patch_sink = ggml_dup(ctx, x);
+        ggml_build_forward_expand(gf, m->v_patch_sink);
+    }
+}
+
+void Qwen25Omni::tower_before_layers_(void * ud, ggml_context * /*ctx*/,
+                                      ggml_cgraph * /*gf*/, int v_layer, int v_embd, int N) {
+    Qwen25Omni * m = (Qwen25Omni *)ud;
+    if (getenv("QOMNI_VLAYER_DUMP")) {   // persistent per-layer dump buffers,
+        if (m->v_dump_ctx) { ggml_free(m->v_dump_ctx); m->v_dump_ctx = nullptr; }
+        struct ggml_init_params dip = { (size_t)(v_layer * 2 + 8) * ggml_tensor_overhead(),
+                                        NULL, true };
+        m->v_dump_ctx = ggml_init(dip);
+        m->v_dump_bufs.assign(v_layer, nullptr);
+        for (int il = 0; il < v_layer; il++)
+            m->v_dump_bufs[il] = ggml_new_tensor_2d(m->v_dump_ctx, GGML_TYPE_F32, v_embd, N);
+        m->v_dump_rows = ggml_new_tensor_1d(m->v_dump_ctx, GGML_TYPE_I32, N);
+        m->v_dump_alloc = ggml_backend_alloc_ctx_tensors(m->v_dump_ctx, m->backend);
+        ggml_backend_buffer_clear(m->v_dump_alloc, 0);
+        std::vector<int> r(N);
+        for (int i = 0; i < N; i++) r[i] = i;
+        ggml_backend_tensor_set(m->v_dump_rows, r.data(), 0, sizeof(int) * N);
+    }
+}
+
+void Qwen25Omni::tower_after_layer0_attn_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                          int v_embd, int N, ggml_tensor * x) {
+    Qwen25Omni * m = (Qwen25Omni *)ud;
+    if (getenv("QOMNI_VB0_DUMP")) {
+        m->v_dump_ctx3 = ggml_init({ (size_t)4 * ggml_tensor_overhead(), NULL, true });
+        m->v_probe2 = ggml_new_tensor_2d(m->v_dump_ctx3, GGML_TYPE_F32, v_embd, N);
+        ggml_backend_alloc_ctx_tensors(m->v_dump_ctx3, m->backend);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, m->v_probe2,
+            ggml_reshape_2d(ctx, ggml_cont(ctx, x), v_embd, N), m->v_probe1));
+    }
+}
+
+void Qwen25Omni::tower_after_layer_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                    int il, int v_embd, int N, ggml_tensor * x) {
+    Qwen25Omni * m = (Qwen25Omni *)ud;
+    if (m->v_dump_rows) {   // per-layer hidden copy into persistent buffers
+        char fn[256];
+        snprintf(fn, sizeof(fn), "%s_L%02d.bin", getenv("QOMNI_VLAYER_DUMP"), il);
+        m->v_layer_files.push_back(fn);
+        ggml_tensor * src2 = ggml_reshape_2d(ctx, ggml_cont(ctx, x), v_embd, N);
+        ggml_build_forward_expand(gf,
+            ggml_set_rows(ctx, m->v_dump_bufs[il], src2, m->v_dump_rows));
+    }
+}
+
+void Qwen25Omni::tower_after_run_(void * ud, ggml_cgraph * /*gf*/) {
+    Qwen25Omni * m = (Qwen25Omni *)ud;
+    const int v_embd = m->tower_.cfg.n_embd;
+    const int N = m->tower_.st.n_patches_x * m->tower_.st.n_patches_y;
+    for (size_t i = 0; i < m->v_layer_files.size(); i++) {   // per-layer hiddens
+        std::vector<float> hv((size_t)ggml_nelements(m->v_dump_bufs[i]));
+        ggml_backend_tensor_get(m->v_dump_bufs[i], hv.data(), 0, sizeof(float) * hv.size());
+        FILE * f = fopen(m->v_layer_files[i].c_str(), "wb");
         if (f) { int r = v_embd, c = N;
                  fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
                  fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
     }
-    v_layer_files.clear();
-    if (v_probe0) {
+    m->v_layer_files.clear();
+    if (m->v_probe0) {
         auto wr = [&](ggml_tensor * t, const char * fn) {
             std::vector<float> hv((size_t)ggml_nelements(t));
             ggml_backend_tensor_get(t, hv.data(), 0, sizeof(float) * hv.size());
@@ -789,12 +643,12 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
                      fwrite(&r, 4, 1, f); fwrite(&c, 4, 1, f);
                      fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
         };
-        wr(v_probe0, "vb0_patch.bin");
-        if (v_probe2) wr(v_probe2, "vb0_attn.bin");
+        wr(m->v_probe0, "vb0_patch.bin");
+        if (m->v_probe2) wr(m->v_probe2, "vb0_attn.bin");
     }
-    if (v_patch_sink) {
+    if (m->v_patch_sink) {
         const char * dp = getenv("QOMNI_VPATCH_DUMP");
-        ggml_tensor * pe = v_patch_sink;
+        ggml_tensor * pe = m->v_patch_sink;
         if (pe) {
             std::vector<float> hv((size_t)ggml_nelements(pe));
             ggml_backend_tensor_get(pe, hv.data(), 0, sizeof(float) * hv.size());
@@ -804,11 +658,6 @@ bool Qwen25Omni::run_vision(const std::vector<float> & patches, std::vector<floa
                      fwrite(hv.data(), 4, hv.size(), f); fclose(f); }
         }
     }
-    const int n = (int)v_feats->ne[1], d = (int)v_feats->ne[0];
-    feats.resize((size_t)n * d);
-    ggml_backend_tensor_get(v_feats, feats.data(), 0, sizeof(float) * feats.size());
-    (void)nm;
-    return true;
 }
 
 bool Qwen25Omni::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
@@ -839,32 +688,10 @@ bool Qwen25Omni::encode_vision(const vqa::MediaInput & media, std::vector<float>
         }
     }
     vqa::img::resize_tv_bicubic_aa(src_rgb, media.width, media.height, rw, rh, resized);
-    const int N = gh * gw, P = v_patch;
-    const int C3 = 3 * v_temporal * P * P;
-    std::vector<float> patches((size_t)C3 * N, 0.0f);
-    {
-        // the official processor emits patches in 2x2 group order
-        const int mh = gh / v_merge, mw = gw / v_merge;
-        int u = 0;
-        for (int gy = 0; gy < mh; gy++)
-            for (int gx = 0; gx < mw; gx++)
-                for (int dy = 0; dy < v_merge; dy++)
-                    for (int dx = 0; dx < v_merge; dx++) {
-                        const int py = gy * v_merge + dy, px = gx * v_merge + dx;
-                        float * row = patches.data() + (size_t)u * C3;
-                        int o = 0;
-                        for (int c = 0; c < 3; c++)
-                            for (int dt = 0; dt < v_temporal; dt++)   // same pixels twice
-                                for (int dh = 0; dh < P; dh++) {
-                                    const float * src = resized.data() +
-                                        ((size_t)(py * P + dh) * rw + px * P) * 3 + c;
-                                    for (int dw = 0; dw < P; dw++)
-                                        row[o++] = (src[(size_t)dw * 3] / 255.0f - v_mean[c]) /
-                                                   v_std[c];
-                                }
-                        u++;
-                    }
-    }
+    const int N = gh * gw;
+    // 2x2 group-order patch extraction + CLIP mean/std (see qwen2vl_tower.hpp)
+    std::vector<float> patches;
+    tower_.patchify(resized.data(), rw, rh, gh, gw, patches);
 
     if (!build_vision_graph(gh, gw)) return false;
     if (!run_vision(patches, feats)) return false;

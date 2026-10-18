@@ -27,6 +27,7 @@
 #include "gguf.h"
 #include "gguf_util.hpp"
 #include "load_util.hpp"
+#include "qwen2vl_tower.hpp"
 #include "resample.hpp"
 #include "sampler.hpp"
 #include "weight_load.hpp"
@@ -49,15 +50,6 @@ struct TxtLayer {
     ggml_tensor *wv = nullptr, *bv = nullptr;
     ggml_tensor *wo = nullptr;
     ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-};
-
-struct VisLayer {
-    ggml_tensor *ln1 = nullptr, *ln2 = nullptr;
-    ggml_tensor *wqkv = nullptr, *bqkv = nullptr;
-    ggml_tensor *wo = nullptr, *bo = nullptr;
-    ggml_tensor *wg = nullptr, *bg = nullptr;
-    ggml_tensor *wu = nullptr, *bu = nullptr;
-    ggml_tensor *wd = nullptr, *bd = nullptr;
 };
 
 // one text graph: prefill (T tokens) or one decode step (T=1)
@@ -105,6 +97,11 @@ private:
 
     void dump(const ggml_cgraph * gf, const char * name);
 
+    // shared-tower debug hooks (see qwen2vl_tower.hpp)
+    static bool tower_finalize_build_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                      ggml_backend_t backend);
+    static void tower_after_run_(void * ud, ggml_cgraph * gf);
+
     vqa::Capabilities caps_;
     vqa::Tokenizer tok_;
 
@@ -121,7 +118,11 @@ private:
     float v_eps = 1e-6f, v_rope_theta = 10000.0f;
     float v_mean[3] = { 0.48145466f, 0.4578275f, 0.40821073f };   // CLIP stats (processor config)
     float v_std[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
-    int n_patches_x = 0, n_patches_y = 0;      // current vision graph grid
+
+    // shared Qwen2.5-VL vision tower (graph, weights, config) - see
+    // core/qwen2vl_tower.hpp; the v_* fields above mirror tower_.cfg and stay
+    // in sync from the gguf metadata in load_weights()
+    vqa::qwen2vl_tower::Tower tower_;
 
     ggml_backend_t backend = nullptr;
     ggml_context * wctx = nullptr;
@@ -132,18 +133,6 @@ private:
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr;
     std::vector<TxtLayer> tl;
-
-    ggml_tensor *v_patch_w = nullptr;
-    ggml_tensor *v_merger_ln = nullptr, *v_mm1_w = nullptr, *v_mm1_b = nullptr;
-    ggml_tensor *v_mm2_w = nullptr, *v_mm2_b = nullptr;
-    std::vector<VisLayer> vl;
-
-    // vision graph (rebuilt per image)
-    ggml_context * vctx = nullptr;
-    ggml_cgraph * vgf = nullptr;
-    ggml_tensor *v_in = nullptr, *v_pos = nullptr, *v_mask = nullptr;
-    ggml_tensor *v_idx_in = nullptr, *v_idx_out = nullptr;
-    ggml_tensor *v_feats = nullptr;
 
     vqa::KvCache kv;
     int n_past = 0;
@@ -160,7 +149,7 @@ private:
 
 Qwen25VL::~Qwen25VL() {
     kv.free();
-    if (vctx) ggml_free(vctx);
+    tower_.free();
     if (allocr) ggml_gallocr_free(allocr);
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wctx) ggml_free(wctx);
@@ -226,6 +215,21 @@ bool Qwen25VL::load_weights(const char * path) {
     }
     v_hd = v_embd / (v_head > 0 ? v_head : 1);
 
+    tower_.cfg.n_layer = v_layer;  tower_.cfg.n_embd = v_embd;
+    tower_.cfg.n_head = v_head;    tower_.cfg.n_hd = v_hd;
+    tower_.cfg.n_patch = v_patch;  tower_.cfg.n_temporal = v_temporal;
+    tower_.cfg.n_merge = v_merge;  tower_.cfg.n_out = v_out;
+    tower_.cfg.n_window = v_window; tower_.cfg.n_wa_pattern = n_wa_pattern;
+    tower_.cfg.eps = v_eps;        tower_.cfg.rope_theta = v_rope_theta;
+    for (int c = 0; c < 3; c++) {
+        tower_.cfg.img_mean[c] = v_mean[c];
+        tower_.cfg.img_std[c] = v_std[c];
+    }
+    tower_.hooks.max_layers_env = "Q2V_MAX_VLAYERS";
+    tower_.hooks.ud = this;
+    tower_.hooks.finalize_build = &Qwen25VL::tower_finalize_build_;
+    tower_.hooks.after_run = &Qwen25VL::tower_after_run_;
+
     vqa::weights::bind_from_mmap(gu, wctx, mm);
     gguf_free(gu);
 
@@ -260,15 +264,15 @@ bool Qwen25VL::load_weights(const char * path) {
         if (!L.norm || !L.wq || !L.wk || !L.wv || !L.wo || !L.ffn_norm || !L.gate || !L.up || !L.down)
             return false;
     }
-    v_patch_w = gt("v.patch_embed.weight");
-    v_merger_ln = gt("v.merger.ln.weight");
-    v_mm1_w = gt("v.merger.fc1.weight"); v_mm1_b = gt("v.merger.fc1.bias");
-    v_mm2_w = gt("v.merger.fc2.weight"); v_mm2_b = gt("v.merger.fc2.bias");
-    vl.resize((size_t)v_layer);
+    tower_.w.patch_w = gt("v.patch_embed.weight");
+    tower_.w.merger_ln = gt("v.merger.ln.weight");
+    tower_.w.mm1_w = gt("v.merger.fc1.weight"); tower_.w.mm1_b = gt("v.merger.fc1.bias");
+    tower_.w.mm2_w = gt("v.merger.fc2.weight"); tower_.w.mm2_b = gt("v.merger.fc2.bias");
+    tower_.w.layers.resize((size_t)v_layer);
     for (int i = 0; i < v_layer; i++) {
         char b[96];
         auto g = [&](const char * suf) { snprintf(b, sizeof(b), "v.blk.%d.%s", i, suf); return gt(b); };
-        VisLayer & L = vl[(size_t)i];
+        vqa::qwen2vl_tower::Layer & L = tower_.w.layers[(size_t)i];
         L.ln1 = g("norm1.weight"); L.ln2 = g("norm2.weight");
         L.wqkv = g("wqkv.weight"); L.bqkv = g("wqkv.bias");
         L.wo = g("wo.weight"); L.bo = g("wo.bias");
@@ -315,219 +319,31 @@ bool Qwen25VL::load(const std::string & gguf_path, const std::string & tokenizer
 // ---------------------------------------------------------------- vision
 
 bool Qwen25VL::build_vision_graph(int gh, int gw) {
-    if (vctx) { ggml_free(vctx); vctx = nullptr; }
-    const int N = gh * gw;
-    const int nm = N / (v_merge * v_merge);
-    const int C3 = 3 * v_temporal * v_patch * v_patch;
-
-    struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, /*no_alloc*/ true };
-    vctx = ggml_init(ip);
-    if (!vctx) return false;
-    vgf = ggml_new_graph_custom(vctx, 65536, false);
-
-    v_in = ggml_new_tensor_2d(vctx, GGML_TYPE_F32, C3, N);
-    ggml_set_name(v_in, "v_patches");
-    v_pos = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, 4 * N);
-    ggml_set_name(v_pos, "v_pos");
-    const bool wa = n_wa_pattern > 0;
-    if (wa) {
-        v_mask = ggml_new_tensor_2d(vctx, GGML_TYPE_F16, N, N);
-        ggml_set_name(v_mask, "v_mask");
-        v_idx_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, nm);
-        ggml_set_name(v_idx_in, "v_idx_in");
-        v_idx_out = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, nm);
-        ggml_set_name(v_idx_out, "v_idx_out");
-    }
-
-    // window-major reorder, applied to the 2x2 groups (4 patch rows at a time)
-    ggml_tensor * x = v_in;
-    if (wa) {
-        x = ggml_reshape_2d(vctx, x, C3 * 4, nm);
-        x = ggml_get_rows(vctx, x, v_idx_in);
-        x = ggml_reshape_2d(vctx, x, C3, N);
-    }
-    x = ggml_mul_mat(vctx, v_patch_w, x);               // [v_embd, N]
-    ggml_set_name(x, "v_patch_out");
-
-    // 4D M-RoPE sections: head_dim/4 each, positions (h, w, h, w)
-    int vsec[4] = { v_hd / 4, v_hd / 4, v_hd / 4, v_hd / 4 };
-
-    int v_max = v_layer;   // Q2V_MAX_VLAYERS=N truncates the tower for bisecting
-    if (const char * e = getenv("Q2V_MAX_VLAYERS")) v_max = std::min(v_layer, atoi(e));
-    for (int il = 0; il < v_max; il++) {
-        VisLayer & L = vl[(size_t)il];
-        const bool full_attn = !wa || ((il + 1) % n_wa_pattern == 0);
-
-        ggml_tensor * h = ggml_rms_norm(vctx, x, v_eps);
-        h = ggml_mul(vctx, h, L.ln1);
-        ggml_tensor * qkv = ggml_mul_mat(vctx, L.wqkv, h);   // [3*v_embd, N]
-        qkv = ggml_add(vctx, qkv, L.bqkv);
-        if (il == 0) ggml_set_name(qkv, "v_blk0_qkv");
-
-        const size_t row = qkv->nb[1];
-        ggml_tensor * q = ggml_view_2d(vctx, qkv, v_embd, N, row, 0);
-        ggml_tensor * k = ggml_view_2d(vctx, qkv, v_embd, N, row,
-                                       (size_t)v_embd * sizeof(float));
-        ggml_tensor * v = ggml_view_2d(vctx, qkv, v_embd, N, row,
-                                       (size_t)2 * v_embd * sizeof(float));
-        ggml_tensor * q3 = ggml_reshape_3d(vctx, ggml_cont(vctx, q), v_hd, v_head, N);
-        ggml_tensor * k3 = ggml_reshape_3d(vctx, ggml_cont(vctx, k), v_hd, v_head, N);
-        ggml_tensor * v3 = ggml_reshape_3d(vctx, ggml_cont(vctx, v), v_hd, v_head, N);
-
-        q3 = ggml_rope_multi(vctx, q3, v_pos, nullptr, v_hd / 2, vsec,
-                             GGML_ROPE_TYPE_VISION, 32768, v_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_multi(vctx, k3, v_pos, nullptr, v_hd / 2, vsec,
-                             GGML_ROPE_TYPE_VISION, 32768, v_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        if (il == 0) ggml_set_name(q3, "v_blk0_q_rope");
-
-        ggml_tensor * qf = ggml_cont(vctx, ggml_permute(vctx, q3, 0, 2, 1, 3));   // [hd, N, head]
-        ggml_tensor * kf = ggml_cont(vctx, ggml_permute(vctx, k3, 0, 2, 1, 3));
-        ggml_tensor * vf = ggml_cont(vctx, ggml_permute(vctx, v3, 0, 2, 1, 3));
-        ggml_tensor * mask = full_attn ? nullptr : v_mask;
-        ggml_tensor * fa = ggml_flash_attn_ext(vctx, qf, kf, vf, mask,
-                                               1.0f / sqrtf((float)v_hd), 0.0f, 0.0f);
-        // FA returns [hd, heads, tokens]: flatten straight to [v_embd, N]
-        ggml_tensor * attn = ggml_reshape_2d(vctx, ggml_cont(vctx, fa), v_embd, N);
-        attn = ggml_mul_mat(vctx, L.wo, attn);
-        attn = ggml_add(vctx, attn, L.bo);
-        x = ggml_add(vctx, x, attn);
-        if (il == 0) ggml_set_name(x, "v_blk0_attn_out");
-
-        h = ggml_rms_norm(vctx, x, v_eps);
-        h = ggml_mul(vctx, h, L.ln2);
-        ggml_tensor * g = ggml_mul_mat(vctx, L.wg, h);
-        g = ggml_add(vctx, g, L.bg);
-        ggml_tensor * u = ggml_mul_mat(vctx, L.wu, h);
-        u = ggml_add(vctx, u, L.bu);
-        h = ggml_mul(vctx, ggml_silu(vctx, g), u);
-        h = ggml_mul_mat(vctx, L.wd, h);
-        h = ggml_add(vctx, h, L.bd);
-        x = ggml_add(vctx, x, h);
-        if (il == 0) ggml_set_name(x, "v_blk0_out");
-        if (il == 15) ggml_set_name(x, "v_blk15_out");
-    }
-    ggml_set_name(x, "v_final");
-
-    // merger: HF normalizes per token over context_dim (1280) and only then folds
-    // the 2x2 group into one 4*1280 row - doing the RMSNorm after the reshape
-    // normalizes over 5120 and destroys the features
-    ggml_tensor * xn = ggml_rms_norm(vctx, x, v_eps);
-    xn = ggml_mul(vctx, xn, v_merger_ln);
-    ggml_tensor * m = ggml_reshape_2d(vctx, xn, v_embd * v_merge * v_merge, nm);
-    ggml_set_name(m, "v_merge");
-    m = ggml_mul_mat(vctx, v_mm1_w, m);
-    m = ggml_add(vctx, m, v_mm1_b);
-    m = ggml_gelu_erf(vctx, m);
-    m = ggml_mul_mat(vctx, v_mm2_w, m);
-    m = ggml_add(vctx, m, v_mm2_b);
-    ggml_set_name(m, "v_proj_out");
-    if (wa) m = ggml_get_rows(vctx, m, v_idx_out);   // window-major -> raster
-    ggml_set_name(m, "v_feats");
-    v_feats = m;
-    ggml_build_forward_expand(vgf, m);
-
-    if (!dump_dir.empty()) {
-        static const char * const dn[] = { "v_patch_out", "v_blk0_qkv", "v_blk0_attn_out",
-                                           "v_blk0_out", "v_merge", "v_proj_out", nullptr };
-        vqa::dump::mark_sinks(vctx, vgf, dn);
-        vqa::dump::finalize_sinks(vctx, vgf, backend);
-    }
-    if (!ggml_gallocr_alloc_graph(allocr, vgf)) {
-        fprintf(stderr, "vision graph allocation failed\n");
-        return false;
-    }
-    n_patches_x = gw;
-    n_patches_y = gh;
-    return true;
+    return tower_.build(gh, gw, allocr, backend);
 }
 
 bool Qwen25VL::run_vision(const std::vector<float> & patches, std::vector<float> & feats) {
-    const int N = n_patches_x * n_patches_y;
-    const int nm = N / (v_merge * v_merge);
+    return tower_.run(backend, patches, feats);
+}
 
-    ggml_backend_tensor_set(v_in, patches.data(), 0, sizeof(float) * patches.size());
-
-    // positions: 4 arrays (h, w, h, w) in *window-major* patch order
-    {
-        std::vector<int> pos((size_t)4 * N, 0);
-        std::vector<int> idx((size_t)nm), inv((size_t)nm);
-        const int gw = n_patches_x, gh = n_patches_y;
-        const int mw = gw / v_merge, mh = gh / v_merge;
-        const int wgrid = v_window / v_patch / v_merge;   // 4 merged tokens per window side
-        int dst = 0;
-        if (n_wa_pattern > 0) {
-            for (int y = 0; y < mh; y += wgrid) {
-                for (int x = 0; x < mw; x += wgrid) {
-                    const int wh = std::min(wgrid, mh - y), ww = std::min(wgrid, mw - x);
-                    for (int dy = 0; dy < wh; dy++)
-                        for (int dx = 0; dx < ww; dx++) {
-                            const int src = (y + dy) * mw + (x + dx);
-                            idx[(size_t)src] = dst;
-                            inv[(size_t)dst] = src;
-                            dst++;
-                        }
-                }
-            }
-        } else {
-            for (int i = 0; i < nm; i++) { idx[(size_t)i] = i; inv[(size_t)i] = i; }
-        }
-        // patch j of merge group g (raster) sits at window-major slot idx[g]*4 + (j%4)
-        for (int g = 0; g < nm; g++) {
-            const int r = g / mw, c = g % mw;
-            for (int j = 0; j < v_merge * v_merge; j++) {
-                const int dy = j / v_merge, dx = j % v_merge;
-                const int p = idx[(size_t)g] * v_merge * v_merge + j;
-                const int py = r * v_merge + dy, px = c * v_merge + dx;
-                pos[(size_t)p] = py;
-                pos[(size_t)N + p] = px;
-                pos[(size_t)2 * N + p] = py;
-                pos[(size_t)3 * N + p] = px;
-            }
-        }
-        ggml_backend_tensor_set(v_pos, pos.data(), 0, sizeof(int) * pos.size());
-        if (n_wa_pattern > 0) {
-            ggml_backend_tensor_set(v_idx_in, inv.data(), 0, sizeof(int) * inv.size());
-            ggml_backend_tensor_set(v_idx_out, idx.data(), 0, sizeof(int) * idx.size());
-            // block-diagonal mask over the reordered patch tokens
-            std::vector<ggml_fp16_t> mask((size_t)N * N, ggml_fp32_to_fp16(-INFINITY));
-            for (int y = 0; y < mh; y += wgrid) {
-                for (int x = 0; x < mw; x += wgrid) {
-                    const int wh = std::min(wgrid, mh - y), ww = std::min(wgrid, mw - x);
-                    const int got = wh * ww;   // merged tokens in this window
-                    int lo = -1;
-                    for (int dy = 0; dy < wh && lo < 0; dy++)
-                        for (int dx = 0; dx < ww; dx++)
-                            if (idx[(size_t)((y + dy) * mw + (x + dx))] >= 0) {
-                                lo = idx[(size_t)((y + dy) * mw + (x + dx))];
-                                break;
-                            }
-                    if (lo < 0) continue;
-                    const int p0 = lo * v_merge * v_merge;
-                    const int p1 = p0 + got * v_merge * v_merge;
-                    for (int r = p0; r < p1; r++)
-                        for (int s = p0; s < p1; s++)
-                            mask[(size_t)r * N + s] = ggml_fp32_to_fp16(0.0f);
-                }
-            }
-            ggml_backend_tensor_set(v_mask, mask.data(), 0, sizeof(ggml_fp16_t) * mask.size());
-        }
-    }
-
-    if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vision compute failed\n");
-        return false;
-    }
-    if (!dump_dir.empty()) {
-        static const char * const dn[] = { "v_patches", "v_patch_out", "v_blk0_qkv",
-                                           "v_blk0_attn_out", "v_blk0_out", "v_blk15_out", "v_final", "v_merge",
-                                           "v_proj_out", "v_feats", nullptr };
-        for (int i = 0; dn[i]; i++) dump(vgf, dn[i]);
-    }
-    const int n = (int)v_feats->ne[1], d = (int)v_feats->ne[0];
-    feats.resize((size_t)n * d);
-    ggml_backend_tensor_get(v_feats, feats.data(), 0, sizeof(float) * feats.size());
-    (void)nm;
+bool Qwen25VL::tower_finalize_build_(void * ud, ggml_context * ctx, ggml_cgraph * gf,
+                                     ggml_backend_t backend) {
+    Qwen25VL * m = (Qwen25VL *)ud;
+    if (m->dump_dir.empty()) return true;
+    static const char * const dn[] = { "v_patch_out", "v_blk0_qkv", "v_blk0_attn_out",
+                                       "v_blk0_out", "v_merge", "v_proj_out", nullptr };
+    vqa::dump::mark_sinks(ctx, gf, dn);
+    vqa::dump::finalize_sinks(ctx, gf, backend);
     return true;
+}
+
+void Qwen25VL::tower_after_run_(void * ud, ggml_cgraph * gf) {
+    Qwen25VL * m = (Qwen25VL *)ud;
+    if (m->dump_dir.empty()) return;
+    static const char * const dn[] = { "v_patches", "v_patch_out", "v_blk0_qkv",
+                                       "v_blk0_attn_out", "v_blk0_out", "v_blk15_out", "v_final", "v_merge",
+                                       "v_proj_out", "v_feats", nullptr };
+    for (int i = 0; dn[i]; i++) m->dump(gf, dn[i]);
 }
 
 bool Qwen25VL::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
@@ -552,34 +368,10 @@ bool Qwen25VL::encode_vision(const vqa::MediaInput & media, std::vector<float> &
         FILE * f = fopen((dump_dir + "/dbg_resized.bin").c_str(), "wb");
         if (f) { fwrite(resized.data(), sizeof(float), resized.size(), f); fclose(f); }
     }
-    const int N = gh * gw, P = v_patch;
-    const int C3 = 3 * v_temporal * P * P;
-    std::vector<float> patches((size_t)C3 * N, 0.0f);
-    {
-        // the official processor emits patches in 2x2 group order:
-        //   (t, gh/2, gw/2, merge_h, merge_w) x (c, dt, dh, dw)
-        // (see Qwen2VLImageProcessor._preprocess: reshape + transpose(0,3,6,4,7,2,1,5,8))
-        const int mh = gh / v_merge, mw = gw / v_merge;
-        int u = 0;
-        for (int gy = 0; gy < mh; gy++)
-            for (int gx = 0; gx < mw; gx++)
-                for (int dy = 0; dy < v_merge; dy++)
-                    for (int dx = 0; dx < v_merge; dx++) {
-                        const int py = gy * v_merge + dy, px = gx * v_merge + dx;
-                        float * row = patches.data() + (size_t)u * C3;
-                        int o = 0;
-                        for (int c = 0; c < 3; c++)
-                            for (int dt = 0; dt < v_temporal; dt++)   // same pixels twice
-                                for (int dh = 0; dh < P; dh++) {
-                                    const float * src = resized.data() +
-                                        ((size_t)(py * P + dh) * rw + px * P) * 3 + c;
-                                    for (int dw = 0; dw < P; dw++)
-                                        row[o++] = (src[(size_t)dw * 3] / 255.0f - v_mean[c]) /
-                                                   v_std[c];
-                                }
-                        u++;
-                    }
-    }
+    const int N = gh * gw;
+    // 2x2 group-order patch extraction + CLIP mean/std (see qwen2vl_tower.hpp)
+    std::vector<float> patches;
+    tower_.patchify(resized.data(), rw, rh, gh, gw, patches);
 
     // Q2V_FEATS=<file.npy.raw> + <file.shape>: load features from disk instead of
     // running the tower (parity debugging: isolates tower errors from the text side)
