@@ -619,6 +619,58 @@ bool tool_classify_video(const vqa::json::Value & a, std::string & out, std::str
     return err.empty();
 }
 
+bool tool_classify_image(const vqa::json::Value & a, std::string & out, std::string & err) {
+    std::string image;
+    if (!need_str(a, "image", image, err)) return false;
+    const vqa::ModelEntry * e = resolve_entry(a.str("model"), err);
+    if (!e) return false;
+    if (!vqa::arch_info(e->arch).pure_vision) {
+        err = "classify_image needs an image tower (siglip / videomae / vivit); '" + e->arch +
+              "' is a language backend - use ask_image instead";
+        return false;
+    }
+    std::string mode;
+    if (!a.flag("embed", false)) {
+        const int k = a.integer("top_k", 5);
+        mode = std::to_string(k > 0 ? k : 5);   // tower top-k: siglip labels / videomae labels
+    }   // else: siglip prints the pooled-embedding summary
+    vqa::MediaInput media;
+    if (!load_image_param(image, media, err)) return false;
+    vqa::Model * m = ensure_model(*e, a, err);
+    if (!m) return false;
+    out = run_ask(m, media, std::string(), mode, a, err);
+    return err.empty();
+}
+
+bool tool_embed_image(const vqa::json::Value & a, std::string & out, std::string & err) {
+    std::string image;
+    if (!need_str(a, "image", image, err)) return false;
+    const vqa::ModelEntry * e = resolve_entry(a.str("model"), err);
+    if (!e) return false;
+    vqa::MediaInput media;
+    if (!load_image_param(image, media, err)) return false;
+    vqa::Model * m = ensure_model(*e, a, err);
+    if (!m) return false;
+    vqa::EmbedParams ep;
+    ep.truncate_dim = a.integer("dim", 0);
+    std::vector<float> vec;
+    if (!m->embed(media, std::string(), ep, vec)) {
+        err = "backend '" + e->arch + "' has no embedding path (embed_image needs "
+              "embgemma2 / siglip)";
+        return false;
+    }
+    // one L2-normalized vector: cosine against other embed_image outputs ranks
+    // similarity (scripts/siglip_retrieve.py shows the pattern end to end)
+    char buf[48];
+    out = "{\"dim\": " + std::to_string(vec.size()) + ", \"normalized\": true, \"embedding\": [";
+    for (size_t i = 0; i < vec.size(); i++) {
+        snprintf(buf, sizeof(buf), "%s%.6f", i ? ", " : "", (double)vec[i]);
+        out += buf;
+    }
+    out += "]}";
+    return true;
+}
+
 using ToolFn = bool (*)(const vqa::json::Value &, std::string &, std::string &);
 
 struct ToolDef {
@@ -636,6 +688,8 @@ const ToolDef kTools[] = {
     { "gaze_point", tool_gaze_point },
     { "analyze_video", tool_analyze_video },
     { "classify_video", tool_classify_video },
+    { "classify_image", tool_classify_image },
+    { "embed_image", tool_embed_image },
 };
 
 // Tool declarations. Schemas are the contract an agent sees, so the
@@ -770,6 +824,33 @@ const char * TOOLS_JSON = R"MCPJSON([
         "model": { "type": "string", "description": "Model id or .gguf path." }
       },
       "required": ["video"]
+    }
+  },
+  {
+    "name": "classify_image",
+    "description": "Run a pure image tower over a still image: top-k class labels with probabilities, or the pooled-embedding summary when embed=true. Needs an image-tower checkpoint - siglip (e.g. a SigLIP NSFW/label fine-tune) or videomae/vivit. No text prompt is involved; for descriptions use describe_image / ask_image.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "image": { "type": "string", "description": "Local image path, or inline base64 / data: URI." },
+        "top_k": { "type": "integer", "description": "How many labels to return (default 5)." },
+        "embed": { "type": "boolean", "description": "Return the pooled-embedding summary instead of labels." },
+        "model": { "type": "string", "description": "Model id or .gguf path." }
+      },
+      "required": ["image"]
+    }
+  },
+  {
+    "name": "embed_image",
+    "description": "Embed a still image into one L2-normalized vector (embgemma2 multimodal or siglip image tower). Cosine similarity between two embed_image outputs ranks image similarity - build galleries with one call per image and compare, or follow scripts/siglip_retrieve.py.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "image": { "type": "string", "description": "Local image path, or inline base64 / data: URI." },
+        "dim": { "type": "integer", "description": "Matryoshka truncation for encoders that support it (0 = model default)." },
+        "model": { "type": "string", "description": "Model id or .gguf path." }
+      },
+      "required": ["image"]
     }
   }
 ])MCPJSON";

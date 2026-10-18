@@ -49,6 +49,13 @@ void resize_lanczos_coeffs(const uint8_t * src, int sw, int sh, int sc,
 void resize_bicubic_coeffs(const uint8_t * src, int sw, int sh, int sc,
                            int dw, int dh, uint8_t * dst);
 
+// Same machinery with PIL's BILINEAR filter (triangle, support 1.0) - PIL
+// image.resize(Image.BILINEAR), the slow HF processors' resample=2 path
+// (several SigLIP fine-tunes ship it). Bit-exact vs PIL. `dst` holds
+// dw*dh*sc bytes.
+void resize_bilinear_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                            int dw, int dh, uint8_t * dst);
+
 // torch F.interpolate(mode="bicubic", align_corners=False) semantics
 // (Keys a = -0.75, 4-tap clamped reads) of an interleaved float (sh,sw,C)
 // buffer -> (dh,dw,C). What VideoChat3 uses for its learned pos table.

@@ -24,7 +24,8 @@ import os
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoImageProcessor, SiglipModel
+from transformers import AutoConfig, AutoImageProcessor, SiglipModel
+from transformers import SiglipForImageClassification
 
 
 def main():
@@ -36,13 +37,17 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     proc = AutoImageProcessor.from_pretrained(args.model)
-    model = SiglipModel.from_pretrained(args.model).eval()
-    print(f"vision cfg: hidden {model.config.vision_config.hidden_size} "
-          f"layers {model.config.vision_config.num_hidden_layers} "
-          f"heads {model.config.vision_config.num_attention_heads} "
-          f"patch {model.config.vision_config.patch_size} "
-          f"eps {model.config.vision_config.layer_norm_eps} "
-          f"act {model.config.vision_config.hidden_act}")
+    cfg = AutoConfig.from_pretrained(args.model)
+    is_cls = "SiglipForImageClassification" in (cfg.architectures or [])
+    model = (SiglipForImageClassification.from_pretrained(args.model) if is_cls
+             else SiglipModel.from_pretrained(args.model)).eval()
+    print(f"model: {'SiglipForImageClassification' if is_cls else 'SiglipModel'}")
+    print(f"vision cfg: hidden {cfg.vision_config.hidden_size} "
+          f"layers {cfg.vision_config.num_hidden_layers} "
+          f"heads {cfg.vision_config.num_attention_heads} "
+          f"patch {cfg.vision_config.patch_size} "
+          f"eps {cfg.vision_config.layer_norm_eps} "
+          f"act {cfg.vision_config.hidden_act}")
 
     img = Image.open(args.image).convert("RGB")
     print(f"image: {args.image} {img.size[0]}x{img.size[1]}")
@@ -60,7 +65,12 @@ def main():
     vm.post_layernorm.register_forward_hook(hook("v_final"))
 
     with torch.no_grad():
-        feats = model.get_image_features(pixel_values=pv)
+        if is_cls:
+            logits = model(pixel_values=pv).logits[0].float()
+            probs = torch.softmax(logits, dim=-1)
+            feats = model.vision_model(pixel_values=pv).pooler_output[0].float()
+        else:
+            feats = model.get_image_features(pixel_values=pv)[0].float()
 
     def save(name, arr):
         a = np.ascontiguousarray(np.asarray(arr, dtype=np.float32))
@@ -68,12 +78,17 @@ def main():
         print(f"{name:16s} shape {a.shape} mean {a.mean():+.6f} "
               f"absmax {np.abs(a).max():.6f}")
 
-    save("pixel_values", pv[0].numpy())                       # [3, 224, 224]
+    save("pixel_values", pv[0].numpy())
     save("v_patch_out", seen["v_patch_out"][0].numpy().T)     # [dim, tokens]
     save("v_final", seen["v_final"][0].numpy().T)             # [dim, tokens]
-    pooled = feats[0].float().numpy()
+    pooled = feats[0].float().numpy() if feats.dim() > 1 else feats.numpy()
     save("v_pooled", pooled)
     print(f"pooled: dim {pooled.shape[0]} l2 {np.linalg.norm(pooled):.6f}")
+    if is_cls:
+        save("v_logits", logits.numpy())
+        save("v_probs", probs.numpy())
+        for i in torch.argsort(-probs):
+            print(f"  {probs[i]:.6f}  {cfg.id2label.get(int(i), str(i))}")
     return 0
 
 

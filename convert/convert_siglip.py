@@ -58,12 +58,16 @@ PATTERNS = ("model.safetensors", "model.safetensors.index.json")
 # defaults straight from transformers SiglipVisionConfig (config.json overrides)
 CFG = dict(n_layer=12, n_embd=768, n_head=12, n_ff=3072, patch=16,
            image_size=224, num_channels=3, eps=1e-6, hidden_act="gelu_pytorch_tanh",
-           has_head=True)
+           has_head=True, num_labels=0, labels=[])
 
-# SiglipImageProcessor: square resize (bicubic, PIL antialiased), rescale 1/255,
-# normalize (x - 0.5) / 0.5. resample is a PILImageResampling id (3 = BICUBIC).
+# SiglipImageProcessor defaults: square resize (PIL antialiased), rescale
+# 1/255, normalize (x - 0.5) / 0.5. resample is a PILImageResampling id
+# (3 = BICUBIC, 2 = BILINEAR); preprocessor_config.json overrides.
 MEAN = [0.5, 0.5, 0.5]
 STD = [0.5, 0.5, 0.5]
+RESAMPLE = 3
+
+VM = "vision_model."   # checkpoint key prefix, re-detected in main()
 
 OUTTYPES = {"f16": None, "q8_0": gguf.GGMLQuantizationType.Q8_0,
             "q4_0": gguf.GGMLQuantizationType.Q4_0}
@@ -86,6 +90,24 @@ def read_config(src_dir):
         hidden_act=v.get("hidden_act"),
     ).items() if val is not None})
     cfg["has_head"] = bool(v.get("vision_use_head", True))
+    # preprocessor_config.json: resize resample id + normalization stats
+    pp = os.path.join(src_dir, "preprocessor_config.json")
+    global RESAMPLE
+    if os.path.isfile(pp):
+        with open(pp, encoding="utf-8") as f:
+            pc = json.load(f)
+        RESAMPLE = int(pc.get("resample", 3))
+        if pc.get("image_mean"):
+            MEAN[:] = [float(x) for x in pc["image_mean"]]
+        if pc.get("image_std"):
+            STD[:] = [float(x) for x in pc["image_std"]]
+    # SiglipForImageClassification fine-tunes carry the label table at the top
+    # level (videomae.labels precedent)
+    id2label = raw.get("id2label") or {}
+    if id2label:
+        pairs = sorted(((int(k), val) for k, val in id2label.items()), key=lambda p: p[0])
+        cfg["labels"] = [name for _, name in pairs]
+        cfg["num_labels"] = len(cfg["labels"])
     return cfg
 
 
@@ -108,11 +130,15 @@ def write_metadata(gw, cfg, outtype):
     gw.add_float32("siglip.layer_norm_epsilon", float(cfg["eps"]))
     gw.add_string("siglip.hidden_act", str(cfg["hidden_act"]))
     gw.add_bool("siglip.has_head", bool(cfg["has_head"]))
+    gw.add_bool("siglip.has_classifier", bool(cfg["num_labels"] > 0))
+    gw.add_uint32("siglip.num_labels", int(cfg["num_labels"]))
+    if cfg["labels"]:
+        gw.add_array("siglip.labels", cfg["labels"])
     # release lineage note: get_image_features has no projection linear here
     gw.add_bool("siglip.has_projection", False)
     gw.add_array("siglip.image_mean", [float(x) for x in MEAN])
     gw.add_array("siglip.image_std", [float(x) for x in STD])
-    gw.add_uint32("siglip.resize_resample", 3)
+    gw.add_uint32("siglip.resize_resample", RESAMPLE)
 
 
 def verify(path, required):
@@ -150,9 +176,25 @@ def main():
 
     weights = _lib.TensorSource(src)
     log(f"{len(weights)} tensors in the checkpoint")
+
+    # SiglipForImageClassification fine-tunes nest the towers under "model."
+    global VM
+    VM = "model.vision_model." if "model.vision_model.embeddings.patch_embedding.weight" in weights         else "vision_model."
+    cfg["has_head"] = VM + "head.attention.in_proj_weight" in weights
+    has_cls = "classifier.weight" in weights
+    if has_cls and not cfg["labels"]:
+        n = int(weights.get("classifier.weight").shape[0])
+        cfg["num_labels"] = n
+        cfg["labels"] = [str(i) for i in range(n)]
+    if has_cls and (not cfg["num_labels"] or len(cfg["labels"]) != cfg["num_labels"]):
+        fail(f"classifier shape disagrees with id2label ({cfg['num_labels']} labels)")
+    if cfg["labels"]:
+        log(f"classifier: {cfg['num_labels']} labels {cfg['labels'][:6]}"
+            f"{' ...' if cfg['num_labels'] > 6 else ''}")
     if "text_model.embeddings.token_embedding.weight" in weights:
-        warn("checkpoint also carries the text tower; round-1 GGUF exports the "
-             "image tower + pooling head only (text tower is round 2)")
+        warn("checkpoint also carries the text tower; the GGUF exports the "
+             "image tower + pooling head + classifier only (text tower is "
+             "future work: needs the BPE text side)")
 
     gw = gguf.GGUFWriter(out, "siglip")
     write_metadata(gw, cfg, args.outtype)
@@ -168,7 +210,7 @@ def main():
         gw.add_tensor(name, np.ascontiguousarray(weights.get(hf_name), dtype=np.float32))
 
     # ------------------------------------------------------------- embeddings
-    conv = weights.get("vision_model.embeddings.patch_embedding.weight")
+    conv = weights.get(VM + "embeddings.patch_embedding.weight")
     dim, cin, kh, kw = conv.shape
     if (cin, kh, kw) != (cfg["num_channels"], cfg["patch"], cfg["patch"]):
         fail(f"unexpected patch_embedding shape {conv.shape}")
@@ -178,13 +220,13 @@ def main():
         _lib.add_quantized(gw, "v.patch_embd.weight", _lib.quantize(w2d, qtype), qtype)
     else:
         _lib.add_f16(gw, "v.patch_embd.weight", w2d)
-    f32("v.patch_embd.bias", "vision_model.embeddings.patch_embedding.bias")
+    f32("v.patch_embd.bias", VM + "embeddings.patch_embedding.bias")
     # learned position table [n_patches, dim]: gguf reverses the numpy shape, so
     # the engine sees ne = [dim, n_patches] and can add it to the token columns
-    f32("v.pos_emb.weight", "vision_model.embeddings.position_embedding.weight")
+    f32("v.pos_emb.weight", VM + "embeddings.position_embedding.weight")
 
     # -------------------------------------------------------------- encoder
-    p = "vision_model.encoder.layers"
+    p = VM + "encoder.layers"
     for i in range(cfg["n_layer"]):
         b, h = f"v.blk.{i}", f"{p}.{i}"
         f32(f"{b}.ln1.weight", f"{h}.layer_norm1.weight")
@@ -221,12 +263,12 @@ def main():
         if not args.quiet:
             progress(i, cfg["n_layer"], "encoder layer", every=4)
 
-    f32("v.norm.weight", "vision_model.post_layernorm.weight")
-    f32("v.norm.bias", "vision_model.post_layernorm.bias")
+    f32("v.norm.weight", VM + "post_layernorm.weight")
+    f32("v.norm.bias", VM + "post_layernorm.bias")
 
     # --------------------------------------------------- attention-pool head
     if cfg["has_head"]:
-        hp = "vision_model.head"
+        hp = VM + "head"
         if f"{hp}.attention.in_proj_weight" not in weights:
             fail("config says vision_use_head but the checkpoint has no head weights")
         f32("v.head.probe", f"{hp}.probe")
@@ -245,9 +287,17 @@ def main():
         linear("v.head.fc2.weight", weights.get(f"{hp}.mlp.fc2.weight"))
         f32("v.head.fc2.bias", f"{hp}.mlp.fc2.bias")
 
-    # retrieval logits scalars (round 2: logit_scale * cos + logit_bias, sigmoid)
-    f32("siglip.logit_scale", "logit_scale")
-    f32("siglip.logit_bias", "logit_bias")
+    # retrieval logits scalars (zero-shot scoring needs the text tower too);
+    # classification fine-tunes often strip them
+    if "logit_scale" in weights:
+        f32("siglip.logit_scale", "logit_scale")
+    if "logit_bias" in weights:
+        f32("siglip.logit_bias", "logit_bias")
+
+    # ------------------------------------------- classification head + labels
+    if has_cls:
+        _lib.add_f16(gw, "v.cls.weight", weights.get("classifier.weight"))
+        f32("v.cls.bias", "classifier.bias")
 
     # ------------------------------------------------------------ write + check
     gw.write_header_to_file()
@@ -258,6 +308,8 @@ def main():
     log(f"done: {out} ({os.path.getsize(out) / 1e6:.0f} MB)")
     required = ["v.patch_embd.weight", "v.pos_emb.weight",
                 f"v.blk.{cfg['n_layer'] - 1}.fc2.weight", "v.norm.weight"]
+    if has_cls:
+        required += ["v.cls.weight", "v.cls.bias"]
     if cfg["has_head"]:
         required += ["v.head.probe", "v.head.wqkv.weight", "v.head.wo.weight"]
     verify(out, required)

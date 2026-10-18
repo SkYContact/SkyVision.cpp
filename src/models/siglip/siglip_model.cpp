@@ -90,6 +90,9 @@ public:
     int hidden_act = 2;               // 2 = gelu(tanh) == gelu_pytorch_tanh
     float ln_eps = 1e-6f;
     bool has_head = true;
+    bool has_classifier = false;      // SiglipForImageClassification fine-tunes
+    int n_labels = 0;
+    std::vector<std::string> labels;
     float mean[3] = {0.5f, 0.5f, 0.5f}, std[3] = {0.5f, 0.5f, 0.5f};
 
     bool use_gpu = false;
@@ -102,7 +105,11 @@ private:
     bool build_graph();
     // One RGB8 image -> pooled (n_embd). When the checkpoint has no head the
     // output is the mean of the post-LN token features.
-    bool encode(const vqa::MediaInput & media, std::vector<float> & pooled);
+    // One RGB8 image -> pooled (n_embd). When the checkpoint has no head the
+    // output is the mean of the post-LN token features. `probs` is filled when
+    // the checkpoint carries the classification head.
+    bool encode(const vqa::MediaInput & media, std::vector<float> & pooled,
+                std::vector<float> * probs = nullptr);
     // SiglipImageProcessor: resize -> normalize -> pack patch rows. Writes the
     // CHW normalized pixels and the packed [C*ph*pw, n_patches] matrix.
     bool preprocess(const uint8_t * rgb, int w, int h, std::vector<float> & pixels,
@@ -121,6 +128,7 @@ private:
     ggml_cgraph * gf = nullptr;
     ggml_tensor * in_patches = nullptr;
     ggml_tensor * t_pooled = nullptr;
+    ggml_tensor * t_probs = nullptr;
 
     ggml_tensor * patch_w = nullptr, * patch_b = nullptr, * pos_emb = nullptr;
     ggml_tensor * norm_w = nullptr, * norm_b = nullptr;
@@ -129,6 +137,7 @@ private:
     ggml_tensor * h_ln_w = nullptr, * h_ln_b = nullptr;
     ggml_tensor * h_fc1_w = nullptr, * h_fc1_b = nullptr;
     ggml_tensor * h_fc2_w = nullptr, * h_fc2_b = nullptr;
+    ggml_tensor * cls_w = nullptr, * cls_b = nullptr;
     std::vector<BlockWeights> layers;
 };
 
@@ -158,8 +167,14 @@ bool Siglip::load(const std::string & gguf_path, const std::string & tokenizer_p
 
     caps_ = {};
     caps_.image = true;
-    fprintf(stderr, "%s: ready (%d layers, %d patch tokens, %s)\n", arch_name.c_str(),
-            n_layer, n_patches, has_head ? "attention-pool head" : "no head");
+    fprintf(stderr, "%s: ready (%d layers, %d patch tokens, %s%s)\n", arch_name.c_str(),
+            n_layer, n_patches, has_head ? "attention-pool head" : "no head",
+            has_classifier ? " + classifier" : "");
+    if (has_classifier) {
+        fprintf(stderr, "%s: %d labels:", arch_name.c_str(), n_labels);
+        for (int i = 0; i < std::min(n_labels, 8); i++) fprintf(stderr, " %s", labels[(size_t)i].c_str());
+        fprintf(stderr, "%s\n", n_labels > 8 ? " ..." : "");
+    }
     return true;
 }
 
@@ -186,6 +201,22 @@ bool Siglip::load_weights(const char * path) {
     resample     = vqa::gguf::u32(gu, k("resize_resample").c_str(), 3);
     ln_eps       = vqa::gguf::f32(gu, k("layer_norm_epsilon").c_str(), ln_eps);
     has_head     = vqa::gguf::boolean(gu, k("has_head").c_str(), has_head);
+    has_classifier = vqa::gguf::boolean(gu, k("has_classifier").c_str(), false);
+    n_labels     = vqa::gguf::u32(gu, k("num_labels").c_str(), 0);
+    labels.clear();
+    {
+        int64_t id = gguf_find_key(gu, k("labels").c_str());
+        if (id >= 0) {
+            const int64_t n = gguf_get_arr_n(gu, id);
+            for (int64_t i = 0; i < n; i++) labels.push_back(gguf_get_arr_str(gu, id, (int)i));
+        }
+    }
+    if (has_classifier && (n_labels <= 0 || (int)labels.size() != n_labels)) {
+        fprintf(stderr, "classifier metadata inconsistent (num_labels %d, %zu labels)\n",
+                n_labels, labels.size());
+        gguf_free(gu);
+        return false;
+    }
     {
         // transformers names: gelu = exact erf, gelu_tanh/gelu_pytorch_tanh = the
         // tanh form (SigLIP ships gelu_pytorch_tanh; the engine's default)
@@ -257,6 +288,14 @@ bool Siglip::load_weights(const char * path) {
         h_fc2_b = gt("v.head.fc2.bias");
         if (!h_probe || !h_wqkv || !h_wo || !h_ln_w || !h_fc2_w) {
             fprintf(stderr, "siglip.has_head but head tensors are missing\n");
+            return false;
+        }
+    }
+    if (has_classifier) {
+        cls_w = gt("v.cls.weight");
+        cls_b = gt("v.cls.bias");
+        if (!cls_w || !cls_b) {
+            fprintf(stderr, "siglip.has_classifier but v.cls.* tensors are missing\n");
             return false;
         }
     }
@@ -429,13 +468,34 @@ bool Siglip::build_graph() {
         out = ggml_scale(gctx, s, 1.0f / (float)Np);
         ggml_set_name(out, "v_pooled");
     }
+    ggml_tensor * probs_t = nullptr;
+    ggml_tensor * pooled_out = out;   // the embedding node (v_pooled)
+    if (cls_w && cls_b) {
+        // SiglipForImageClassification: classifier(mean(last_hidden_state)) -
+        // the patch-token MEAN of the post-LN stream, NOT the pooling head's
+        // output (the head weights ride along unused in these fine-tunes).
+        ggml_tensor * xt = ggml_cont(gctx, ggml_permute(gctx, x, 1, 0, 2, 3));
+        ggml_tensor * meanpooled = ggml_scale(gctx,
+            ggml_reshape_2d(gctx, ggml_sum_rows(gctx, xt), n_embd, 1), 1.0f / (float)Np);
+        ggml_set_name(meanpooled, "v_cls_pool");
+        ggml_tensor * logits = ggml_mul_mat(gctx, cls_w, meanpooled);
+        logits = ggml_add(gctx, logits, cls_b);
+        ggml_set_name(logits, "v_logits");
+        probs_t = ggml_soft_max(gctx, logits);
+        ggml_set_name(probs_t, "v_probs");
+        out = probs_t;
+    }
     ggml_build_forward_expand(gf, out);
+    if (probs_t) ggml_build_forward_expand(gf, pooled_out);
+    // embed() reads the head-pooled tensor too; it is NOT an ancestor of probs
+    // (the classifier consumes the token mean), so expand it explicitly or its
+    // name lookup misses and its buffer is never computed.
 
     if (b.names) {
         static const char * const dump_names[] = {
             "patches", "v_patch_out", "v_blk0_qkv", "v_blk0_attn_out", "v_blk0_out",
             "v_final", "v_head_attn", "v_head_ln", "v_head_z", "v_head_fc1", "v_head_mlp",
-            "v_pooled", nullptr,
+            "v_pooled", "v_cls_pool", "v_logits", "v_probs", nullptr,
         };
         vqa::dump::mark_sinks(gctx, gf, dump_names);
     }
@@ -448,7 +508,8 @@ bool Siglip::build_graph() {
     fprintf(stderr, "[perf] %s: graph build+alloc %.0f ms\n", arch_name.c_str(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb0).count());
     t_pooled = ggml_graph_get_tensor(gf, "v_pooled");
-    if (!t_pooled) { fprintf(stderr, "graph output missing\n"); return false; }
+    t_probs = probs_t ? ggml_graph_get_tensor(gf, "v_probs") : nullptr;
+    if (!t_pooled || (probs_t && !t_probs)) { fprintf(stderr, "graph output missing\n"); return false; }
     return true;
 }
 
@@ -457,12 +518,14 @@ bool Siglip::preprocess(const uint8_t * rgb, int w, int h, std::vector<float> & 
                         std::vector<float> & patches) {
     const int S = image_size;
     // square resize straight to (S, S) - SiglipImageProcessor has no crop step.
-    // resample 3 (the SigLIP default) goes through the PIL Resample.c BICUBIC
-    // replication (8bpc fixpoint, bit-exact vs the slow HF processor); other
-    // resample ids fall back to the generic antialias path.
+    // resample 3 (SigLIP releases) / 2 (several fine-tunes) go through the PIL
+    // Resample.c BICUBIC/BILINEAR replications (8bpc fixpoint, bit-exact vs the
+    // slow HF processor); anything else falls back to the generic antialias path.
     std::vector<uint8_t> resized8((size_t)S * S * 3);
     if (resample == 3) {
         vqa::img::resize_bicubic_coeffs(rgb, w, h, 3, S, S, resized8.data());
+    } else if (resample == 2) {
+        vqa::img::resize_bilinear_coeffs(rgb, w, h, 3, S, S, resized8.data());
     } else {
         std::vector<float> resized;
         vqa::img::resize_antialias(rgb, w, h, S, S, resized,
@@ -496,8 +559,10 @@ bool Siglip::preprocess(const uint8_t * rgb, int w, int h, std::vector<float> & 
 }
 
 // ---------------------------------------------------------------- forward
-bool Siglip::encode(const vqa::MediaInput & media, std::vector<float> & pooled) {
+bool Siglip::encode(const vqa::MediaInput & media, std::vector<float> & pooled,
+                    std::vector<float> * probs) {
     pooled.clear();
+    if (probs) probs->clear();
     if (!gf) { fprintf(stderr, "%s: graph not built\n", arch_name.c_str()); return false; }
     if (media.empty()) { fprintf(stderr, "%s: no image\n", arch_name.c_str()); return false; }
 
@@ -523,6 +588,10 @@ bool Siglip::encode(const vqa::MediaInput & media, std::vector<float> & pooled) 
 
     pooled.resize((size_t)n_embd);
     ggml_backend_tensor_get(t_pooled, pooled.data(), 0, sizeof(float) * (size_t)n_embd);
+    if (probs && t_probs) {
+        probs->resize((size_t)n_labels);
+        ggml_backend_tensor_get(t_probs, probs->data(), 0, sizeof(float) * (size_t)n_labels);
+    }
 
     if (!dump_dir.empty()) {
         // engine-side pixels for the preprocessing diff (oracle: ref_pixel_values)
@@ -548,6 +617,10 @@ bool Siglip::encode(const vqa::MediaInput & media, std::vector<float> & pooled) 
         dump("v_head_fc1");
         dump("v_head_mlp");
         dump("v_pooled");
+        if (t_probs) {
+            dump("v_logits");
+            dump("v_probs");
+        }
     }
     return true;
 }
@@ -569,18 +642,37 @@ bool Siglip::ask(const vqa::MediaInput & media, const std::string & prompt,
         return false;
     }
     if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
-    std::vector<float> pooled;
-    if (!encode(media, pooled)) return false;
+    std::vector<float> pooled, probs;
+    if (!encode(media, pooled, &probs)) return false;
     if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
 
     char buf[512];
     if (mode == "embed") {
+        // the pooled embedding (pre-logits), retrieval-compatible with --embed
         out_text = "[";
         for (size_t i = 0; i < pooled.size(); i++) {
             snprintf(buf, sizeof(buf), "%s%.6f", i ? ", " : "", (double)pooled[i]);
             out_text += buf;
         }
         out_text += "]";
+        return true;
+    }
+    if (!probs.empty()) {
+        // videomae-style top-k; mode may carry the k as a number (default 5)
+        int k = 5;
+        if (!mode.empty() && mode.find_first_not_of("0123456789") == std::string::npos)
+            k = std::max(1, atoi(mode.c_str()));
+        std::vector<int> order(probs.size());
+        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+        const int kk = std::min<int>(k, (int)probs.size());
+        std::partial_sort(order.begin(), order.begin() + kk, order.end(),
+                          [&](int a, int b) { return probs[(size_t)a] > probs[(size_t)b]; });
+        for (int i = 0; i < kk; i++) {
+            const int id = order[(size_t)i];
+            const char * label = id < (int)labels.size() ? labels[(size_t)id].c_str() : "?";
+            snprintf(buf, sizeof(buf), "%.6f  %s\n", (double)probs[(size_t)id], label);
+            out_text += buf;
+        }
         return true;
     }
     double l2 = 0.0, mean_v = 0.0;

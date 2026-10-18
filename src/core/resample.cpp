@@ -305,6 +305,12 @@ static inline double md_cubic_filter(double x) {
     return 0.0;
 }
 
+// PIL Resample.c triangle_filter (BILINEAR, support = 1.0)
+static inline double md_triangle_filter(double x) {
+    if (x < 0.0) x = -x;
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
 static const int MD_PRECISION_BITS = 32 - 8 - 2;  // 22
 
 struct MdCoeffs {
@@ -446,6 +452,19 @@ void resize_bicubic_coeffs(const uint8_t * src, int sw, int sh, int sc,
     MdCoeffs ch, cv;
     if (need_v) md_precompute_coeffs(sh, dh, 2.0, md_cubic_filter, cv);
     if (need_h) md_precompute_coeffs(sw, dw, 2.0, md_cubic_filter, ch);
+    pil_coeffs_resize(src, sw, sh, sc, dw, dh, dst, ch, cv, need_h, need_v);
+}
+
+void resize_bilinear_coeffs(const uint8_t * src, int sw, int sh, int sc,
+                            int dw, int dh, uint8_t * dst) {
+    if (sw == dw && sh == dh) {
+        std::memcpy(dst, src, (size_t)sw * sh * sc);
+        return;
+    }
+    bool need_h = dw != sw, need_v = dh != sh;
+    MdCoeffs ch, cv;
+    if (need_v) md_precompute_coeffs(sh, dh, 1.0, md_triangle_filter, cv);
+    if (need_h) md_precompute_coeffs(sw, dw, 1.0, md_triangle_filter, ch);
     pil_coeffs_resize(src, sw, sh, sc, dw, dh, dst, ch, cv, need_h, need_v);
 }
 
