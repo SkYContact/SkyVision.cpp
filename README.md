@@ -634,10 +634,15 @@ token2wav 在 CPU bf16 下有 dtype 问题，参考输出待补），音量偏�
 
 量化版：
 
-| 精度 | thinker / talker | 验证 | 用法 |
+| 精度 | thinker / talker | 验证（多模态消融，test-1.jpeg + 4 s wav vs HF bf16 ref） | 用法 |
 |---|---|---|---|
-| q8_0 | 5.64 GB / 1.66 GB | 与 ggml-org 官方 Q8_0 **逐张量 bit 级一致**；答案与 f16 相同，logits corr 0.9991；音频塔 corr 0.9993 | CPU 全功能（含 `--speak`）；6G 卡放不下 |
-| q4_0 | 3.63 GB / 1.50 GB | 答案与 f16 相同，logits corr 0.9511 | **6G 卡全功能**：QA 加 `QOMNI_NO_TALKER=1 --n-ctx 4096`；文本→语音整链也能全在卡上跑；QA+语音同跑超 6G 显存 |
+| f16 | 11.2 GB / 1.66 GB (q8) | logits0 corr 0.9946；音频塔 corr 0.9997；贪心答案与 HF 一致 | 12G 卡可跑（配 q8 talker） |
+| q8_0 | 5.64 GB / 1.66 GB | 与 ggml-org 官方 Q8_0 **逐张量 bit 级一致**；logits corr 0.9928（CPU/GPU 均 0.993）；音频塔 corr 0.9992；答案与 f16 相同 | CPU 全功能（含 `--speak`）；12G 卡全功能 |
+| q4_0 | 3.63 GB / 1.50 GB | logits corr 0.9475；音频塔 corr 0.9714；答案为同一事实的更短表述 | 6G 卡文本→语音整链；12G 卡全功能 |
+
+语音输出（全部量化档）：token2wav 修复后 wav rms 0.16-0.31（HF 量级 0.08-0.10），
+贪心解码对 talker 双方（HF 与本引擎）都是退化解，采样（temp 0.9/top-k 40/top-p 0.8）
+下 EOS 正常。e2e 多模态 QA+7.9 s 语音在 12G 卡 54 s（q8，宿主声码器已并行化）。
 
 GPU 上所有"宿主直读权重"的位置（mel 滤波器、BigVGAN/ECAPA/spk）都必须走
 `ggml_backend_tensor_get`——GPU 上 `t->data` 是空指针，`tensor_to_f32` 直读必崩。
