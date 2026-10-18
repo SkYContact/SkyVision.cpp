@@ -21,10 +21,17 @@ with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
 | Backend | Architecture tag | Input | Notes |
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | image | MoE text model + SigLIP tower; all five official skills (caption / query / detect / point / gaze), web UI, batch inference |
-| **VideoChat3-4B** | `videochat3` | image | Qwen3 text trunk (36 layers, GQA, per-head qk-norm) + VideoChat3's own 27-layer ViT (2D RoPE, 2×2 merge), built-in merger and multimodal projector |
-| **Marlin-2B** | `marlin` | image + video | Qwen3.5 hybrid trunk (18 gated-delta linear-attention + 6 full-attention layers, interleaved MRoPE) + Qwen3-VL style vision tower (learned absolute pos embed, 2D RoPE, per-temporal-step attention); the two trained skills: caption (timestamped event list) and find (temporal grounding) |
+| **VideoChat3-4B** | `videochat3` | image + video | Qwen3 text trunk (36 layers, GQA, per-head qk-norm) + VideoChat3's own 27-layer ViT (2D RoPE, 2×2 merge), built-in merger and multimodal projector |
+| **Qwen3.5 family (incl. Marlin-2B)** | `qwen3_5` (legacy GGUF tag `marlin`) | image + video | Qwen3.5 hybrid trunk (18 gated-delta linear-attention + 6 full-attention layers, interleaved MRoPE) + Qwen3-VL style vision tower (learned absolute pos embed, 2D RoPE, per-temporal-step attention). Official `Qwen/Qwen3.5-*` checkpoints convert as-is (same structure, parity verified stage by stage); Marlin-2B is the video-captioning specialisation with two trained skills: caption (timestamped event list) and find (temporal grounding) |
 | **VideoJev-4B (scoring)** | `videojev` | video | Qwen3.5-4B trunk (32 layers: 24 linear + 8 full, **16 key / 32 value heads in the linear layers**) + the same vision tower, but the last layer is **attention-only** (MLP and post-norm trimmed) and a trained cosine decision head replaces the lm head: one forward scores a fixed candidate list (temporal grounding = per-patch sigmoid, single-choice VQA = option softmax). No text generation at all — drive it with `--score <qs.json>` |
+| **Mage-VL-4B** | `mage_vl` | image + video | Microsoft Research Asia's codec-native VLM: Mage-ViT Codec-ViT (24 layers, 16×16 patches, per-axis 4:6:6 T/H/W RoPE, per-frame block attention, blocks folded straight into the merger) + Qwen3-4B-Instruct-2507 text trunk (36 layers, GQA + qk-norm, same shape as VideoChat3). Official `microsoft/Mage-VL` checkpoints convert as-is; single-block images, per-frame `<X.X seconds>` timestamp labels on video (frame-sampling backend). First ggml implementation of this model |
+| **MOSS-VL-Realtime (11B)** | `moss_vl` | image + video | OpenMOSS cross-attention architecture: Qwen3 text trunk (36 self layers + 12 pure cross-attn layers, tanh dual gating) + SigLIP tower (deepstack 8/16/24 + merger) + a learnable per-frame separator. Vision KV goes through a separate cross attention; interleaved MRoPE (planar 3-axis vision positions). Multi-turn sessions supported (`?session=`) |
 | **VideoMAE (base)** | `videomae` | video (image = still clip) | vision-only tower, no text side: Conv3d tubelet patch embedding + fixed sin-cos position table (**no cls token**) + 12 full space-time attention layers; one forward pass returns a label distribution (fine-tunes such as Kinetics-400) or the pooled embedding (`MCG-NJU/videomae-base` is the pretraining release, no head) |
+| **ViViT (b-16x2, video tower)** | `vivit` | video (image = still clip) | the same video tower (reuses the `videomae` backend): the only differences are a **cls token**, a **learned** position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v, and a shortest-edge-256 → crop-224 **bilinear** preprocessing with zero centering. 32 frames → 3136+1 tokens, one forward returns Kinetics-400 labels |
+| **Qwen2.5-VL (3B)** | `qwen2vl` | image (video pending) | Qwen2 text trunk (36 layers, GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32 layers, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger. Dynamic resolution via `smart_resize` (multiples of 28); preprocessing is **CLIP mean/std**, bicubic, patches packed in **2×2 group order** |
+| **Qwen2.5-Omni (3B)** | `qwen25omni` | image + audio in, text + speech out | full thinker-talker: Qwen2.5 text trunk (untied lm_head) + the Qwen2.5-VL tower (same window-attention graph as `qwen2vl`) + a Whisper-style audio tower (128-bin log-mel, **n_window=100 chunked convolution + chunked attention**, 25 tok/s) → **Talker** (24-layer dual-track LM: the text track consumes thinker hidden states, emits 25 Hz codec tokens) → **Token2Wav** (flow-matching DiT, RK4×10 steps + CFG + sway sampling; BigVGAN v2 anti-aliased activations, pure C++ host implementation). Audio input via `--audio` (ffmpeg decodes to 16 kHz mono). References: llama.cpp PR #13784 (thinker) + the HF transformers 5.20 sources (all semantics); mel/audio tower bit-aligned with the official implementation |
+| **SmolVLM (256M, Idefics3)** | `smolvlm` | image | the smallest usable backend here: SigLIP-base tower (12 layers, patch 16, 512², learned positions, LN/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30 layers, no bias, GQA 9:3, rope 1e5). Official Idefics3 preprocessing: longest edge **2048** → pad to multiples of 512 → **512² tiles** (row-major) + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8 |
+| **EmbeddingGemma-2 (740M)** | `embgemma2` | image + video + audio + text (embeddings) | multimodal embedding model (no text generation): Gemma3 text tower (24 layers, d=512, GQA 4:1, interleaved SWA/full, **per-layer PLE**) + Gemma4 ViT (16 layers, patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / **chunked local attention with Transformer-XL relative position bias**, ClippableLinear clamps throughout). `--embed` emits 768-d vectors (Matryoshka truncation to 512/256/128/64), `--embed-preset` official task prefixes, `--embed-file` batch JSONL. All four modalities vs the fp32 HF reference: **0.99999+** |
 
 ## Status
 
@@ -41,10 +48,13 @@ with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
 | Web UI (`--serve`) | ✅ image-first UI: drag/paste, 3 caption lengths, VQA, detect boxes, point crosshairs, gaze prediction; same-image cache hits in ~66 ms |
 | FP8 expert weights → Q8_0 / Q6_K / Q4_K | ✅ converter included (Q6_K ≈ 7.6 GB — the pick for 12 GB GPUs) |
 | Batch inference (`--batch`) / streaming | ✅ |
-| VideoChat3-4B text / image VQA | ✅ works end to end (`vqa-cli`, verified on CPU and CUDA); **stage-by-stage parity against the PyTorch reference is still outstanding** |
+| VideoChat3-4B text / image VQA | ✅ end to end + **stage-by-stage parity verified**: patch embedding rel 4e-4, the 27-layer ViT + merger + projector rel 0.026 (F16 weight-noise level), greedy output byte-identical to the official bf16 |
 | Marlin-2B image/video VQA | ✅ end to end with **stage-by-stage parity verified** against the official transformers 5.20 reference (pixel values bitwise-identical, tower drift beats official bf16, logits 1.5e-2 vs f32); `--mode caption` / `--mode find` wired to the canonical trained prompts |
 | VideoJev-4B candidate scoring | ✅ whole path wired + **verified against the official transformers 5.14 code** (`scripts/parity_videojev.py`; prompt token ids are byte-identical). Taking a CPU float32 reference as truth: the engine (f16) is within **6.8e-3** max probability error (q8_0: 5.9e-3), while the official repo's own bf16 run is off by 5.7e-2 — the engine tracks fp32 closer than the reference default. Choice head: 6.6e-6 vs 5.1e-5 |
-| VideoChat3-4B video input | 🔜 frame decoding and timestamped prompts are designed but not wired up yet |
+| MOSS-VL-Realtime image/video QA | ✅ end to end + parity against the official stack: image prefill token stream 24/24 and video 78/78 bitwise-identical, layer-2 cross-attn intermediates corr ≥ 0.999, KV readback vs the official roped K corr 0.9997. CUDA (5070 Ti Laptop, Q4_K): 213 ms/image vision, 67 tok/s decode; CPU 16 threads 8.9 tok/s. Multi-turn via `/ask?session=<id>` (`reset=1` clears), realtime stream via `rt/start?session=&src=&interval=` (`rt/say`, `rt/events`, `rt/stop`) |
+| Mage-VL image/video QA | ✅ end to end + per-stage vision-tower parity; greedy answers match the official transformers oracle. CUDA (3060 6 GB, Q6_K): 162 ms/image vision, 63 tok/s decode, weights + KV fit a 6 GB card. `--video` with per-frame `<X.X seconds>` labels; the streammind gate ships as `--mode gate` / `--mode gated[:τ]` (the `mage-gate-f16.gguf` from `convert/convert_mage_gate.py` auto-loads next to the model) |
+| Qwen2.5-Omni image+audio → text+speech | ✅ thinker + talker: q8_0 is bit-identical to ggml-org's official Q8_0 tensor for tensor, logits corr 0.9928, audio tower corr 0.9992, answers match f16; `--audio` in, `--speak reply.wav` out (24 kHz wav). Quantization table in the Qwen2.5-Omni section |
+| VideoChat3-4B video input | ✅ built-in `--video` (ffmpeg pipe; `FFMPEG=<path>` overrides the binary): frame sampling + timestamped prompts + joint attention over 4-frame temporal clips; the vision tower runs clip by clip (peak activations stay at one clip), and oversized images/videos are clamped to the same context budget |
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
@@ -90,6 +100,25 @@ hf download moondream/moondream3.1-9B-A2B --local-dir models/moondream3.1-9B-A2B
 
 # VideoChat3-4B
 hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
+
+# MOSS-VL-Realtime (image/video + multi-turn sessions)
+vqa-cli --model Moss-VL-Realtime-q4k.gguf --image photo.jpg --ask "What is in this image?"
+vqa-cli --model Moss-VL-Realtime-q4k.gguf --video clip.mp4 --max-frames 8 --ask "What happens?"   # video: per-frame timestamped prompts
+# server-side multi-turn: POST /api/model/Moss-VL-Realtime-q4k/ask?q=...&session=abc (reset=1 clears)
+
+# Marlin-2B (ModelScope mirror, no login)
+modelscope download NemoStation/Marlin-2B --local_dir models/Marlin-2B
+
+# Qwen3.5-2B (official, general image/video VQA)
+modelscope download Qwen/Qwen3.5-2B --local_dir models/Qwen3.5-2B
+
+# VideoJev-4B (scoring, no text generation; driven with --score)
+hf download ZhuYuhan/VideoJev-4B --local-dir models/VideoJev-4B
+python convert/convert_videojev.py --src models/VideoJev-4B -o videojev-4b-q8_0.gguf
+
+# VideoMAE: the pretraining release (embedding only) or the Kinetics-400 fine-tune
+hf download MCG-NJU/videomae-base --local-dir models/videomae-base
+hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae-base-ft
 ```
 
 The converters find the checkpoint themselves: `--src <dir|file>` → the model's
@@ -249,7 +278,14 @@ re-opened and its tensor table verified.
 | `convert_vision.py` | `moondream3.1-vision.gguf` (SigLIP tower, ~0.84 GB) |
 | `convert_region.py` | `moondream3.1-region.gguf` (detect/point/gaze head, ~30 MB) |
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf` (Qwen3 + VideoChat3 ViT, single file, `--outtype f16\|q8_0\|q6_k\|q4_0`) |
+| `convert_qwen3_5.py` | shared by Qwen3.5 and Marlin-2B: `<checkpoint>-<outtype>.gguf` (hybrid trunk + Qwen3-VL tower, single file, `--outtype f16\|q8_0\|q6_k\|q4_0`, default q8_0; Marlin checkpoints get the `marlin.skills` bit automatically) |
+| `convert_videojev.py` | `videojev-4b-<outtype>.gguf` (the cosine scoring head and special tokens travel inside the GGUF; `--outtype` defaults to q8_0) |
+| `convert_mage_vl.py` | `mage-vl-4b-<outtype>.gguf` (Codec-ViT + Qwen3 trunk, single file, `--outtype f16\|q8_0\|q6_k\|q4_0`) |
+| `convert_moss_vl.py` | `Moss-VL-Realtime-<nf4-out>.gguf` (the official NF4 self-layer weights are dequantized and requantized, default q4_k; `--nf4-out` / `--bf16-text-out` / `--vision-out` pick per-part precision) |
 | `convert_videomae.py` | `videomae-<outtype>.gguf` (VideoMAE video tower, single file, `--outtype f16\|q8_0\|q4_0`; the classifier and its `id2label` table travel inside the GGUF) |
+| `convert_qwen2vl.py` | `qwen2vl-<outtype>.gguf` (single file, `--outtype f16\|q8_0\|q4_0`, default f16) |
+| `convert_qwen25omni.py` | `qwen25omni-<outtype>.gguf` (thinker) + `qwen25omni-talker-<outtype>.gguf` (talker + token2wav); `--outtype f16\|q8_0\|q4_0`, `--vision-f32`, `--no-talker` |
+| `convert_smolvlm.py` | `smolvlm-<outtype>.gguf` (single file, `--outtype f16\|q8_0\|q4_0`, default f16) |
 | `convert_embedgemma2.py` | `embeddinggemma2-<outtype>.gguf` (four-modality embedder, single file, `--outtype f16\|q8_0\|q4_0`; ~1.5 GB at f16) |
 
 ### moondream3.1
@@ -284,6 +320,7 @@ checkpoint directory at run time (`--tokenizer <dir>`).
 
 ```bash
 python convert/convert_videochat3.py --outtype q8_0   # → videochat3-4b-q8_0.gguf (4.83 GB)
+python convert/convert_qwen3_5.py --src models/Qwen3.5-2B   # → qwen3.5-2b-q8_0.gguf (2.67 GB, shared by Qwen3.5/Marlin)
 python convert/convert_videochat3.py --outtype q6_k   # → 3.92 GB
 python convert/convert_videochat3.py --outtype q4_0   # → 2.95 GB
 ```
@@ -453,6 +490,51 @@ redistribution, self-hosting and commercial integration; only reselling a public
 general-purpose Moondream inference API requires a separate license — that obligation falls on
 the operator, not on this engine.
 
+### Qwen2.5-Omni
+
+```bash
+python convert/convert_qwen25omni.py --src models/qwen25omni/hf --outtype f16 --vision-f32
+# → qwen25omni-f16.gguf (thinker) + qwen25omni-talker-f16.gguf (talker + token2wav + speaker embedding)
+vqa-cli --model qwen25omni-f16.gguf --tokenizer models/qwen25omni/hf \
+        --image photo.jpg --audio clip.wav --ask "What is shown?" \
+        --speak reply.wav          # speech output (24 kHz wav, default voice Chelsie)
+```
+
+Thinker side: the text trunk shares the QWEN2VL graph (note the lm_head is **not tied** — the
+converter writes `t.output.weight`); the audio tower differs from vanilla whisper in three ways,
+all replicated from the official HF 5.20 implementation — the mel spectrogram is chunked into
+n_window×2 = 200-frame blocks with **per-block convolution** (on the ggml side, 4 zero columns plus
+two zeroed border columns after conv1 reproduce it exactly), intra-block attention, and frame-pair
+(2i, 2i+1) average pooling (floor semantics, odd tail frame dropped). The three ingredients of
+`ggml_conv_1d` (kernel bytes = torch `[OC,IC,K]` as-is, channel-contiguous data, output `[T,C]` with
+the bias added after the transpose) are documented at the top of `qwen25omni_audio.cpp`.
+
+Talker side: prefill is only 3 positions (`[h0+e0, bos+codec_pad, h1+e1+codec_bos]`); the prompt
+acts only through the absolute rope offset; codec sampling temp 0.9 / top-k 40 / top-p 0.8 /
+repetition penalty 1.05. The Token2Wav DiT runs as a ggml graph (AdaLN-zero, block-24 chunked
+attention mask, RoPE); BigVGAN and the ECAPA speaker tower are host C++ (the grouped FIR of the
+anti-aliased activations has no ggml operator; kaiser windows are computed from the HF formulas).
+Known gap: speech is not yet aligned against HF (HF's token2wav hits a dtype problem on CPU bf16,
+reference output pending), volume runs low, and BigVGAN's snake/fir semantics deserve a second pass
+with the official fp32 weights.
+
+Quantized builds:
+
+| Precision | thinker / talker | Verification (multimodal ablation: test-1.jpeg + 4 s wav vs the HF bf16 ref) | Use |
+|---|---|---|---|
+| f16 | 11.2 GB / 1.66 GB (q8) | logits0 corr 0.9946; audio tower corr 0.9997; greedy answer matches HF | runs on 12 GB cards (with the q8 talker) |
+| q8_0 | 5.64 GB / 1.66 GB | bit-identical to ggml-org's official Q8_0 **tensor for tensor**; logits corr 0.9928 (0.993 on both CPU and GPU); audio tower corr 0.9992; same answers as f16 | full feature set on CPU (incl. `--speak`); full feature set on 12 GB cards |
+| q4_0 | 3.63 GB / 1.50 GB | logits corr 0.9475; audio tower corr 0.9714; a shorter phrasing of the same facts | full text→speech chain on 6 GB cards; full feature set on 12 GB |
+
+Speech output (every quantization): after the token2wav fixes the wav rms is 0.16-0.31 (HF lands at
+0.08-0.10); greedy decoding is a degenerate mode for both talkers (HF and this engine), and under
+sampling (temp 0.9 / top-k 40 / top-p 0.8) EOS fires normally. End-to-end multimodal QA plus 7.9 s
+of speech takes 54 s on a 12 GB card (q8, host vocoder parallelized).
+
+On the GPU, every spot where the host reads weights directly (mel filters, BigVGAN/ECAPA/spk) must
+go through `ggml_backend_tensor_get` — on the GPU `t->data` is a null pointer, and reading it
+through `tensor_to_f32` will crash.
+
 ### EmbeddingGemma-2 (four-modality embeddings)
 
 ```bash
@@ -568,6 +650,15 @@ src/
   models/videochat3/   VideoChat3-4B backend (vision preprocessing + graphs)
   models/videomae/     VideoMAE video tower backend (clip preprocessing + space-time attention
                        + classifier / embedding)
+  models/qwen3_5/      Qwen3.5 / Marlin / VideoJev backend (gated-delta + full-attention hybrid
+                       graph, caption/find skills, the scoring head)
+  models/moss_vl/      MOSS-VL-Realtime backend (self+cross attention graphs, multi-turn and
+                       realtime-stream sessions)
+  models/mage_vl/      Mage-VL backend (Codec-ViT tower + System 1 gating)
+  models/qwen2vl/      Qwen2.5-VL backend (window-attention ViT + 2×2 group-order patches)
+  models/qwen25omni/   Qwen2.5-Omni backend (thinker/talker GGUFs + host Token2Wav)
+  models/smolvlm/      SmolVLM-256M backend (Idefics3 tile preprocessing)
+  models/embedgemma2/  EmbeddingGemma-2 backend (four-modality embeddings)
   cli/                 unified front end (vqa-cli: inference / --serve Web UI / --mcp server)
 convert/               HF checkpoint → GGUF converters
 scripts/               build scripts, parity and self-test tooling

@@ -20,7 +20,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
 | **VideoChat3-4B** | `videochat3` | 图像 + 视频 | Qwen3 文本主干（36 层 GQA + per-head qk-norm）+ VideoChat3 自研 27 层 ViT（2D RoPE + 2×2 merge）、2×2→4608 merger、multimodal projector |
-| **Qwen3.5 系（含 Marlin-2B）** | `marlin` | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
+| **Qwen3.5 系（含 Marlin-2B）** | `qwen3_5`（旧 GGUF 标签 `marlin` 兼容） | 图像 + 视频 | Qwen3.5 混合主干（18 层 gated-delta 线性注意力 + 6 层 full attention，interleaved MRoPE）+ Qwen3-VL 式视觉塔（学习式绝对位置嵌入 + 2D RoPE + 逐时间步注意力）。官方 `Qwen/Qwen3.5-*` 检查点直接转换即用（结构同构、逐级 parity 已验证）；Marlin-2B 为其视频字幕特化版，额外带官方训练技能 caption（带时间戳事件）/ find（时序定位）
 | **VideoJev-4B（打分式）** | `videojev` | 视频 | Qwen3.5-4B 主干（32 层：24 线性 + 8 full，**线性注意力 16 键 / 32 值头 GQA**）+ 同款视觉塔，但**末层被裁成 attention-only**（无 MLP/post-norm），并用训练好的 cosine 决策头替代 lm head：一次前向对候选列表打分（时序定位=逐时间片 sigmoid，单选=VQA softmax），**不生成文本**。走 `--score <qs.json>`，见"候选打分" |
 | **Mage-VL-4B** | `mage_vl` | 图像 + 视频 | 微软亚研院 codec 原生 VLM：Mage-ViT Codec-ViT（24 层、16×16 patch、逐维 4:6:6 T/H/W RoPE、按帧分块注意力、2×2 block 布局直折 merger）+ Qwen3-4B-Instruct-2507 文本主干（36 层 GQA + qk-norm，与 VideoChat3 同构）。官方 `microsoft/Mage-VL` 检查点转换即用；图像单块、视频逐帧 `<X.X seconds>` 时间戳标签（帧采样后端）。社区首个 ggml 实现
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
@@ -54,7 +54,6 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | VideoJev-4B 候选打分 | ✅ 全链路打通 + **对拍官方 transformers 5.14**（`scripts/parity_videojev.py`，prompt token 序列逐位一致）。以 CPU float32 参考为真值：引擎 f16 的最大概率偏差 **6.8e-3**（q8_0 5.9e-3），而官方仓库默认的 bf16 跑法偏差 5.7e-2 —— 引擎比官方参考更贴近 fp32。choice 端偏差 6.6e-6（官方 bf16 为 5.1e-5）。见 `scripts/parity_videojev.py` / `scripts/gen_fake_videojev.py` |
 | Marlin-2B 视频结构化技能 | ✅ `--mode caption`（Scene + 带秒级时间戳的 Events 列表）/ `--mode find`（自然语言事件 → `From X.X to Y.X.`），训练对齐的官方提示词 |
 | 视觉预处理 token 预算 | ✅ 图片/视频的视觉 token 上限 = n_ctx − max_tokens − 文本开销，编码前钳制分辨率或提前报错（不再白等几秒后 context overflow） |
-
 | MOSS-VL-Realtime 图像/视频问答 | ✅ 端到端 + 官方栈对拍：图像 prefill token 流 24/24、视频 78/78 逐位一致；layer2 cross-attn 中间量 corr ≥ 0.999；KV cache 回读 vs 官方 roped K corr 0.9997。CUDA（5070 Ti Laptop，Q4_K）：视觉 213ms/图、decode 67 tok/s；CPU 16 线程 decode 8.9 tok/s |
 | MOSS-VL 多轮会话 | ✅ `--serve` 的 `/ask?session=<id>`（`reset=1` 清空）：server 维护最近 12 轮文本历史，引擎 prompt 重建（媒体缓存命中时视觉塔免重跑） |
 | MOSS-VL 实时流会话 | ✅ `/ask?session=<id>&rt=1`：官方 real_time_generate 的引擎侧实现——新帧/新问题增量追加到活跌 KV（文本 KV 续写 + cross-KV 行追加，不重建全上下文），位置按官方增量 MRoPE 公式；`<|silence|>` 作为闲置信号终止本轮。已验证：跨轮记忆（两张图分别在后续追问中正确引用） |
@@ -64,6 +63,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | MOSS-VL 常驻推理流 | ✅ `rt/start?session=&src=&interval=`（src=文件/URL/`video=`摄像头）：ffmpeg 采集线程 + 常驻推理循环，模型按轮观察新帧并**主动发言**（`<|silence|>`=本轮无话可说）；`rt/say?q=` 流内提问（独立文本轮）、`rt/events?since=` 轮询 NDJSON 事件、`rt/stop` 停止 |
 | VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
 | EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
+
 ## 快速开始
 
 ### 1. 构建
@@ -88,6 +88,16 @@ cmake --build build --config Release --target vqa-cli
 HTTP server，全部能力（看图问答、caption/detect/point/gaze/ask-think、批量、Web UI）都通过
 `vqa::Model` 接口由同一个 `vqa-cli` 驱动。
 CUDA 构建下引擎默认优先使用 GPU，`--cpu`（或 moondream 的 `MD_CPU=1`）可强制 CPU。
+
+可选：把 JPEG 解码换成 libjpeg-turbo（不 clone 也能编，走 stb_image，代价是与
+PIL/libjpeg 的 IDCT 差 1-3 灰阶；换了之后与 PIL 逐位一致，omni 视觉塔 parity 闭环）：
+
+```bash
+git clone --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo vendor/libjpeg-turbo
+# 上游禁止未修改的树被 add_subdirectory：把其自保护守卫改成自比较（该补丁已进 Dockerfile）
+sed -i 's/CMAKE_SOURCE_DIR/CMAKE_CURRENT_SOURCE_DIR/g' vendor/libjpeg-turbo/CMakeLists.txt
+# 有 nasm 自动开 SIMD（输出与不开逐位一致，只是快 2-4 倍）；MSVC 下自动对齐 /MD 运行时
+```
 
 ### 2. 取权重
 
@@ -299,8 +309,14 @@ CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mo
 | `convert_vision.py` | `moondream3.1-vision.gguf`（SigLIP 塔，~0.84GB） |
 | `convert_region.py` | `moondream3.1-region.gguf`（detect/point/gaze 头，~30MB） |
 | `convert_videochat3.py` | `videochat3-4b-<outtype>.gguf`（Qwen3 + VideoChat3 ViT，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
-| `convert_marlin.py` | `marlin-2b-<outtype>.gguf`（Qwen3.5 混合主干 + Qwen3-VL 视觉塔，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
+| `convert_qwen3_5.py` | Qwen3.5 / Marlin-2B 通用：`<检查点>-<outtype>.gguf`（混合主干 + Qwen3-VL 视觉塔，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`，默认 q8_0；Marlin 检查点自动写入 `marlin.skills` 技能位） |
+| `convert_videojev.py` | `videojev-4b-<outtype>.gguf`（cosine 打分头与特殊 token 一起写进 GGUF，`--outtype` 默认 q8_0） |
+| `convert_mage_vl.py` | `mage-vl-4b-<outtype>.gguf`（Codec-ViT + Qwen3 文本主干，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
+| `convert_moss_vl.py` | `Moss-VL-Realtime-<nf4-out>.gguf`（官方 NF4 self 层权重反量化后重量化，默认 q4_k；`--nf4-out` / `--bf16-text-out` / `--vision-out` 分层选档） |
 | `convert_videomae.py` | `videomae-<outtype>.gguf`（VideoMAE 视频塔，单文件，`--outtype f16\|q8_0\|q4_0`；分类头与 `id2label` 一起写进 GGUF） |
+| `convert_qwen2vl.py` | `qwen2vl-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
+| `convert_qwen25omni.py` | `qwen25omni-<outtype>.gguf`（thinker）+ `qwen25omni-talker-<outtype>.gguf`（talker+token2wav），`--outtype f16\|q8_0\|q4_0`、`--vision-f32`、`--no-talker` |
+| `convert_smolvlm.py` | `smolvlm-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
 | `convert_embedgemma2.py` | `embeddinggemma2-<outtype>.gguf`（四模态嵌入，单文件，`--outtype f16\|q8_0\|q4_0`；f16 约 1.5GB） |
 
 ### moondream3.1
@@ -331,7 +347,7 @@ Q6_K 量化器是本仓库自带的（gguf-py 至今只实现了 Q6_K 的**解�
 
 ```bash
 python convert/convert_videochat3.py --outtype q8_0   # → videochat3-4b-q8_0.gguf（4.83GB）
-python convert/convert_marlin.py --src models/Qwen3.5-2B   # → qwen3.5-2b-q8_0.gguf（2.67GB，Qwen3.5/Marlin 通用）
+python convert/convert_qwen3_5.py --src models/Qwen3.5-2B   # → qwen3.5-2b-q8_0.gguf（2.67GB，Qwen3.5/Marlin 通用）
 python convert/convert_videochat3.py --outtype q6_k   # → 3.92GB
 python convert/convert_videochat3.py --outtype q4_0   # → 2.95GB
 ```
@@ -475,6 +491,44 @@ vqa-cli --model smolvlm-256m-f16.gguf --tokenizer models/smolvlm-256m \
 该许可明确允许量化、转换、再分发、自托管与商用集成；仅对公众开放的通用 moondream API
 转售需要单独授权——那是部署者的义务，与本引擎无关。
 
+### Qwen2.5-Omni
+
+```bash
+python convert/convert_qwen25omni.py --src models/qwen25omni/hf --outtype f16 --vision-f32
+# → qwen25omni-f16.gguf（thinker）+ qwen25omni-talker-f16.gguf（talker+token2wav+音色）
+vqa-cli --model qwen25omni-f16.gguf --tokenizer models/qwen25omni/hf \
+        --image photo.jpg --audio clip.wav --ask "What is shown?" \
+        --speak reply.wav          # 语音输出（24kHz wav，默认音色 Chelsie）
+```
+
+thinker 侧：文本主干走 QWEN2VL 同构图（注意 lm_head **不 tied**，转换器写 `t.output.weight`）；
+音频塔与原味 whisper 的三点差异都按 HF 5.20 官方实现复刻——mel 按 n_window×2=200 帧分块后
+**逐块独立卷积**（ggml 侧用 4 零列 + conv1 后零化边界两列精确复现）、块内注意力、帧对 (2i, 2i+1)
+平均池化（floor 语义，奇尾帧丢弃）。`ggml_conv_1d` 的三要素（kernel 字节 = torch [OC,IC,K] 原样、
+数据通道连续、输出 [T,C] 且 bias 在转置后加）在 `qwen25omni_audio.cpp` 顶部有完整注释。
+
+talker 侧：预填只有 3 个位置（[h0+e0, bos+codec_pad, h1+e1+codec_bos]），prompt 只通过 rope 绝对
+偏移起作用；codec 采样 temp 0.9 / top-k 40 / top-p 0.8 / 重复惩罚 1.05。Token2Wav 的 DiT 走 ggml 图
+（AdaLN-zero、block=24 分块注意力 mask、RoPE），BigVGAN 与 ECAPA 说话人塔是宿主 C++（抗锯齿激活的
+分组 FIR 没有 ggml 算子；kaiser 滤波器按 HF 公式现算）。已知差距：语音数值尚未与 HF 对齐（HF 的
+token2wav 在 CPU bf16 下有 dtype 问题，参考输出待补），音量偏小，BigVGAN 的 snake/fir 语义值得用
+官方 fp32 权重再核对一遍。
+
+量化版：
+
+| 精度 | thinker / talker | 验证（多模态消融，test-1.jpeg + 4 s wav vs HF bf16 ref） | 用法 |
+|---|---|---|---|
+| f16 | 11.2 GB / 1.66 GB (q8) | logits0 corr 0.9946；音频塔 corr 0.9997；贪心答案与 HF 一致 | 12G 卡可跑（配 q8 talker） |
+| q8_0 | 5.64 GB / 1.66 GB | 与 ggml-org 官方 Q8_0 **逐张量 bit 级一致**；logits corr 0.9928（CPU/GPU 均 0.993）；音频塔 corr 0.9992；答案与 f16 相同 | CPU 全功能（含 `--speak`）；12G 卡全功能 |
+| q4_0 | 3.63 GB / 1.50 GB | logits corr 0.9475；音频塔 corr 0.9714；答案为同一事实的更短表述 | 6G 卡文本→语音整链；12G 卡全功能 |
+
+语音输出（全部量化档）：token2wav 修复后 wav rms 0.16-0.31（HF 量级 0.08-0.10），
+贪心解码对 talker 双方（HF 与本引擎）都是退化解，采样（temp 0.9/top-k 40/top-p 0.8）
+下 EOS 正常。e2e 多模态 QA+7.9 s 语音在 12G 卡 54 s（q8，宿主声码器已并行化）。
+
+GPU 上所有"宿主直读权重"的位置（mel 滤波器、BigVGAN/ECAPA/spk）都必须走
+`ggml_backend_tensor_get`——GPU 上 `t->data` 是空指针，`tensor_to_f32` 直读必崩。
+
 ### EmbeddingGemma-2（四模态嵌入）
 
 ```bash
@@ -576,6 +630,13 @@ src/
   models/moondream/    moondream3.1 后端（引擎 + 视觉塔 + 多 crop 预处理 + region 头 + 服务端/批量）
   models/videochat3/   VideoChat3-4B 后端（视觉预处理 + 计算图）
   models/videomae/     VideoMAE 视频塔后端（clip 预处理 + 全时空注意力前向 + 分类/嵌入）
+  models/qwen3_5/      Qwen3.5 / Marlin / VideoJev 后端（gated-delta + full attention 混合图、caption/find 技能、打分头）
+  models/moss_vl/      MOSS-VL-Realtime 后端（self+cross 双路注意力图、多轮/实时流会话）
+  models/mage_vl/      Mage-VL 后端（Codec-ViT 视觉塔 + System 1 门控）
+  models/qwen2vl/      Qwen2.5-VL 后端（窗口注意力 ViT + 2×2 分组 patch 预处理）
+  models/qwen25omni/   Qwen2.5-Omni 后端（thinker/talker 双 GGUF + 宿主 Token2Wav）
+  models/smolvlm/      SmolVLM-256M 后端（Idefics3 瓦片预处理）
+  models/embedgemma2/  EmbeddingGemma-2 后端（四模态嵌入）
   cli/                 统一前端 vqa-cli（推理 / --serve Web UI / --mcp MCP 服务器）
 convert/               HF 检查点 → GGUF 转换器
 scripts/               构建脚本、parity 与自检脚本
@@ -608,41 +669,3 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
 
 MIT，见 [LICENSE](LICENSE)。ggml 为 MIT（ggml-org）。模型权重与 tokenizer 遵循其各自条款，单独下载。
 
-
-### Qwen2.5-Omni
-
-```bash
-python convert/convert_qwen25omni.py --src models/qwen25omni/hf --out-type f16 --vision-f32
-# → qwen25omni-f16.gguf（thinker，9.4GB）+ qwen25omni-talker-f16.gguf（talker+token2wav+音色，2GB）
-vqa-cli --model qwen25omni-f16.gguf --tokenizer models/qwen25omni/hf \
-        --image photo.jpg --audio clip.wav --ask "What is shown?" \
-        --speak reply.wav          # 语音输出（24kHz wav，默认音色 Chelsie）
-```
-
-thinker 侧：文本主干走 QWEN2VL 同构图（注意 lm_head **不 tied**，转换器写 `t.output.weight`）；
-音频塔与原味 whisper 的三点差异都按 HF 5.20 官方实现复刻——mel 按 n_window×2=200 帧分块后
-**逐块独立卷积**（ggml 侧用 4 零列 + conv1 后零化边界两列精确复现）、块内注意力、帧对 (2i, 2i+1)
-平均池化（floor 语义，奇尾帧丢弃）。`ggml_conv_1d` 的三要素（kernel 字节 = torch [OC,IC,K] 原样、
-数据通道连续、输出 [T,C] 且 bias 在转置后加）在 `qwen25omni_audio.cpp` 顶部有完整注释。
-
-talker 侧：预填只有 3 个位置（[h0+e0, bos+codec_pad, h1+e1+codec_bos]），prompt 只通过 rope 绝对
-偏移起作用；codec 采样 temp 0.9 / top-k 40 / top-p 0.8 / 重复惩罚 1.05。Token2Wav 的 DiT 走 ggml 图
-（AdaLN-zero、block=24 分块注意力 mask、RoPE），BigVGAN 与 ECAPA 说话人塔是宿主 C++（抗锯齿激活的
-分组 FIR 没有 ggml 算子；kaiser 滤波器按 HF 公式现算）。已知差距：语音数值尚未与 HF 对齐（HF 的
-token2wav 在 CPU bf16 下有 dtype 问题，参考输出待补），音量偏小，BigVGAN 的 snake/fir 语义值得用
-官方 fp32 权重再核对一遍。
-
-量化版：
-
-| 精度 | thinker / talker | 验证（多模态消融，test-1.jpeg + 4 s wav vs HF bf16 ref） | 用法 |
-|---|---|---|---|
-| f16 | 11.2 GB / 1.66 GB (q8) | logits0 corr 0.9946；音频塔 corr 0.9997；贪心答案与 HF 一致 | 12G 卡可跑（配 q8 talker） |
-| q8_0 | 5.64 GB / 1.66 GB | 与 ggml-org 官方 Q8_0 **逐张量 bit 级一致**；logits corr 0.9928（CPU/GPU 均 0.993）；音频塔 corr 0.9992；答案与 f16 相同 | CPU 全功能（含 `--speak`）；12G 卡全功能 |
-| q4_0 | 3.63 GB / 1.50 GB | logits corr 0.9475；音频塔 corr 0.9714；答案为同一事实的更短表述 | 6G 卡文本→语音整链；12G 卡全功能 |
-
-语音输出（全部量化档）：token2wav 修复后 wav rms 0.16-0.31（HF 量级 0.08-0.10），
-贪心解码对 talker 双方（HF 与本引擎）都是退化解，采样（temp 0.9/top-k 40/top-p 0.8）
-下 EOS 正常。e2e 多模态 QA+7.9 s 语音在 12G 卡 54 s（q8，宿主声码器已并行化）。
-
-GPU 上所有"宿主直读权重"的位置（mel 滤波器、BigVGAN/ECAPA/spk）都必须走
-`ggml_backend_tensor_get`——GPU 上 `t->data` 是空指针，`tensor_to_f32` 直读必崩。
