@@ -829,7 +829,25 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
         cond_ready = true;
     }
     if (getenv("T2W_SKIP")) { fprintf(stderr, "t2w: SKIPPED\n"); return false; }
-    const int n_code = (int)codec.size();
+    // DiT cost grows ~quadratically with T0 and 4096 is the hard graph cap:
+    // instead of dropping the WHOLE reply's audio ("bad length"), truncate the
+    // codec stream so long answers speak their first N seconds
+    int n_code = (int)codec.size();
+    std::vector<int> codec_trunc;
+    const int * codes = codec.data();
+    {
+        int cap = 400;   // 25 Hz codecs ~= 16 s of speech
+        if (const char * e = getenv("QOMNI_T2W_MAX_CODES")) cap = atoi(e);
+        const int t0_cap = 4096 / d_repeats;
+        if (cap <= 0 || cap > t0_cap) cap = t0_cap;
+        if (n_code > cap) {
+            fprintf(stderr, "t2w: truncating %d codecs to %d (T0 cap; raise QOMNI_T2W_MAX_CODES)\n",
+                    n_code, cap);
+            codec_trunc.assign(codec.begin(), codec.begin() + cap);
+            codes = codec_trunc.data();
+            n_code = cap;
+        }
+    }
     const int T0 = n_code * d_repeats;
     if (T0 < 1 || T0 > 4096) { fprintf(stderr, "t2w: bad length %d\n", T0); return false; }
     const int T = T0 * 2;   // CFG batch
@@ -850,7 +868,7 @@ bool Token2Wav::run(const std::vector<int> & codec, std::vector<float> & pcm) {
         std::vector<float> row;
         for (int i = 0; i < n_code; i++) {
             row.resize((size_t)d_emb);
-            read_emb_row(codec_embd, codec[(size_t)i], row.data());
+            read_emb_row(codec_embd, codes[(size_t)i], row.data());
             for (int r = 0; r < d_repeats; r++)
                 memcpy(cemb.data() + (size_t)(i * d_repeats + r) * d_emb, row.data(),
                        (size_t)d_emb * sizeof(float));
