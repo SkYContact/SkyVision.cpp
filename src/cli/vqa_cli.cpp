@@ -162,7 +162,8 @@ int main(int argc, char ** argv) {
     }
     if (serve_port > 0) {
         const std::string dir = models_dir.empty() ? "." : models_dir;
-        return vqa::run_web_ui(serve_port, dir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg, serve_host.c_str());
+        return vqa::run_web_ui(serve_port, dir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg,
+                               serve_host.c_str(), use_gpu);
     }
 
     if (model_path.empty()) { usage(); return 2; }

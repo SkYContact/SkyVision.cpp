@@ -25,6 +25,7 @@
 <div class="wrap">
   <h1>Sky<span>Vision</span>.cpp</h1>
   <div class="sub">本地多模型视觉推理 · 只显示可运行的模型</div>
+  <div class="sub" id="loadbanner" style="display:none;color:#e0af68"></div>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" style="display:none">
     没有发现可运行的模型。把 *.gguf（及 moondream 的 *-vision.gguf、tokenizer.json）放到启动目录后刷新。
@@ -45,6 +46,17 @@ fetch('/api/models').then(r => r.json()).then(d => {
     grid.appendChild(a);
   }
 });
+// 后台换载提示：有模型在加载时轮询 /status 显示进度（切换期间提问返回 409）
+setInterval(async () => {
+  const el = document.getElementById('loadbanner');
+  const d = await fetch('/api/models').then(r => r.json()).catch(() => null);
+  if (!d || !d.loading_id) { el.style.display = 'none'; return; }
+  const s = await fetch('/api/model/' + encodeURIComponent(d.loading_id) + '/status')
+              .then(r => r.json()).catch(() => null);
+  const pct = s && s.bytes_total ? ' ' + (100 * s.bytes_done / s.bytes_total).toFixed(0) + '%' : '';
+  el.textContent = '模型 ' + d.loading_id + ' 正在后台加载' + pct + '（切换期间提问会被暂时拒绝）…';
+  el.style.display = 'block';
+}, 2000);
 </script>
 </body>
 </html>

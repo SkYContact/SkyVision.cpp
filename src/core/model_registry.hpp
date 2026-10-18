@@ -48,6 +48,9 @@ public:
 
     // Load `e`, unloading whatever else is resident. `opt` carries caller
     // knobs (n_ctx / threads / cpu) plus an explicit vision override.
+    // Refuses with an actionable `err` when the VRAM guard (vram_check below)
+    // predicts the load cannot fit - the OOM would otherwise surface deep
+    // inside a ggml buffer allocation (on Windows often as error 1455).
     Model * load(const ModelEntry & e, const LoadOptions & opt, std::string & err);
     void unload();
 
@@ -70,5 +73,35 @@ private:
 // Path existence without opening the file (wins over fopen for >10GB weights
 // and for directories).
 bool path_exists(const std::string & path);
+
+// VRAM head-room probe taken before a load (roadmap §6.3-E). The estimate is
+// deliberately coarse: weights x1.1 (activation/compute headroom) plus a
+// best-effort KV-cache size read from the GGUF's own architecture metadata.
+// No CUDA linkage: the numbers come from the ggml backend device API, and in a
+// CPU-only build (or with --cpu, or without a visible GPU) the check compiles
+// down to a no-op that admits everything.
+struct VramCheck {
+    bool have_gpu = false;     // a GPU device with reportable memory was found
+    std::string device;        // its description ("NVIDIA GeForce ..." etc.)
+    uint64_t free_b = 0;       // free device memory at probe time
+    uint64_t total_b = 0;
+    uint64_t weights_b = 0;    // gguf + vision sidecar bytes on disk
+    uint64_t kv_b = 0;         // coarse KV estimate at opt.n_ctx (0 = unknown)
+    uint64_t need_b = 0;       // the guard's requirement: weights*1.1 + kv
+    bool ok = true;            // need_b <= free_b (always true without a GPU)
+    std::string err;           // actionable advice when !ok
+};
+
+// Fill a VramCheck for `e`. Pure measurement + threshold; never throws, never
+// loads. Set SKYVISION_FORCE_LOAD=1 to have it admit everything (escape hatch).
+VramCheck vram_check(const ModelEntry & e, const LoadOptions & opt);
+
+// The threshold decision, factored out so tools/vram_probe.cpp can unit-test
+// constructed insufficient-memory scenarios without a GPU present.
+bool vram_admits(const VramCheck & r, std::string & err);
+
+// The coarse KV-cache estimator, exposed so the probe tool can print it even
+// in a CPU-only build (where vram_check itself skips at zero cost).
+uint64_t vram_kv_bytes(const std::string & gguf_path, const std::string & arch, int n_ctx);
 
 }  // namespace vqa

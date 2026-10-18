@@ -197,6 +197,13 @@ moondream Web UI 覆盖官方全部五个技能：图像描述（简短/标准/�
 HTTP API：`POST /api/vision`，`mode=ask|caption|detect|point|gaze`
 （caption 带 `len=short|normal|long`，gaze 带 `x=&y=` 起点坐标），body 为图片二进制。
 
+**双模型同驻**：单槽 registry 一次只驻留一个模型，换载已异步化——`POST /api/model/<id>/load`
+立即返回 `{"loading":true}`，轮询 `GET /api/model/<id>/status`（loading 进度字节/ready/error），
+换载期间 `/ask` 返回 409，加载前有显存守卫（预估 权重×1.1+KV，不足时给行动建议；
+`SKYVISION_FORCE_LOAD=1` 可越过）。两个大模型要同时在线时用双进程：
+`scripts\serve-dual.bat`——GPU 实例 `--serve 8080` 跑 MOSS-VL，第二实例 `--serve 8081 --cpu`
+跑 Qwen2.5-Omni（CPU 全功能含 `--speak`），端口/绑定地址可用 `SKYVISION_*_PORT/_HOST` 环境变量改。
+
 ### 4. MCP 服务器（给 agent 用）
 
 `vqa-cli --mcp` 把同一个引擎包装成 **MCP（Model Context Protocol）** 服务器，走标准

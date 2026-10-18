@@ -49,6 +49,80 @@ std::string g_arch_placeholder;      // ditto, for arch-conditional UI
 // discovery + the resident model slot, shared with the MCP front end
 vqa::ModelRegistry g_reg;
 
+// server-wide backend choice (the CLI's --cpu/--gpu; default follows the CLI)
+bool g_use_gpu = true;
+
+vqa::LoadOptions server_load_options() {
+    vqa::LoadOptions o;
+    o.use_gpu = g_use_gpu;
+    return o;
+}
+
+// ------------------------------------------------------- async model swap
+// http::serve is a single-threaded accept loop: a synchronous load used to
+// freeze every connection for the whole read (67.6s for a cold 7.3GB swap).
+// Swaps now run on a one-shot background thread; /load replies at once with
+// {"loading":true}, clients poll GET /api/model/<id>/status, and /ask while a
+// swap is in flight is rejected with 409 instead of blocking for a minute.
+// Already-loaded models keep the old synchronous behaviour untouched.
+struct SwapState {
+    std::mutex mu;             // guards everything below
+    std::string id;            // model being loaded ("" when idle)
+    std::string err;           // failure text (state == error)
+    int state = 0;             // 0 idle, 1 loading, 2 ready, 3 error
+    uint64_t io_base = 0;      // process disk-read bytes when the load started
+    std::chrono::steady_clock::time_point t0;
+};
+static SwapState g_swap;
+
+// progress is a coarse but honest signal: weights loading is disk-bound, so
+// the process I/O read counter delta tracks how much of the GGUF has been
+// pulled off disk. Parse/alloc/dequant time is not in there (counter
+// unavailable -> stays 0); bytes_total clamps it.
+static uint64_t proc_io_read_bytes() {
+#ifdef _WIN32
+    IO_COUNTERS io = {};
+    if (!GetProcessIoCounters(GetCurrentProcess(), &io)) return 0;
+    return (uint64_t)io.ReadTransferCount;
+#else
+    FILE * f = fopen("/proc/self/io", "r");
+    if (!f) return 0;
+    uint64_t v = 0;
+    char line[128];
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "read_bytes: %llu", (unsigned long long *)&v) == 1) break;
+    fclose(f);
+    return v;
+#endif
+}
+
+static bool swap_busy(std::string * id = nullptr) {
+    std::lock_guard<std::mutex> lk(g_swap.mu);
+    if (id && g_swap.state == 1) *id = g_swap.id;
+    return g_swap.state == 1;
+}
+
+static void swap_409(vqa::http::HttpSock c, const std::string & busy_id) {
+    vqa::http::send(c, "409 Conflict", "application/json",
+                    "{\"error\":\"model '" + vqa::http::json_escape(busy_id) +
+                    "' is loading; poll GET /api/model/<id>/status and retry\",\"state\":\"loading\",\"loading_id\":\"" +
+                    vqa::http::json_escape(busy_id) + "\"}");
+}
+
+// one-shot loader thread: takes the same g_mu every /ask holds, so the
+// registry's resident-slot swap stays atomic with respect to inference
+static void swap_thread(std::string id, const ModelEntry e) {
+    std::string err;
+    vqa::Model * m = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        m = g_reg.load(e, server_load_options(), err);
+    }
+    std::lock_guard<std::mutex> lk(g_swap.mu);
+    g_swap.state = m ? 2 : 3;
+    if (m) g_swap.err.clear(); else g_swap.err = err;
+}
+
 // ---------------------------------------------------------------- realtime
 // live stream session: one ffmpeg capture process + a resident inference loop
 // that feeds new frames (and any queued user questions) into the model's
@@ -366,12 +440,21 @@ const ModelEntry * find_model(const std::string & id) { return g_reg.find(id); }
 
 bool ensure_loaded(const ModelEntry & e, std::string & err) {
     if (g_reg.loaded() && g_reg.loaded_id() == e.id) return true;
-    return g_reg.load(e, vqa::LoadOptions(), err) != nullptr;
+    // a swap in flight owns g_mu for its whole duration: refusing here keeps
+    // /ask responsive (409 from the caller) instead of blocking on the mutex
+    // for a minute
+    std::string busy;
+    if (swap_busy(&busy)) { err = "model '" + busy + "' is loading; poll GET /api/model/" + e.id + "/status and retry"; return false; }
+    return g_reg.load(e, server_load_options(), err) != nullptr;
 }
 
 // the page JS reads id/arch/quant/size/loaded; the MCP front end builds a richer
 // shape from the same entries (ModelRegistry::models_json)
 std::string models_json() {
+    const std::string loading_id = swap_busy() ? [&] {
+        std::lock_guard<std::mutex> lk(g_swap.mu);
+        return g_swap.id;
+    }() : std::string();
     std::string s = "{\"models\":[";
     bool first = true;
     for (const auto & m : g_reg.entries()) {
@@ -381,7 +464,9 @@ std::string models_json() {
              "\",\"quant\":\"" + m.quant + "\",\"size\":" + std::to_string(m.size) +
              ",\"loaded\":" + (g_reg.loaded_id() == m.id ? "true" : "false") + "}";
     }
-    return s + "]}";
+    // additive: id of the model a background swap is reading right now ("" none)
+    s += "],\"loading_id\":\"" + vqa::http::json_escape(loading_id) + "\"}";
+    return s;
 }
 
 bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
@@ -401,6 +486,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
             const std::string sess = query_param(req.query, "session");
             if (sess.empty()) { send_error(c, "need ?session="); return true; }
             if (action == "rt/start" && req.method == "POST") {
+                std::string busy_id;
+                if (swap_busy(&busy_id)) { swap_409(c, busy_id); return true; }
                 std::lock_guard<std::mutex> lk(g_mu);
                 std::string err;
                 if (!ensure_loaded(*e, err)) { send_error(c, err); return true; }
@@ -471,13 +558,71 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
         }
 
         if (req.method == "POST" && action == "load") {
-            std::lock_guard<std::mutex> lk(g_mu);
-            std::string err;
-            if (!ensure_loaded(*e, err)) { send(c, "500 Internal Server Error", "application/json", "{\"error\":\"" + json_escape(err) + "\"}"); return true; }
-            send_json(c, "{\"ok\":true}");
+            // swap in flight: same id is idempotent, anything else conflicts
+            std::string busy_id;
+            if (swap_busy(&busy_id)) {
+                if (busy_id == id) { send_json(c, "{\"loading\":true,\"state\":\"loading\"}"); return true; }
+                swap_409(c, busy_id);
+                return true;
+            }
+            {   // already resident: the legacy synchronous path, byte-for-byte
+                // the old behaviour (regression red line for loaded models)
+                std::lock_guard<std::mutex> lk(g_mu);
+                if (g_reg.loaded() && g_reg.loaded_id() == id) {
+                    send_json(c, "{\"ok\":true}");
+                    return true;
+                }
+            }
+            // publish the swap, then hand the registry work to the background
+            // thread so the (single-threaded) accept loop stays responsive
+            {
+                std::lock_guard<std::mutex> lk(g_swap.mu);
+                g_swap.id = id;
+                g_swap.err.clear();
+                g_swap.state = 1;
+                g_swap.io_base = proc_io_read_bytes();
+                g_swap.t0 = std::chrono::steady_clock::now();
+            }
+            fprintf(stderr, "server: swap to %s dispatched\n", id.c_str());
+            std::thread(swap_thread, id, *e).detach();
+            send_json(c, "{\"loading\":true,\"state\":\"loading\"}");
+            return true;
+        }
+        if (req.method == "GET" && action == "status") {
+            // poll target for async swaps: state loading (with coarse progress
+            // bytes + elapsed) / ready / error (with the load's error text)
+            std::string loaded_id;
+            {   // never nested with g_swap.mu (swap_thread runs g_mu, then g_swap.mu)
+                std::lock_guard<std::mutex> lk(g_mu);
+                loaded_id = g_reg.loaded_id();
+            }
+            std::lock_guard<std::mutex> lk(g_swap.mu);
+            std::string s = "{\"id\":\"" + json_escape(id) + "\",\"loading\":";
+            if (g_swap.state == 1 && g_swap.id == id) {
+                uint64_t done = 0;
+                const uint64_t now = proc_io_read_bytes();
+                if (now > g_swap.io_base) done = now - g_swap.io_base;
+                if (done > e->size) done = e->size;   // counter counts all I/O: clamp
+                const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - g_swap.t0).count();
+                s += "true,\"state\":\"loading\",\"bytes_done\":" + std::to_string(done) +
+                     ",\"bytes_total\":" + std::to_string(e->size) + ",\"elapsed_ms\":" +
+                     std::to_string(ms) + "}";
+            } else if (loaded_id == id) {
+                s += "false,\"state\":\"ready\"}";
+            } else if (g_swap.state == 3 && g_swap.id == id) {
+                s += "false,\"state\":\"error\",\"error\":\"" + json_escape(g_swap.err) + "\"}";
+            } else {
+                s += "false,\"state\":\"idle\"}";
+            }
+            send_json(c, s);
             return true;
         }
         if (req.method == "POST" && action == "ask") {
+            // a swap owns g_mu for its whole read: reject fast (409) instead of
+            // blocking this connection for the load's duration
+            std::string busy_id;
+            if (swap_busy(&busy_id)) { swap_409(c, busy_id); return true; }
             std::lock_guard<std::mutex> lk(g_mu);
             std::string err;
             if (!ensure_loaded(*e, err)) { send(c, "500 Internal Server Error", "application/json", "{\"error\":\"" + json_escape(err) + "\"}"); return true; }
@@ -713,8 +858,9 @@ std::string id_placeholder;   // set per page request before serve_page
 
 namespace vqa {
 int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
-               const std::string & tokenizer, const char * bind_host) {
+               const std::string & tokenizer, const char * bind_host, bool use_gpu) {
     g_web_dir = web_dir;
+    g_use_gpu = use_gpu;   // --cpu must reach the on-demand loads (used to be swallowed)
     g_reg.discover(models_dir, tokenizer);   // same discovery as the MCP server
     printf("SkyVision.cpp web UI: http://127.0.0.1:%d  (%zu models, Ctrl+C to stop)\n", port,
            g_reg.entries().size());

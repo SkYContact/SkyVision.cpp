@@ -204,9 +204,12 @@ struct ArchInfo {
 
 ArchInfo arch_info(const std::string & arch);
 
-// unified Web UI (vqa-cli --serve); returns process exit code
+// unified Web UI (vqa-cli --serve); returns process exit code.
+// `use_gpu` carries the CLI's --cpu/--gpu choice into on-demand loads (it used
+// to be swallowed, so a "--cpu" server still loaded weights onto the GPU).
 int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
-               const std::string & tokenizer, const char * bind_host);
+               const std::string & tokenizer, const char * bind_host,
+               bool use_gpu = true);
 
 // MCP (Model Context Protocol) server over stdio (vqa-cli --mcp): exposes the
 // engine as agent-facing tools. `preset_model` is an optional id / gguf path

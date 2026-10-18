@@ -68,6 +68,24 @@
 </div>
 <script>
 const MODEL = '__MODEL_ID__';
+// 换载在服务器后台线程执行：/load 立即返回 {"loading":true}，轮询 /status 到 ready
+async function wait_model(st) {
+  let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
+  let j = await r.json().catch(() => ({}));
+  if (j.loading) {
+    for (;;) {
+      await new Promise(res => setTimeout(res, 800));
+      r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/status');
+      j = await r.json();
+      if (j.state === 'ready') return;
+      if (j.state === 'error') throw new Error(j.error || 'load failed');
+      if (st && j.bytes_total)
+        st.textContent = '切换模型 ' + (100 * j.bytes_done / j.bytes_total).toFixed(0) +
+                         '%（' + (j.elapsed_ms / 1000).toFixed(0) + ' s）…';
+    }
+  }
+  if (!r.ok) throw new Error(j.error || 'load failed');
+}
 const dropImg = document.getElementById('dropImg'), fileImg = document.getElementById('fileImg');
 const dropAud = document.getElementById('dropAud'), fileAud = document.getElementById('fileAud');
 const imgP = document.getElementById('preview'), audP = document.getElementById('audP');
@@ -133,13 +151,12 @@ btn.onclick = async () => {
   const t0 = performance.now();
   status.textContent = '加载模型（首次约 30 秒）…';
   try {
-    let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });
-    if (!r.ok) throw new Error((await r.json()).error || 'load failed');
+    await wait_model(status);
     status.textContent = '多模态编码…';
     const q = encodeURIComponent(document.getElementById('q').value);
     const k = kind === 'audio' ? '&kind=audio' : '';
     const sp = document.getElementById('speak').checked ? '&speak=1' : '';
-    r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + k + sp + '&n=300&stream=1', {
+    const r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/ask?q=' + q + k + sp + '&n=300&stream=1', {
       method: 'POST', body: blob || new Uint8Array(0)
     });
     // NDJSON: {"phase":"vision"} {"t":".."}* then {"wav":"<b64>","done":true}

@@ -145,6 +145,7 @@ set(VQA_CORE_SRC
     src/core/vqa_util.cpp
     src/core/vqa_registry.cpp
     src/core/model_registry.cpp
+    src/core/vram_guard.cpp
     src/core/media_io.cpp
     src/core/jpeg_decode.cpp
     src/core/video_pipe.cpp
@@ -203,6 +204,10 @@ set(MAGE_VL_SRC
 set(EMBG2_SRC
     src/models/embedgemma2/embedgemma2_model.cpp)
 
+#   src/models/siglip/       SigLIP image tower (pooled embedding / classifier base)
+set(SIGLIP_SRC
+    src/models/siglip/siglip_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -218,7 +223,8 @@ add_executable(vqa-cli
     ${SMOLVLM_SRC}
     ${MAGE_VL_SRC}
     ${QWEN25OMNI_SRC}
-    ${EMBG2_SRC})
+    ${EMBG2_SRC}
+    ${SIGLIP_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
 if (VQA_HAVE_LIBJPEG)
@@ -254,3 +260,11 @@ if (VQA_HAVE_LIBJPEG)
     target_link_libraries(media-decode-dump PRIVATE jpeg-static)
     target_include_directories(media-decode-dump PRIVATE ${VQA_JPEG_INC} ${VQA_JPEG_GEN_INC})
 endif()
+
+# --- VRAM guard probe (roadmap §6.3-E): prints the devices/memory the guard
+#     sees plus its requirement estimate for a GGUF, and unit-tests the
+#     threshold decision with constructed insufficient-memory scenarios.
+#     Deliberately NOT part of vqa-cli; links only the guard leaf module. ---
+add_executable(vram-probe tools/vram_probe.cpp src/core/vram_guard.cpp)
+target_link_libraries(vram-probe PRIVATE ggml ggml-cpu)
+target_include_directories(vram-probe PRIVATE ${GGML_INC} ${CORE_INC})

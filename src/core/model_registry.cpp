@@ -321,6 +321,11 @@ const ModelEntry * ModelRegistry::find(const std::string & id_or_path) const {
 
 Model * ModelRegistry::load(const ModelEntry & e, const LoadOptions & opt, std::string & err) {
     if (loaded_ && loaded_id_ == e.id) return loaded_;
+    // VRAM guard (roadmap §6.3-E): predict the requirement before touching the
+    // backend, so an over-budget load fails here with advice instead of as an
+    // allocation failure three stacks deep (Windows: CUDA error 1455).
+    std::string why;
+    if (!vram_admits(vram_check(e, opt), why)) { err = why; return nullptr; }
     unload();
     fprintf(stderr, "registry: loading %s (%s) ...\n", e.id.c_str(), e.arch.c_str());
     fflush(stderr);
