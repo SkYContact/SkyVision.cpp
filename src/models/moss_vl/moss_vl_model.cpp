@@ -18,9 +18,9 @@
 //     attention and the MLP entirely (the reference zeroes their outputs).
 //   * text MRoPE: ggml_rope_multi(GGML_ROPE_TYPE_IMROPE, sections 24/20/20),
 //     4th position axis = T axis (covers the two tail frequency pairs).
-#include "vqa.hpp"
-#include "vit_block.hpp"
-#include "llm_block.hpp"
+#include "core/vqa.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/blocks/llm_block.hpp"
 
 #include <functional>
 #include <array>
@@ -33,16 +33,17 @@
 #ifdef GGML_USE_CUDA
 #   include "ggml-cuda.h"
 #endif
-#include "tokenizer.hpp"
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "weight_load.hpp"
-#include "attention.hpp"
-#include "sampler.hpp"
-#include "vqa_util.hpp"
-#include "resample.hpp"   // vqa::img::smart_resize / resize_bicubic_antialias
+#include "core/text/tokenizer.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/engine/weight_load.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/util/aligned_buf.hpp"
+#include "core/util/mmap.hpp"
+#include "core/media/resample.hpp"
 #include "moss_vl_preprocess.hpp"
 
 #include <algorithm>

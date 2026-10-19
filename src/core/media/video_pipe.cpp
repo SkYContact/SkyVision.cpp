@@ -5,7 +5,7 @@
 // follows the qwen_vl_utils / mlx-vlm convention: n = min(duration * fps,
 // max_frames); when the cap binds, the effective fps becomes max_frames /
 // duration so the sampled frames stay spread uniformly over the whole video.
-#include "media_io.hpp"
+#include "core/media/media_io.hpp"
 
 // popen mode: MSVC accepts "rb", glibc rejects it (EINVAL) - resolve at
 // compile time (_WIN32 is a predefined macro on MSVC only, never an expression)

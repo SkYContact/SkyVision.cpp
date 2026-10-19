@@ -10,7 +10,7 @@
 // CPU-only build has no GPU device and admits everything at zero cost.
 // Lives in its own translation unit so tools/vram_probe.cpp can link the
 // exact same logic without pulling the whole engine in.
-#include "model_registry.hpp"
+#include "core/runtime/model_registry.hpp"
 
 #include "ggml-backend.h"
 #include "gguf.h"

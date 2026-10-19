@@ -3,7 +3,7 @@
 // results are reproducible from a caller-held seed.
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include <algorithm>
 #include <cmath>

@@ -122,36 +122,52 @@ endif()
 
 # ---------------------------------------------------------------------------
 # layout
-#   src/core/                shared engine layer: interfaces, utils, media I/O,
-#                            tokenizer, GGUF weight loading
-#   src/models/moondream/    moondream3.1 backend
-#   src/models/videochat3/   VideoChat3-4B backend (Qwen3 text + VideoChat3 ViT)
+#   src/core/vqa.hpp         the public Model interface (only root header)
+#   src/core/engine/         ggml plumbing: backend, weights, dumps, attention,
+#                            sampling, cross-graph staging
+#   src/core/blocks/         shared graph bodies: ViT / decoder block, VL towers
+#   src/core/media/          pixels / audio / video frames: decode, resample, mel
+#   src/core/text/           tokenizer, JSON, UTF-8
+#   src/core/runtime/        model discovery, registry, load preamble, HTTP UI
+#   src/core/util/           MMap, aligned buffers
+#   src/models/<arch>/       one directory per backend
 #   src/cli/                 unified image/video VQA front end
+#   tools/                   standalone probes (not part of vqa-cli)
+#
+# include convention: every core header is included root-relative from src/
+# (`#include "core/engine/backend.hpp"`), so one include dir covers the shared
+# layer regardless of how it is subdivided. Backends keep their own directory
+# on the include path and cross-reference each other by basename.
 # ---------------------------------------------------------------------------
 
 # GGML_INC was set by the ggml block above (in-tree or prebuilt)
 set(STB_INC  ${CMAKE_SOURCE_DIR}/vendor/stb)   # vendored single-header image decoder
-set(CORE_INC ${CMAKE_SOURCE_DIR}/src/core)
-set(MD_INC   ${CMAKE_SOURCE_DIR}/src/models/moondream)
-set(VC3_INC  ${CMAKE_SOURCE_DIR}/src/models/videochat3)
-set(MV_INC   ${CMAKE_SOURCE_DIR}/src/models/moss_vl)
-set(MAGE_INC ${CMAKE_SOURCE_DIR}/src/models/mage_vl)
-set(VM_INC   ${CMAKE_SOURCE_DIR}/src/models/videomae)
+set(SRC_INC  ${CMAKE_SOURCE_DIR}/src)          # root for "core/..." includes
+# one include dir per backend (its private headers are included by basename;
+# vjepa2 additionally reaches videomae's clip packer through VM_INC)
+set(MD_INC    ${CMAKE_SOURCE_DIR}/src/models/moondream)
+set(VC3_INC   ${CMAKE_SOURCE_DIR}/src/models/videochat3)
+set(MV_INC    ${CMAKE_SOURCE_DIR}/src/models/moss_vl)
+set(MAGE_INC  ${CMAKE_SOURCE_DIR}/src/models/mage_vl)
+set(VM_INC    ${CMAKE_SOURCE_DIR}/src/models/videomae)
+set(QO_INC    ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
 
 # shared layer. media_io.cpp is the single translation unit owning the stb_image
 # implementation; tokenizer.cpp owns the Unicode tables for the Qwen2
 # pre-tokenizer (regenerate them with scripts/gen_unicode_ranges.py)
 set(VQA_CORE_SRC
-    src/core/vqa_util.cpp
-    src/core/vqa_registry.cpp
-    src/core/model_registry.cpp
-    src/core/vram_guard.cpp
-    src/core/media_io.cpp
-    src/core/jpeg_decode.cpp
-    src/core/video_pipe.cpp
-    src/core/backend.cpp
-    src/core/resample.cpp
-    src/core/tokenizer.cpp)
+    src/core/util/mmap.cpp
+    src/core/text/utf8.cpp
+    src/core/text/json_scan.cpp
+    src/core/text/tokenizer.cpp
+    src/core/runtime/vqa_registry.cpp
+    src/core/runtime/model_registry.cpp
+    src/core/runtime/vram_guard.cpp
+    src/core/media/media_io.cpp
+    src/core/media/jpeg_decode.cpp
+    src/core/media/video_pipe.cpp
+    src/core/media/resample.cpp
+    src/core/engine/backend.cpp)
 
 set(MOONDREAM_SRC
     src/models/moondream/moondream.cpp
@@ -177,6 +193,11 @@ set(MOSS_VL_SRC
 set(VIDEOMAE_SRC
     src/models/videomae/videomae_preprocess.cpp
     src/models/videomae/videomae_model.cpp)
+
+#   src/models/vjepa2/       V-JEPA 2 video encoder (3-D rope, mean-pooled
+#                            embedding; reuses videomae's clip patchify)
+set(VJEPA2_SRC
+    src/models/vjepa2/vjepa2_model.cpp)
 
 #   src/models/qwen2vl/      Qwen2.5-VL backend (Qwen2 trunk + windowed ViT)
 set(QWEN2VL_SRC
@@ -219,6 +240,7 @@ add_executable(vqa-cli
     ${QWEN35_SRC}
     ${MOSS_VL_SRC}
     ${VIDEOMAE_SRC}
+    ${VJEPA2_SRC}
     ${QWEN2VL_SRC}
     ${SMOLVLM_SRC}
     ${MAGE_VL_SRC}
@@ -226,7 +248,7 @@ add_executable(vqa-cli
     ${EMBG2_SRC}
     ${SIGLIP_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen25omni)
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC})
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(vqa-cli PRIVATE jpeg-static)
@@ -234,27 +256,30 @@ if (VQA_HAVE_LIBJPEG)
 endif()
 
 # --- vision encoder test target (milestone 6) ---
-add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp src/core/vqa_util.cpp)
+add_executable(moondream-vision-test src/models/moondream/moondream_vision.cpp
+    src/core/util/mmap.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp)
 target_compile_definitions(moondream-vision-test PRIVATE VISION_TEST_MAIN)
 target_link_libraries(moondream-vision-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-vision-test PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
+target_include_directories(moondream-vision-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC})
 
 # --- region head test target (milestone 7) ---
-add_executable(moondream-region-test src/models/moondream/moondream_region.cpp src/core/vqa_util.cpp)
+add_executable(moondream-region-test src/models/moondream/moondream_region.cpp
+    src/core/util/mmap.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp)
 target_compile_definitions(moondream-region-test PRIVATE REGION_TEST_MAIN)
 target_link_libraries(moondream-region-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-region-test PRIVATE ${GGML_INC} ${STB_INC} ${CORE_INC} ${MD_INC})
+target_include_directories(moondream-region-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC})
 
 # --- multi-crop Lanczos preprocess test target (milestone 6 follow-up) ---
-add_executable(moondream-preprocess-test src/models/moondream/moondream_preprocess.cpp src/core/resample.cpp)
+add_executable(moondream-preprocess-test src/models/moondream/moondream_preprocess.cpp
+    src/core/media/resample.cpp)
 target_compile_definitions(moondream-preprocess-test PRIVATE PREPROCESS_TEST_MAIN)
 target_link_libraries(moondream-preprocess-test PRIVATE ggml ggml-cpu)
-target_include_directories(moondream-preprocess-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC} ${CORE_INC})
+target_include_directories(moondream-preprocess-test PRIVATE ${GGML_INC} ${STB_INC} ${MD_INC} ${SRC_INC})
 
 # --- media decode dump tool (JPEG engine A/B vs PIL, scripts/test_jpeg_decode.py) ---
-add_executable(media-decode-dump src/core/media_io.cpp src/core/jpeg_decode.cpp)
+add_executable(media-decode-dump src/core/media/media_io.cpp src/core/media/jpeg_decode.cpp)
 target_compile_definitions(media-decode-dump PRIVATE MEDIA_IO_DECODE_DUMP_MAIN)
-target_include_directories(media-decode-dump PRIVATE ${STB_INC} ${CORE_INC})
+target_include_directories(media-decode-dump PRIVATE ${STB_INC} ${SRC_INC})
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(media-decode-dump PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(media-decode-dump PRIVATE jpeg-static)
@@ -265,6 +290,6 @@ endif()
 #     sees plus its requirement estimate for a GGUF, and unit-tests the
 #     threshold decision with constructed insufficient-memory scenarios.
 #     Deliberately NOT part of vqa-cli; links only the guard leaf module. ---
-add_executable(vram-probe tools/vram_probe.cpp src/core/vram_guard.cpp)
+add_executable(vram-probe tools/vram_probe.cpp src/core/runtime/vram_guard.cpp)
 target_link_libraries(vram-probe PRIVATE ggml ggml-cpu)
-target_include_directories(vram-probe PRIVATE ${GGML_INC} ${CORE_INC})
+target_include_directories(vram-probe PRIVATE ${GGML_INC} ${SRC_INC})

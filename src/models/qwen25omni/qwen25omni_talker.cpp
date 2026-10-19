@@ -11,7 +11,7 @@
 // codec_head turns the trunk output into logits over the 8448-entry codebook.
 #include "qwen25omni_talker.hpp"
 
-#include "attention.hpp"
+#include "core/engine/attention.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"

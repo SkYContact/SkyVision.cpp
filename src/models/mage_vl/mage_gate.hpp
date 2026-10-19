@@ -16,7 +16,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
-#include "gguf_util.hpp"
+#include "core/engine/gguf_util.hpp"
 
 #include <cmath>
 #include <cstdint>

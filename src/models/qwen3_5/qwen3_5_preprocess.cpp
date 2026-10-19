@@ -1,7 +1,7 @@
 // qwen3_5_preprocess.cpp - see qwen3_5_preprocess.hpp.
 #include "qwen3_5_preprocess.hpp"
 
-#include "resample.hpp"
+#include "core/media/resample.hpp"
 
 #include <cmath>
 

@@ -7,8 +7,8 @@
 //    for it (weights x1.1 + coarse KV vs free VRAM) and the guard's verdict,
 // 3. unit-tests the vram_admits() threshold decision with constructed
 //    insufficient-memory scenarios (no GPU required).
-// Built as its own target from src/core/vram_guard.cpp - not part of vqa-cli.
-#include "model_registry.hpp"
+// Built as its own target from src/core/runtime/vram_guard.cpp - not part of vqa-cli.
+#include "core/runtime/model_registry.hpp"
 
 #include "ggml-backend.h"
 

@@ -3,8 +3,8 @@
 
 #include "ggml.h"
 #include "gguf.h"
-#include "sampler.hpp"    // vqa::greedy_argmax
-#include "vqa_util.hpp"   // vqa::MMap
+#include "core/engine/sampler.hpp"
+#include "core/util/mmap.hpp"
 
 #include <algorithm>
 #include <cmath>

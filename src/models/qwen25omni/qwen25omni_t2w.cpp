@@ -46,7 +46,7 @@ static void par_for(int n, F f) {
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-#include "gguf_util.hpp"
+#include "core/engine/gguf_util.hpp"
 
 #include <algorithm>
 #include <cmath>

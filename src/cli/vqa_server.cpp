@@ -9,11 +9,11 @@
 // Models are discovered from --models-dir (default: cwd): every *.gguf whose
 // general.architecture is a known text backend, with its runtime dependencies
 // present (moondream3 wants a *-vision.gguf; both want tokenizer.json).
-#include "vqa.hpp"
-#include "http_server.hpp"
-#include "vqa_util.hpp"
-#include "media_io.hpp"
-#include "model_registry.hpp"
+#include "core/vqa.hpp"
+#include "core/runtime/http_server.hpp"
+#include "core/util/mmap.hpp"
+#include "core/media/media_io.hpp"
+#include "core/runtime/model_registry.hpp"
 
 #include <algorithm>
 #include <cstdio>

@@ -111,8 +111,14 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, const BlockWeights
 // each backend's original op sequence bit-for-bit:
 //   - t_rope != nullptr          -> manual pair rotation (moss_vl: pairs
 //                                   (j, j+vhd_f/2) rotated by the [2, vhd_f/2,
-//                                   N] cos/sin table); else ggml_rope_multi
-//                                   with GGML_ROPE_TYPE_VISION, sections
+//                                   N] cos/sin table); t_rope_odd set rotates
+//                                   the second half with its own table (V-JEPA
+//                                   2's tiled-frequency quirk: an upstream bug
+//                                   the pretrained weights depend on, so the
+//                                   pair members use different frequencies);
+//                                   no_rope skips rotation entirely (pooling
+//                                   heads); else ggml_rope_multi with
+//                                   GGML_ROPE_TYPE_VISION, sections
 //                                   {vhd/4, vhd/4}, n_dims vhd_f/2.
 //   - rope_pad_rescale           -> rescale rope_theta by vhd_f/vhd so each
 //                                   real pair keeps its exact frequency when
@@ -147,6 +153,10 @@ struct VitHookEnv {
     bool dbg_names = false;
     ggml_tensor *t_vpos = nullptr;         // ggml rope positions
     ggml_tensor *t_rope = nullptr;         // manual-mode cos/sin tables
+    ggml_tensor *t_rope_odd = nullptr;     // manual mode: table for the second
+                                           // half of each pair (null = same
+                                           // angle as the first half)
+    bool no_rope = false;                  // manual mode: skip rotation (pooler)
     const std::vector<int> *clips = nullptr;  // per-clip temporal steps; null
                                               // or size 1 -> single FA over N
     const char *stop_after = nullptr;
@@ -172,23 +182,31 @@ inline ggml_tensor * vit_attention_hook(void * ud_, ggml_tensor * qkv) {
     ggml_tensor * v = head_view(2);
     if (e.dbg_names && e.layer == 0) ggml_set_name(qkv, "v_blk0_qkv");
 
-    if (e.t_rope) {
+    if (e.t_rope && !e.no_rope) {
         // manual in-graph rotation: pair (j, j+vhd_f/2) by angle tables
         // broadcast per head; t_rope layout: cos plane [vhd_f/2, N] then sin
-        const size_t rs = ggml_element_size(e.t_rope);
-        ggml_tensor * cos_t = ggml_view_3d(c, e.t_rope, vhd_f / 2, 1, N, rs, (size_t)(vhd_f / 2) * rs, 0);
-        ggml_tensor * sin_t = ggml_view_3d(c, e.t_rope, vhd_f / 2, 1, N, rs, (size_t)(vhd_f / 2) * rs,
-                                           (size_t)N * (vhd_f / 2) * rs);
+        auto planes = [&](ggml_tensor * t, ggml_tensor *& cos_t, ggml_tensor *& sin_t) {
+            const size_t rs = ggml_element_size(t);
+            cos_t = ggml_view_3d(c, t, vhd_f / 2, 1, N, rs, (size_t)(vhd_f / 2) * rs, 0);
+            sin_t = ggml_view_3d(c, t, vhd_f / 2, 1, N, rs, (size_t)(vhd_f / 2) * rs,
+                                 (size_t)N * (vhd_f / 2) * rs);
+        };
+        ggml_tensor *cos_t = nullptr, *sin_t = nullptr;
+        planes(e.t_rope, cos_t, sin_t);
+        ggml_tensor *cos_o = cos_t, *sin_o = sin_t;
+        if (e.t_rope_odd) planes(e.t_rope_odd, cos_o, sin_o);
         auto rope_pair = [&](ggml_tensor * x) {
             ggml_tensor * re = ggml_view_3d(c, x, vhd_f / 2, H, N, x->nb[1], x->nb[2], 0);
             ggml_tensor * im = ggml_view_3d(c, x, vhd_f / 2, H, N, x->nb[1], x->nb[2],
                                             (size_t)(vhd_f / 2) * ggml_element_size(x));
             ggml_tensor * ore = ggml_sub(c, ggml_mul(c, re, cos_t), ggml_mul(c, im, sin_t));
-            ggml_tensor * oim = ggml_add(c, ggml_mul(c, re, sin_t), ggml_mul(c, im, cos_t));
+            ggml_tensor * oim = ggml_add(c, ggml_mul(c, re, sin_o), ggml_mul(c, im, cos_o));
             return ggml_concat(c, ore, oim, 0);
         };
         q = rope_pair(q);
         k = rope_pair(k);
+    } else if (e.no_rope) {
+        // pooling heads: no position information at all
     } else {
         int sections[GGML_MROPE_SECTIONS] = { vhd / 4, vhd / 4, 0, 0 };
         const float base = e.rope_pad_rescale ? powf(e.rope_theta, (float)vhd_f / vhd) : e.rope_theta;

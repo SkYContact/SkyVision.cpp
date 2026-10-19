@@ -5,11 +5,10 @@
 // canonical checkpoint dir, fallback vocab) is a column of the table below.
 // Wiring a new backend = one factory declaration in backend_factories.hpp,
 // one `create_xxx()` definition in the backend, one row here.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
-#include "backend_factories.hpp"
-#include "tokenizer.hpp"
-#include "vqa_util.hpp"
+#include "core/runtime/backend_factories.hpp"
+#include "core/text/tokenizer.hpp"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -96,6 +95,11 @@ const ArchEntry kArchs[] = {
     // video towers: labels or pooled embedding. ViViT is the same graph with a
     // cls token + learned position table, so it reuses the videomae backend.
     { { "videomae", "vivit", nullptr }, create_videomae,
+      TokenizerMode::Qwen2Regex, "", 0, false, true, "" },
+    // V-JEPA 2: the same shape of tower (pure video encoder -> embedding) but
+    // with 3-D decomposed RoPE instead of a position table, so it gets its own
+    // graph; no classifier release at fpc64-256, features only.
+    { { "vjepa2", "vjepa", nullptr }, create_vjepa2,
       TokenizerMode::Qwen2Regex, "", 0, false, true, "" },
     // Mage-VL-4B: Mage-ViT codec ViT + Qwen3-4B trunk; realtime gate gguf
     // (mage-gate-f16.gguf) sits next to the model gguf and loads when present

@@ -24,12 +24,12 @@
 // 102 - n_out are gap garbage.
 #include "qwen25omni_model.hpp"
 
-#include "audio_feats.hpp"
+#include "core/media/audio_feats.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-#include "gguf_util.hpp"
+#include "core/engine/gguf_util.hpp"
 
 #include <algorithm>
 #include <cmath>

@@ -9,13 +9,13 @@
 // The backend is chosen from the GGUF `general.architecture` field. Backends that
 // implement vqa::Model run in-process; moondream3.1 (which still carries its own
 // richer argument surface) is driven through moondream_main().
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
-#include "json.hpp"
-#include "media_io.hpp"
-#include "model_registry.hpp"
-#include "tokenizer.hpp"
-#include "vqa_util.hpp"
+#include "core/text/json.hpp"
+#include "core/media/media_io.hpp"
+#include "core/runtime/model_registry.hpp"
+#include "core/text/tokenizer.hpp"
+#include "core/util/mmap.hpp"
 
 #include <cctype>
 #include <cstdio>

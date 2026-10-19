@@ -10,7 +10,7 @@
 //      grid, torch F.interpolate semantics (A = -0.75, align_corners = false)
 #pragma once
 
-#include "resample.hpp"
+#include "core/media/resample.hpp"
 
 #include <cstdint>
 #include <vector>

@@ -1,9 +1,11 @@
-#include "tokenizer.hpp"
+#include "core/text/tokenizer.hpp"
 
 #include <cstdint>
 
-#include "unicode_ranges.inc"
-#include "vqa_util.hpp"
+#include "core/text/unicode_ranges.inc"
+#include "core/util/mmap.hpp"
+#include "core/text/utf8.hpp"
+#include "core/text/json_scan.hpp"
 
 #include <algorithm>
 #include <cstdio>

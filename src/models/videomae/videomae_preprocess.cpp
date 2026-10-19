@@ -1,7 +1,7 @@
 // videomae_preprocess.cpp - see videomae_preprocess.hpp.
 #include "videomae_preprocess.hpp"
 
-#include "resample.hpp"   // vqa::img::resize_bicubic_antialias (PIL semantics)
+#include "core/media/resample.hpp"
 
 #include <algorithm>
 #include <cmath>

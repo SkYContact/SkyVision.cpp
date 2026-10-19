@@ -16,7 +16,7 @@
 //     from host cos/sin tables, no weight permutation needed.
 //   * the merger is a straight reshape: block layout puts each 2x2 merge group
 //     in 4 consecutive rows, so [N,1024] -> LN -> [N/4,4096] -> MLP -> [N/4,2560].
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -26,21 +26,22 @@
 #ifdef GGML_USE_CUDA
 #   include "ggml-cuda.h"   // ggml_backend_cuda_init
 #endif
-#include "tokenizer.hpp"
-#include "ggml_dump.hpp"
+#include "core/text/tokenizer.hpp"
+#include "core/engine/ggml_dump.hpp"
 
 #include <map>
-#include "stage_buf.hpp"
-#include "weight_load.hpp"
-#include "vit_block.hpp"
+#include "core/engine/stage_buf.hpp"
+#include "core/engine/weight_load.hpp"
+#include "core/blocks/vit_block.hpp"
 #include "mage_preprocess.hpp"
 #include "mage_gate.hpp"
-#include "ggml_dump.hpp"
+#include "core/engine/ggml_dump.hpp"
 
 #include <map>
-#include "attention.hpp"
-#include "sampler.hpp"
-#include "vqa_util.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/util/aligned_buf.hpp"
+#include "core/util/mmap.hpp"
 
 #include <algorithm>
 #include <chrono>

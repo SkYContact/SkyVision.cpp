@@ -18,22 +18,22 @@
 //     <fake><row_R_col_C><image>*64        (per tile, row-major, "\n" per row)
 //     <fake><global-img><image>*64<fake>   (the global view, last)
 //   so the features must come out in the same order: tiles first, global last.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
-#include "attention.hpp"
-#include "backend.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/backend.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-#include "ggml_dump.hpp"
+#include "core/engine/ggml_dump.hpp"
 #include "gguf.h"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "llm_block.hpp"
-#include "resample.hpp"
-#include "sampler.hpp"
-#include "weight_load.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/blocks/llm_block.hpp"
+#include "core/media/resample.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/engine/weight_load.hpp"
 
 #include <algorithm>
 #include <chrono>

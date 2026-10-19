@@ -1,7 +1,7 @@
 // moss_vl_preprocess.cpp - see moss_vl_preprocess.hpp.
 #include "moss_vl_preprocess.hpp"
 
-#include "resample.hpp"
+#include "core/media/resample.hpp"
 
 #include <cmath>
 

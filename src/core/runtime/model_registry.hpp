@@ -9,7 +9,7 @@
 // vocab heuristic that must not drift between callers.
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include <cstddef>
 #include <cstdint>

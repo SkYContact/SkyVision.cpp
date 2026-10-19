@@ -7,8 +7,8 @@
 // READMEs already reference them, so only the plumbing is shared.
 #pragma once
 
-#include "tokenizer.hpp"
-#include "vqa.hpp"
+#include "core/text/tokenizer.hpp"
+#include "core/vqa.hpp"
 
 #include <cstdlib>
 #include <initializer_list>

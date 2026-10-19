@@ -4,11 +4,12 @@
 // Web UI never parse structured input (they take flags or query strings), and
 // the only consumer of real JSON is the MCP server (JSON-RPC over stdio) plus
 // the tokenizer's config scan, which has its own purpose-built helpers in
-// vqa_util.hpp. Keeping one recursive-descent parser here instead of pulling a
-// dependency in matches the rest of src/core (header-only, no ggml, no I/O).
+// core/text/json_scan.hpp. Keeping one recursive-descent parser here instead of
+// pulling a dependency in matches the rest of src/core (header-only, no ggml,
+// no I/O).
 #pragma once
 
-#include "vqa_util.hpp"   // append_utf8
+#include "core/text/utf8.hpp"
 
 #include <cmath>
 #include <cstdio>

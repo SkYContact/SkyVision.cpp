@@ -1,7 +1,7 @@
 // jpeg_decode.cpp - the only translation unit that touches libjpeg's C API.
 // See jpeg_decode.hpp for the why (bit-exact parity with PIL / libjpeg family)
 // and jpeglib's usual setjmp/longjmp error sidecar for the how.
-#include "jpeg_decode.hpp"
+#include "core/media/jpeg_decode.hpp"
 
 #ifdef VQA_HAVE_LIBJPEG
 

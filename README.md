@@ -26,6 +26,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **MOSS-VL-Realtime（11B）** | `moss_vl` | 图像 + 视频 | OpenMOSS cross-attention 架构：Qwen3 文本主干（36 self 层 + 12 纯 cross-attn 层，tanh 双门控）+ SigLIP 塔（deepstack 8/16/24 + merger）+ 每帧可学习 separator。视觉 KV 走独立 cross 注意力，interleaved MRoPE（视觉三轴平面位置）。支持多轮会话（`?session=`） |
 | **VideoMAE（base，video tower）** | `videomae` | 视频（图像=静帧） | 纯视觉塔，没有文本侧：Conv3d tubelet patch 嵌入 + 固定 sin-cos 位置表（**无 cls token**）+ 12 层全时空注意力，一次前向出分类标签（`*-finetuned-*` 检查点，如 Kinetics-400）或 pooled 嵌入（`MCG-NJU/videomae-base` 是预训练版，无分类头）。单 clip 1568 token，单图；`--mode embed` 直接吐 768 维特征 |
 | **ViViT（b-16x2，video tower）** | `vivit` | 视频（图像=静帧） | 同一条视频塔（复用 `videomae` 后端）：差别只是**有 cls token**、位置表是**学出来的参数**、`gelu_fast`（tanh 形式）、LN eps 1e-6、qkv 三路都有 bias、预处理短边 256→裁 224 且**双线性**重采样 + 零中心化。32 帧 → 3136+1 token，一次前向出 Kinetics-400 标签 |
+| **V-JEPA 2（ViT-L/16，video tower）** | `vjepa2` | 视频（图像=静帧） | Meta FAIR 的世界模型编码器：**没有位置表**，改用**三维分解 RoPE**（head_dim 64 = 20 时间 + 20 高 + 20 宽 + 4 不动，位置取自 `(t', h', w')` 网格）；24 层全时空注意力，q/k/v 三路都带 bias，GELU(erf)。64 帧 × 256² → **8192 token**。三个头都支持：**attentive pooler**（fine-tune 用它池化）+ **线性分类器**（`--mode N` 出 top-N 标签，如 SSv2/Diving48）+ **masked-latent predictor**（`--mode predict` 做掩码潜变量预测）。发布版只有编码器 + predictor |
 | **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
 | **Qwen2.5-Omni（3B）** | `qwen25omni` | 图像 + 音频输入，文本 + 语音输出 | 全功能 thinker-talker：Qwen2.5 文本主干（untied lm_head）+ Qwen2.5-VL 视觉塔（与 `qwen2vl` 同款窗口注意力图）+ Whisper 系音频塔（128-bin log-mel、**n_window=100 分块卷积+分块注意力**、25 token/s）→ **Talker**（24 层双轨 LM：文本轨吃 thinker 隐状态，输出 25Hz codec token）→ **Token2Wav**（flow-matching DiT，RK4×10 步 + CFG + sway 采样；BigVGAN v2 抗锯齿激活，纯 C++ 宿主实现）。音频输入走 `--audio`（ffmpeg 解码 16k mono）。参考实现：llama.cpp PR #13784（thinker）+ HF transformers 5.20 官方源码（全部语义基准），mel/音频塔与官方逐位对齐 |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
@@ -63,6 +64,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | MOSS-VL 常驻推理流 | ✅ `rt/start?session=&src=&interval=`（src=文件/URL/`video=`摄像头）：ffmpeg 采集线程 + 常驻推理循环，模型按轮观察新帧并**主动发言**（`<|silence|>`=本轮无话可说）；`rt/say?q=` 流内提问（独立文本轮）、`rt/events?since=` 轮询 NDJSON 事件、`rt/stop` 停止 |
 | VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
 | EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
+| V-JEPA 2 特征 / 分类 / 掩码预测 | ✅ ViT-L（326M + predictor 25M，f16 653MB）：64 帧 → 短边 292（双线性）→ 裁 256 → **8192 token 全时空注意力 ×24 层** → 1024 维特征；SSv2 微调版（16 帧）再走 **3 层 attentive pooler + 174 类线性头**，`--mode 5` 直出标签；`--mode predict` 跑 12 层 masked-latent predictor。**对拍已验证**（transformers 5.x）：同输入下 24 层全长 cos **1.000000**（max 0.065）；端到端（各自预处理）pooled cos **0.9994**、SSv2 top-1 标签一致（0.916 vs 0.921，概率最大差 4.5e-3）、predictor cos **0.998**。CPU 单 clip（8192 token）约 25 s，SSv2（2048 token）约 5 s |
 
 ## 快速开始
 
@@ -132,6 +134,9 @@ python convert/convert_videojev.py --src models/VideoJev-4B -o videojev-4b-q8_0.
 # VideoMAE：预训练版（只有嵌入）或带 Kinetics-400 分类头的 fine-tune
 hf download MCG-NJU/videomae-base --local-dir models/videomae-base
 hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae-base-ft
+
+# V-JEPA 2：ViT-L 视频编码器（64 帧 256²，只出特征）
+hf download facebook/vjepa2-vitl-fpc64-256 --local-dir models/vjepa2-vitl-fpc64-256
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
@@ -166,6 +171,13 @@ vqa-cli --model videojev-4b-q8_0.gguf --video clip.mp4 --fps 2 --score qs.json
 # VideoMAE：视频 → 动作标签（分类头版）/ 768 维嵌入（预训练版）
 vqa-cli --model videomae-base-ft.gguf --video clip.mp4 --ask x --mode 5
 vqa-cli --model videomae-base.gguf    --video clip.mp4 --ask x --mode embed
+
+# V-JEPA 2：视频 → 1024 维特征 / SSv2 标签 / 掩码潜变量预测
+vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --ask x --mode embed
+vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --embed ""     # L2 归一化向量
+vqa-cli --model vjepa2-ssv2-f16.gguf --video clip.mp4 --ask x --mode 5
+vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --mode predict \
+        --ask "ctx=0:4096,tgt=4096:8192"                        # 预测后一半 token 的潜变量
 
 # EmbeddingGemma-2：多模态嵌入（图像/视频/音频/文本 → 768 维，不生成文本）
 vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
@@ -298,7 +310,7 @@ CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mo
 | `point_objects` | 目标中心点，同上 |
 | `gaze_point` | 由起点预测注视点，同上 |
 | `analyze_video` | 视频问答（ffmpeg 抽帧，`fps` / `max_frames`），Marlin 支持 `mode=caption\|find` |
-| `classify_video` | 纯视频塔（VideoMAE / ViViT）→ top-k 标签或 768 维嵌入 |
+| `classify_video` | 纯视频塔（VideoMAE / ViViT / V-JEPA 2）→ top-k 标签或 pooled 嵌入 |
 
 约定：媒体参数既可以是本地路径，也可以是 `data:image/...;base64,<data>` / `base64:<data>`；
 静止图片可以直接喂给 `classify_video` / `analyze_video`（当作单帧 clip，不需要 ffmpeg）；
@@ -321,6 +333,7 @@ CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mo
 | `convert_mage_vl.py` | `mage-vl-4b-<outtype>.gguf`（Codec-ViT + Qwen3 文本主干，单文件，`--outtype f16\|q8_0\|q6_k\|q4_0`） |
 | `convert_moss_vl.py` | `Moss-VL-Realtime-<nf4-out>.gguf`（官方 NF4 self 层权重反量化后重量化，默认 q4_k；`--nf4-out` / `--bf16-text-out` / `--vision-out` 分层选档） |
 | `convert_videomae.py` | `videomae-<outtype>.gguf`（VideoMAE 视频塔，单文件，`--outtype f16\|q8_0\|q4_0`；分类头与 `id2label` 一起写进 GGUF） |
+| `convert_vjepa2.py` | `vjepa2-<outtype>.gguf`（V-JEPA 2 编码器 + 可选 attentive pooler/分类器/predictor，单文件，`--outtype f16\|f32\|q8_0\|q4_0`，f16 约 653MB；`--no-predictor` / `--no-pooler` 裁头；q/k 行按 RoPE 布局重排） |
 | `convert_qwen2vl.py` | `qwen2vl-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
 | `convert_qwen25omni.py` | `qwen25omni-<outtype>.gguf`（thinker）+ `qwen25omni-talker-<outtype>.gguf`（talker+token2wav），`--outtype f16\|q8_0\|q4_0`、`--vision-f32`、`--no-talker` |
 | `convert_smolvlm.py` | `smolvlm-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
@@ -424,6 +437,87 @@ python convert/convert_vivit.py --src models/vivit-b-16x2      # → vivit-f16.g
 引擎 `--dump-dir ref_vivit` 跑同一张图，实测 `v_patch_out` mean|d| 3.5e-3、block0 1.0e-2、
 12 层全长 1.4e-2（值域 22，corr 0.99977）、400 类概率最大差 **6.0e-3**（top-5 标签顺序一致），
 残差全部来自重采样舍入（像素级差 ~1.8 灰阶）。
+
+### V-JEPA 2
+
+```bash
+hf download facebook/vjepa2-vitl-fpc64-256 --local-dir models/vjepa2-vitl-fpc64-256
+python convert/convert_vjepa2.py --src models/vjepa2-vitl-fpc64-256 -o vjepa2-f16.gguf   # 608MB
+vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --ask x --mode embed   # 1024 维特征 JSON
+```
+
+这是纯编码器（世界模型的一半）：输出 1024 维 mean-pooled 视频特征，不生成文本、也没有分类头。
+
+- Conv3d（`kernel=stride=(tubelet,patch,patch)`）折成一次 matmul，token 顺序 `(t', h', w')`、
+  元素顺序 `(c, dt, dh, dw)`，与 `videomae` 共用同一份 clip 打包代码（`videomae_preprocess`）
+- **没有位置表，位置在层内的 RoPE 里**：head_dim 64 切成 `20(时间) + 20(高) + 20(宽) + 4(不动)`，
+  规则是 `seg = 2*((head_dim//3)//2)`；token 的 `(t', h', w')` 网格下标就是三趟旋转的 position id
+- **RoPE 有一个必须照抄的上游 bug**：`rotate_queries_or_keys` 里 `repeat(1,1,1,2)` 是**平铺**
+  而不是交织，于是相邻维对 `(2u, 2u+1)` 的偶分量用频率 `2u`、奇分量用 `2u+1`（不是正交旋转）。
+  Meta 源码注释明确写了"修正会破坏与预训练权重的兼容性"（vjepa2 PR #15），所以必须复现。
+  转换器把 q/k 的每个旋转段重排成 `[偶数维 | 奇数维]`，引擎就能用 `mul/add` 直接算，
+  q 和 k 用同一重排 → 注意力打分不受影响（GGUF 里写 `vjepa2.rope_layout = "even-odd"`，
+  引擎加载时校验，不匹配直接报错而不是静默出错）
+- 4096 宽的 MLP 是 `hidden_size * mlp_ratio`，`hidden_act = gelu` 是 **erf 精确版**；LN eps 1e-6；
+  q/k/v 与输出投影**全部带 bias**
+- 预处理跟 `videomae` 不同：短边缩到 **292**（`video_preprocessor_config.json` 的
+  `size.shortest_edge`，`resample: 2` 双线性）再中心裁 256；`default_to_square` 在
+  `size` 是 dict 时不生效（实测 HF 仍按短边等比缩放，已按此实现）
+- 64 帧 × 256² = **8192 token**，全时空注意力单层就是 16 头 × 8192²，CPU 上单 clip 25-30 s
+  （19 核）；GPU 上建议直接跑 f16
+- 张量：`v.patch_embd.*` / `v.blk.{i}.{ln1,wqkv,wo,ln2,fc1,fc2}` / `v.norm.*`，共 292 个
+- `predictor.*`（12 层、`pred_hidden_size=384`，含 mask token 与 1024↔384 投影）只服务预训练的
+  masked latent prediction，转换时整体丢弃（199 个张量），需要 rollout/规划再接
+
+三个头（转换器按权重自动识别，`--no-predictor` / `--no-pooler` 可裁）：
+
+- **attentive pooler**（`*-ssv2` 这类 `VJEPA2ForVideoClassification` 才有）：先 N 层
+  普通 pre-norm 自注意力（**无 RoPE、无 mask**）跑完整 token 流，再用**一个学出来的 query
+  token 对整段做 cross attention**——注意这个 cross attention **没有输出投影**
+  （上游注释点明），query 本身也不做 LN，只有被查询的流走 LN；随后 query 残差 + MLP
+- **分类器**：pooler 输出过一个线性层 → `--mode N` 打印 top-N 标签，`id2label` 写进
+  `vjepa2.labels`；**嵌入口径也跟着变**：有 pooler 时 `--mode embed`/`--embed` 给 pooler 输出
+  （官方 `get_vision_features` 同样这么选）
+- **masked-latent predictor**（12 层 d=384，含 mask token 与 1024↔384 投影，f16 约 45MB）：
+  `--mode predict --ask "ctx=0:4096,tgt=4096:8192[,mask=1]"`（区间写 `a:b` 半开、
+  `a-b` 闭区间、多项用 `/` 分隔）。流程与官方一致：取编码器流在 ctx token 上的特征 →
+  1024→384 投影 → 拼上 mask token → **按位置排序** → 12 层窄栈（自己的 RoPE 表）→ LN →
+  反排序取 target token → 384→1024 投影。predictor 图按 `(n_ctx, n_tgt)` 缓存，换掩码形状才重建
+  （~10 ms），每次只回填索引与表
+- 坑：transformers 的 `VJEPA2Predictor.forward` **不会把 `mask_index` 传下去**，永远用索引 1
+  （发布权重里 1..9 号 mask token 全零，只有 0 号有范数 0.769）——引擎默认也用 1 以对齐，
+  `mask=0` 才用那颗真训过的 token
+- 第二个坑：predictor 的 head_dim 是 32 → 每段只有 `seg/2 = 5` 个频率，**频率表长度是奇数**，
+  奇分量频率 `(2u+1) % 5` 会回绕（不是 `偶分量 + 1`）。编码器 seg=20 时 `seg/2=10` 为偶数，
+  这个差别看不出来，只有 predictor 会错
+
+对拍：`python scripts/ref_vjepa2.py --model <hf_dir> --video clip.mp4 --out ref_vjepa2`
+导出 `v_patch_out / v_blk0_out / v_final / v_pooled`（微调版再加 `v_logits / v_probs`），
+以及 `ref_p_latents.npy` + `predict_spec.txt`（直接喂 `--mode predict --ask "$(cat ...)"`）；
+`vqa-cli --dump-dir ref_vjepa2` 跑同一段视频逐级比 `cpp_*.bin`（按 ggml 的 `ne` 顺序读，
+二维张量是 `[dim, tokens]` 列主序）。实测（ViT-L/fpc64-256，本机 19 核）：
+
+| 对照 | 结果 |
+|---|---|
+| **同输入**（把引擎的 `patches` 灌回官方实现）24 层全长 | cos **1.000000**、max 0.065 —— 图实现本身没有偏差 |
+| 端到端 `v_patch_out` / block0 | 相对差 6.9e-4 / 7.1e-4 |
+| 端到端 24 层全长 | 逐 token cos 0.91（8192 token 全注意力对**亚灰阶**输入差极敏感，均值池化后收敛） |
+| mean-pooled 特征 | cos **0.9994~0.9998** |
+| SSv2 pooler + 174 类头 | top-1 标签一致（0.916 vs 0.921），概率最大差 **4.5e-3**，top-4 集合一致 |
+| predictor（4096 / 1024 target） | cos **0.998**，max 0.5 |
+
+端到端残差全部来自重采样：引擎走 PIL 语义，HF 的 video processor 走 torch 抗锯齿，
+像素级 mean 差 1.7e-4（max 0.0175 归一化 ≈ 半个灰阶）。想要更硬的对照就用
+`--outtype f32`（1.2GB）+ 同输入法。调试：`VJEPA2_MAX_LAYERS=N` 只跑前 N 层，
+`--dump-dir` 额外导出 `v_blk0_qkv / v_blk0_q_rope / v_blk0_k_rope / v_blk0_attn / v_logits / v_probs`。
+
+复用了什么：block 体、flash-attn 接线、成对旋转 RoPE 全部来自 `core/vit_block.hpp`
+（moondream / VideoChat3 / VideoMAE / ViViT 同一份，本后端只补了「第二条角度表」和
+「无 rope」两个开关）；patch 打包直接用 videomae 的 `pack_clip`；卷积折 matmul、ggml 的
+`flash_attn_ext` / `norm` / `gelu_erf` / `mul_mat` / `get_rows / concat`、GGUF 读写
+（`gguf` + `_lib`）都与其它后端同源。真正手写的只有本架构特有的图接线（三维 RoPE 表、
+pooler 的 cross attention、predictor 的排序/反排序）——ggml 的 `ggml_rope_*` 表达不了上游那个
+「频率平铺」的 bug，所以旋转只能落成 mul/add。
 
 ### Qwen2.5-VL
 
@@ -637,6 +731,7 @@ src/
   models/moondream/    moondream3.1 后端（引擎 + 视觉塔 + 多 crop 预处理 + region 头 + 服务端/批量）
   models/videochat3/   VideoChat3-4B 后端（视觉预处理 + 计算图）
   models/videomae/     VideoMAE 视频塔后端（clip 预处理 + 全时空注意力前向 + 分类/嵌入）
+  models/vjepa2/       V-JEPA 2 后端（三维 RoPE + 全时空注意力 + pooler/分类器/predictor）
   models/qwen3_5/      Qwen3.5 / Marlin / VideoJev 后端（gated-delta + full attention 混合图、caption/find 技能、打分头）
   models/moss_vl/      MOSS-VL-Realtime 后端（self+cross 双路注意力图、多轮/实时流会话）
   models/mage_vl/      Mage-VL 后端（Codec-ViT 视觉塔 + System 1 门控）
@@ -660,25 +755,38 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
   `VIDEOMAE_DUMP_DIR=<dir>`（或 `--dump-dir`）导出 `patches / v_patch_out / v_blk0_qkv /
   v_blk0_attn_out / v_blk0_out / v_final / v_pooled / v_logits / v_probs`，
   `VIDEOMAE_MAX_LAYERS=N` 只跑前 N 层做逐层漂移对照（本机实测 12 层全长相对差 ~1e-3，
-  约为 F16 权重噪声 + 线程归约顺序噪声）。
-- **共享层（`src/core`）**：后端之间不放重复实现——`vqa.hpp` 接口、`backend.hpp`（CUDA 优先 +
-  CPU 回退 + 线程数默认值，按**物理核**而不是逻辑核，SMT 对这类模型的 GEMV 是负收益）、
-  `gguf_util.hpp`（元数据读取 / 张量转 F32）、`weight_load.hpp`（mmap 绑定、1D 张量转
-  host F32、CPU 零拷贝/GPU 上传的 buffer 归属）、`load_util.hpp`（LoadOptions 落地 +
-  各后端 `<PREFIX>_DUMP_DIR` 覆盖 + 特殊 token id 解析）、`vit_block.hpp`（所有 ViT 塔共用的 block 体，
-  moondream / VideoChat3 / VideoMAE 三家都用它，差异走 hooks）、`llm_block.hpp`（Qwen 系因果解码层的
-  共享 block 体，vit_block 的解码侧姊妹篇：把各后端手写的逐层解码循环收进同一个建图函数，
-  VideoChat3 / SmolVLM / MOSS-VL（cross-attention 等特殊层走 hooks.attention 覆写）已入住，
-  权重字段为空即跳过对应 op，后端私有行为一律挂 BlockHooks）、`qwen2vl_tower.hpp`（Qwen2.5-VL 视觉塔
-  整塔共享：Conv3d patch embed、窗口注意力 + 周期性全注意力层、四段 2D M-RoPE、merger，
-  qwen2vl 与 qwen25omni 两个引擎逐 op 一致，差异只落在 cfg 字段与可空调试 hook 上）、
-  `resample.hpp`（smart_resize、
-  PIL 语义 antialias bicubic 缩放、位置表双线性插值——原来寄居在 videochat3 目录里被另外三个
-  模型反向 include）、`audio_feats.hpp`（音频前端原语：FFT / Hann 窗 / mel 滤波器组 / log-mel，
-  Qwen2.5-Omni 的 whisper 系与 EmbedGemma-2 的 Gemma4 系两套数值上不可互换的实现并排共存，
-  禁止跨族"统一"浮点行为）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧暂存）、
-  `ggml_dump.hpp`（对拍导出）、`sampler.hpp`、`tokenizer.cpp`、`media_io.cpp`。
-- **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/unicode_ranges.inc`。
+  约为 F16 权重噪声 + 线程归约顺序噪声）；V-JEPA 2 用 `--dump-dir` 导出
+  `patches / v_patch_out / v_blk0_qkv / v_blk0_q_rope / v_blk0_attn / v_blk0_attn_out /
+  v_blk0_out / v_final / v_pooled`，`VJEPA2_MAX_LAYERS=N` 同理截断层数。
+- **共享层（`src/core`）**：后端之间不放重复实现，目录按职责分层，索引见
+  [`src/core/README.md`](src/core/README.md)；include 一律从 `src/` 根写
+  （`#include "core/engine/weight_load.hpp"`），所以再加子目录也不用改 include 路径：
+  - `vqa.hpp` — 唯一放在根上的头：`vqa::Model` 接口与能力表，前端只认它
+  - `engine/` — ggml 侧公共件：`backend.hpp`（CUDA 优先 + CPU 回退 + 线程数按**物理核**，
+    SMT 对这类模型的 GEMV 是负收益）、`weight_load.hpp`（mmap 绑定、1D 张量转 host F32、
+    CPU 零拷贝 / GPU 上传的 buffer 归属）、`gguf_util.hpp`（元数据读取 / 张量转 F32）、
+    `ggml_dump.hpp`（对拍导出）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧
+    跨图暂存）、`sampler.hpp`
+  - `blocks/` — 可复用图体：`vit_block.hpp`（所有 ViT 塔共用的 block 体 + 通用成对旋转 RoPE，
+    moondream / VideoChat3 / VideoMAE / ViViT / V-JEPA 2 都用它，差异走 hooks）、
+    `llm_block.hpp`（Qwen 系因果解码层，VideoChat3 / SmolVLM / MOSS-VL 已入住，权重字段为空即跳过
+    对应 op）、`qwen2vl_tower.hpp`（Qwen2.5-VL 视觉塔整塔共享，qwen2vl 与 qwen25omni 逐 op 一致）
+  - `media/` — `resample.hpp`（smart_resize、PIL 语义 antialias bicubic、位置表插值；
+    原来寄居在 videochat3 目录被三个模型反向 include）、`media_io.hpp`（图像 / 视频帧解码）、
+    `jpeg_decode.hpp`（libjpeg-turbo，与 PIL 逐像素一致）、`audio_feats.hpp`（FFT / Hann / mel /
+    log-mel：Qwen2.5-Omni 的 whisper 系与 EmbedGemma-2 的 Gemma4 系两套数值不可互换，禁止跨族
+    "统一"浮点行为）、`video_pipe.cpp`（ffmpeg 抽帧）
+  - `text/` — `tokenizer`（byte-level BPE + Qwen2 正则预切分）、`utf8`（UTF-8 编解码 + GPT-2
+    byte↔unicode 字符表）、`json` 与 `json_scan`（前者递归下降解析器，后者只做 HF 配置的键扫描）、
+    `unicode_ranges.inc`（生成文件）
+  - `runtime/` — `model_registry`（能跑哪些 GGUF / tokenizer 解析 / 单实例驻留）、`vqa_registry`
+    （架构名 → 工厂表，唯一知道后端清单的文件）、`backend_factories`、`load_util`（LoadOptions 落地
+    + 各后端 `<PREFIX>_DUMP_DIR` + 特殊 token id）、`vram_guard`、`http_server`（内嵌 Web UI）
+  - `util/` — `mmap`（只读映射 + 整文件读取）、`aligned_buf`（64 字节对齐缓冲）
+- **加/改共享层前先读**：`src/core/README.md` 里有"新代码该放哪"的判定表和"把重复实现收敛进来"
+  的四步流程（两份实现先各自数值一致 → 合并前 diff 掉漂移的守卫 → 新行为默认关闭 → 跑
+  `scripts/ref_*.py` + `scripts/smoke.sh`）。
+- **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/text/unicode_ranges.inc`。
 - **回归冒烟**：`scripts/smoke.sh` 跑跨后端金标准电池（smolvlm/vc3/moss/qwen3.5 各一条贪婪，CPU
   + 钉死 `--threads 1` 保证可复现）；`--golden FILE` 对既有金标准逐字节比对。改共享层/做迁移后先跑它。
 

@@ -11,8 +11,8 @@
 //    nb[0]=4, nb[1]=D*4.
 
 #include "moondream_vision.hpp"
-#include "vit_block.hpp"
-#include "weight_load.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/engine/weight_load.hpp"
 #include <thread>
 #include <atomic>
 #include "ggml.h"

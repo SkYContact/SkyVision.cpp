@@ -7,7 +7,7 @@
 // that grows in rare rebuilds (static shapes in between, so the graph stays
 // CUDA-capture eligible).
 
-#include "attention.hpp"
+#include "core/engine/attention.hpp"
 
 struct BatchSeq {
     std::vector<int> toks, out;

@@ -33,7 +33,7 @@
 // MLP - exactly the SigLIP block); the pooling head is written out inline
 // because torch's MultiheadAttention split (probe as the only query) has no
 // equivalent in the shared block.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -44,13 +44,13 @@
 #   include "ggml-cuda.h"
 #endif
 
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "resample.hpp"
-#include "vit_block.hpp"
-#include "weight_load.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/media/resample.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/engine/weight_load.hpp"
 
 #include <algorithm>
 #include <chrono>

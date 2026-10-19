@@ -29,7 +29,7 @@
 // VideoChat3 towers (same LN -> qkv -> attention -> wo -> LN -> MLP sequence);
 // the only difference is the activation, VideoMAE's nn.GELU() is the exact erf
 // form, so it passes a gelu hook instead of writing a second block.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -40,14 +40,14 @@
 #   include "ggml-cuda.h"
 #endif
 
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "weight_load.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/engine/weight_load.hpp"
 #include "videomae_preprocess.hpp"
-#include "vit_block.hpp"
-#include "vqa_util.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/util/mmap.hpp"
 
 #include <algorithm>
 #include <chrono>

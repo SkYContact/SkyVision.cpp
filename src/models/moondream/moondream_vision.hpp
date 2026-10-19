@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include "vqa_util.hpp"   // vqa::MMap
+#include "core/util/mmap.hpp"
 
 struct VisionModel {
     // config (defaults = official VisionConfig; overridden by GGUF metadata)

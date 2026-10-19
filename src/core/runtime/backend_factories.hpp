@@ -5,7 +5,7 @@
 // one declaration here plus one row in vqa_registry.cpp's arch table.
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 namespace vqa {
 
@@ -14,6 +14,7 @@ Model * create_videochat3();
 Model * create_qwen3_5();
 Model * create_moss_vl();
 Model * create_videomae();
+Model * create_vjepa2();
 Model * create_qwen2vl();
 Model * create_smolvlm();
 Model * create_mage_vl();

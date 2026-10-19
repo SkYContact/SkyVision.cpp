@@ -15,19 +15,19 @@
 #include "qwen25omni_model.hpp"
 #include "qwen25omni_talker.hpp"
 
-#include "attention.hpp"
-#include "backend.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/backend.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "qwen2vl_tower.hpp"
-#include "resample.hpp"
-#include "sampler.hpp"
-#include "weight_load.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/blocks/qwen2vl_tower.hpp"
+#include "core/media/resample.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/engine/weight_load.hpp"
 
 #include <algorithm>
 #include <chrono>

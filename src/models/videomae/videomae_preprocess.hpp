@@ -11,7 +11,7 @@
 //      [dim, C, tubelet, patch, patch] flattened to [dim, C*tubelet*patch*patch].
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include <cstdint>
 #include <vector>

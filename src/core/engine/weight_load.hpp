@@ -15,8 +15,9 @@
 #include "ggml-cpu.h"   // ggml_backend_cpu_buffer_from_ptr / ggml_backend_is_cpu
 #include "ggml.h"
 #include "gguf.h"
-#include "gguf_util.hpp"
-#include "vqa_util.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/util/aligned_buf.hpp"
+#include "core/util/mmap.hpp"
 
 #include <cstdio>
 #include <utility>

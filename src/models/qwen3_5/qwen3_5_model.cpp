@@ -14,9 +14,9 @@
 //   * Qwen3.5 RMSNorm applies x*(1+w): the converter already stored w+1.
 //   * there is no separate ffn_norm - attn_post_norm feeds the FFN directly.
 //   * text KV exists only for the 6 full-attention layers.
-#include "vqa.hpp"
-#include "vit_block.hpp"
-#include "llm_block.hpp"
+#include "core/vqa.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/blocks/llm_block.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -26,17 +26,18 @@
 #ifdef GGML_USE_CUDA
 #   include "ggml-cuda.h"
 #endif
-#include "tokenizer.hpp"
-#include "attention.hpp"
-#include "sampler.hpp"
-#include "vqa_util.hpp"
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "gguf_util.hpp"
-#include "stage_buf.hpp"
-#include "load_util.hpp"     // LoadOptions plumbing + token id resolution
-#include "resample.hpp"      // vqa::img::smart_resize / resize_bicubic_antialias
-#include "weight_load.hpp"   // mmap bind / 1D->f32 / zero-copy vs upload
+#include "core/text/tokenizer.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/util/aligned_buf.hpp"
+#include "core/util/mmap.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/engine/stage_buf.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/media/resample.hpp"
+#include "core/engine/weight_load.hpp"
 #include "qwen3_5_preprocess.hpp"
 
 #include <algorithm>

@@ -5,7 +5,7 @@
 // result is always a vqa::MediaInput, so a backend only ever sees frames + time.
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include <string>
 

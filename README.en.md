@@ -28,6 +28,7 @@ with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
 | **MOSS-VL-Realtime (11B)** | `moss_vl` | image + video | OpenMOSS cross-attention architecture: Qwen3 text trunk (36 self layers + 12 pure cross-attn layers, tanh dual gating) + SigLIP tower (deepstack 8/16/24 + merger) + a learnable per-frame separator. Vision KV goes through a separate cross attention; interleaved MRoPE (planar 3-axis vision positions). Multi-turn sessions supported (`?session=`) |
 | **VideoMAE (base)** | `videomae` | video (image = still clip) | vision-only tower, no text side: Conv3d tubelet patch embedding + fixed sin-cos position table (**no cls token**) + 12 full space-time attention layers; one forward pass returns a label distribution (fine-tunes such as Kinetics-400) or the pooled embedding (`MCG-NJU/videomae-base` is the pretraining release, no head) |
 | **ViViT (b-16x2, video tower)** | `vivit` | video (image = still clip) | the same video tower (reuses the `videomae` backend): the only differences are a **cls token**, a **learned** position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v, and a shortest-edge-256 → crop-224 **bilinear** preprocessing with zero centering. 32 frames → 3136+1 tokens, one forward returns Kinetics-400 labels |
+| **V-JEPA 2 (ViT-L/16, video tower)** | `vjepa2` | video (image = still clip) | Meta FAIR's world-model encoder: **no position table** - 3-D decomposed **RoPE** inside every layer (head_dim 64 = 20 temporal + 20 height + 20 width + 4 untouched, positions from the `(t', h', w')` token grid); 24 full space-time attention layers, bias on q/k/v and the output projection, GELU(erf). 64 frames x 256^2 = **8192 tokens**. All three heads are supported: the **attentive pooler** (used by the fine-tunes), a **linear classifier** (`--mode N` -> top-N labels, SSv2 / Diving48) and the **masked-latent predictor** (`--mode predict`). The pretraining release carries the encoder plus that predictor |
 | **Qwen2.5-VL (3B)** | `qwen2vl` | image (video pending) | Qwen2 text trunk (36 layers, GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32 layers, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger. Dynamic resolution via `smart_resize` (multiples of 28); preprocessing is **CLIP mean/std**, bicubic, patches packed in **2×2 group order** |
 | **Qwen2.5-Omni (3B)** | `qwen25omni` | image + audio in, text + speech out | full thinker-talker: Qwen2.5 text trunk (untied lm_head) + the Qwen2.5-VL tower (same window-attention graph as `qwen2vl`) + a Whisper-style audio tower (128-bin log-mel, **n_window=100 chunked convolution + chunked attention**, 25 tok/s) → **Talker** (24-layer dual-track LM: the text track consumes thinker hidden states, emits 25 Hz codec tokens) → **Token2Wav** (flow-matching DiT, RK4×10 steps + CFG + sway sampling; BigVGAN v2 anti-aliased activations, pure C++ host implementation). Audio input via `--audio` (ffmpeg decodes to 16 kHz mono). References: llama.cpp PR #13784 (thinker) + the HF transformers 5.20 sources (all semantics); mel/audio tower bit-aligned with the official implementation |
 | **SmolVLM (256M, Idefics3)** | `smolvlm` | image | the smallest usable backend here: SigLIP-base tower (12 layers, patch 16, 512², learned positions, LN/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30 layers, no bias, GQA 9:3, rope 1e5). Official Idefics3 preprocessing: longest edge **2048** → pad to multiples of 512 → **512² tiles** (row-major) + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8 |
@@ -57,6 +58,7 @@ with nothing mounted - see [the MCP section](#4-mcp-server-for-agents).
 | VideoChat3-4B video input | ✅ built-in `--video` (ffmpeg pipe; `FFMPEG=<path>` overrides the binary): frame sampling + timestamped prompts + joint attention over 4-frame temporal clips; the vision tower runs clip by clip (peak activations stay at one clip), and oversized images/videos are clamped to the same context budget |
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
+| V-JEPA 2 features / classification / masked prediction | ✅ ViT-L (326M + a 25M predictor, 653 MB at f16): 64 frames → shortest edge 292 (bilinear) → crop 256 → **8192-token full space-time attention x 24 layers** → 1024-d feature; the SSv2 fine-tune (16 frames) adds a **3-layer attentive pooler + 174-way linear head** (`--mode 5` prints labels), and `--mode predict` runs the 12-layer masked-latent predictor. **Parity verified** against transformers 5.x: with the *same* patch input the 24-layer stream matches at cos **1.000000** (max 0.065); end to end (each with its own preprocessing) the pooled feature is cos **0.9994**, the SSv2 top-1 label agrees (0.916 vs 0.921, probabilities within 4.5e-3) and the predictor lands at cos **0.998**. ~25 s per 8192-token clip on CPU (19 cores), ~5 s for SSv2 |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
 | SmolVLM-256M (Idefics3) | ✅ arch `smolvlm`, the smallest backend here: SigLIP-base tower (12L, patch 16, 512², learned positions, LayerNorm/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30L, no biases, GQA 9:3, rope 1e5). Idefics3 preprocessing: longest edge 2048 → pad to multiples of 512 → 512² tiles + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8. Logits corr 0.99991 and byte-identical answers |
 | EmbeddingGemma-2 (740M) | ✅ arch `embgemma2`, multimodal **embedding** (no text generation): Gemma3 text tower (24L d=512, GQA 4:1, interleaved SWA/full, per-layer PLE) + Gemma4 ViT (16L patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / chunk-12 local attention with Transformer-XL rel-shift bias; every linear is a ClippableLinear with finite clamps from the checkpoint). `--embed` emits 768-d vectors (Matryoshka truncation `--embed-dim`, official task prefixes `--embed-preset`, batch `--embed-file`). All four modalities vs the fp32 HF reference: text 0.9999999 / image 0.99999 / audio 0.99999 / video 0.9999998 |
@@ -119,6 +121,9 @@ python convert/convert_videojev.py --src models/VideoJev-4B -o videojev-4b-q8_0.
 # VideoMAE: the pretraining release (embedding only) or the Kinetics-400 fine-tune
 hf download MCG-NJU/videomae-base --local-dir models/videomae-base
 hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae-base-ft
+
+# V-JEPA 2: ViT-L video encoder (64 frames at 256^2, features only)
+hf download facebook/vjepa2-vitl-fpc64-256 --local-dir models/vjepa2-vitl-fpc64-256
 ```
 
 The converters find the checkpoint themselves: `--src <dir|file>` → the model's
@@ -258,7 +263,7 @@ cache (`mode=max`, not subject to the 10 GB Actions cache quota).
 | `point_objects` | Target centre point, same requirement |
 | `gaze_point` | Fixation point from a start point, same requirement |
 | `analyze_video` | Video VQA (ffmpeg sampling, `fps` / `max_frames`); Marlin adds `mode=caption\|find` |
-| `classify_video` | Pure video tower (VideoMAE / ViViT) → top-k labels or the 768-d embedding |
+| `classify_video` | Pure video tower (VideoMAE / ViViT / V-JEPA 2) → top-k labels or the pooled embedding |
 
 Conventions: media arguments accept a local path or inline bytes (`data:image/...;base64,<data>`,
 `base64:<data>`); a still image works for `classify_video` / `analyze_video` as a one-frame clip
@@ -283,6 +288,7 @@ re-opened and its tensor table verified.
 | `convert_mage_vl.py` | `mage-vl-4b-<outtype>.gguf` (Codec-ViT + Qwen3 trunk, single file, `--outtype f16\|q8_0\|q6_k\|q4_0`) |
 | `convert_moss_vl.py` | `Moss-VL-Realtime-<nf4-out>.gguf` (the official NF4 self-layer weights are dequantized and requantized, default q4_k; `--nf4-out` / `--bf16-text-out` / `--vision-out` pick per-part precision) |
 | `convert_videomae.py` | `videomae-<outtype>.gguf` (VideoMAE video tower, single file, `--outtype f16\|q8_0\|q4_0`; the classifier and its `id2label` table travel inside the GGUF) |
+| `convert_vjepa2.py` | `vjepa2-<outtype>.gguf` (V-JEPA 2 encoder + optional attentive pooler / classifier / predictor, single file, `--outtype f16\|f32\|q8_0\|q4_0`, ~653 MB at f16; `--no-predictor` / `--no-pooler` trim the heads; q/k rows permuted to the RoPE layout) |
 | `convert_qwen2vl.py` | `qwen2vl-<outtype>.gguf` (single file, `--outtype f16\|q8_0\|q4_0`, default f16) |
 | `convert_qwen25omni.py` | `qwen25omni-<outtype>.gguf` (thinker) + `qwen25omni-talker-<outtype>.gguf` (talker + token2wav); `--outtype f16\|q8_0\|q4_0`, `--vision-f32`, `--no-talker` |
 | `convert_smolvlm.py` | `smolvlm-<outtype>.gguf` (single file, `--outtype f16\|q8_0\|q4_0`, default f16) |
@@ -338,6 +344,11 @@ Reads any transformers `videomae` checkpoint (`MCG-NJU/videomae-base`,
 python convert/convert_videomae.py --src models/videomae-base-ft   # → videomae-f16.gguf (~190 MB)
 vqa-cli --model videomae-f16.gguf --video clip.mp4 --mode 5        # top-5 labels
 vqa-cli --model videomae-f16.gguf --video clip.mp4 --mode embed    # 768-d pooled embedding
+vqa-cli --model vjepa2-f16.gguf   --video clip.mp4 --mode embed    # V-JEPA 2: 1024-d feature
+vqa-cli --model vjepa2-f16.gguf   --video clip.mp4 --embed ""      # L2-normalized vector
+vqa-cli --model vjepa2-ssv2-f16.gguf --video clip.mp4 --mode 5      # SSv2 top-5 labels
+vqa-cli --model vjepa2-f16.gguf   --video clip.mp4 --mode predict \
+        --ask "ctx=0:4096,tgt=4096:8192"                            # masked-latent prediction
 ```
 
 - the Conv3d patch embedding is folded into one matmul (`[dim, C*tubelet*patch*patch]`),
@@ -388,6 +399,93 @@ Parity: `python scripts/ref_vivit.py --model models/vivit-b-16x2 --image photo.j
 engine with `--dump-dir ref_vivit` - patch tokens mean|d| 3.5e-3, block 0 1.0e-2, 12 layers
 1.4e-2 (values up to 22, corr 0.99977), all 400 Kinetics probabilities within **6e-3** with the
 same top-5 order. The residual comes from resampling rounding (~1.8 grey levels per pixel).
+
+### V-JEPA 2
+
+```bash
+hf download facebook/vjepa2-vitl-fpc64-256 --local-dir models/vjepa2-vitl-fpc64-256
+python convert/convert_vjepa2.py --src models/vjepa2-vitl-fpc64-256 -o vjepa2-f16.gguf   # 608MB
+vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --ask x --mode embed   # 1024-d feature JSON
+```
+
+This is the encoder half of the world model: a 1024-d mean-pooled video feature, no text, no
+classifier.
+
+- the Conv3d (`kernel = stride = (tubelet, patch, patch)`) is folded into one matmul; token order
+  `(t', h', w')`, element order `(c, dt, dh, dw)`, sharing the clip packer with `videomae`;
+- **no position table at all** - positions live in a 3-D decomposed **RoPE** inside every layer:
+  head_dim 64 splits as `20 (temporal) + 20 (height) + 20 (width) + 4 (untouched)` with
+  `seg = 2*((head_dim//3)//2)`, and the token's `(t', h', w')` grid index is the position id of
+  each of the three passes;
+- **the upstream RoPE quirk has to be reproduced**: in `rotate_queries_or_keys` the
+  `repeat(1,1,1,2)` **tiles** the cos/sin tables instead of interleaving them, so the adjacent pair
+  `(2u, 2u+1)` rotates its even member with frequency `2u` and its odd member with `2u+1` (not an
+  orthonormal rotation). Meta's source comments say fixing it "would break compatibility with the
+  pretrained model" (vjepa2 PR #15), so the checkpoint needs it. The converter permutes each rotated
+  segment of the q/k rows to `[even dims | odd dims]`, which lets the engine express the rotation
+  with plain mul/add; q and k get the same permutation, so attention scores are unchanged. The GGUF
+  records `vjepa2.rope_layout = "even-odd"` and the loader refuses anything else;
+- the 4096-wide MLP is `hidden_size * mlp_ratio`; `hidden_act = gelu` is the **erf** form, LN eps
+  1e-6, and q/k/v plus the output projection all carry a bias;
+- preprocessing differs from `videomae`: shortest edge **292** (`size.shortest_edge`, `resample: 2`
+  bilinear) then center crop 256. `default_to_square` has no effect while `size` is a dict (measured:
+  HF still resizes by the shortest edge), so that is what the engine does;
+- 64 frames x 256^2 = **8192 tokens**; one layer of full space-time attention is 16 heads x 8192^2,
+  so a clip takes ~25-30 s on CPU (19 cores) - use f16 and a GPU for throughput;
+- tensors: `v.patch_embd.*` / `v.blk.{i}.{ln1,wqkv,wo,ln2,fc1,fc2}` / `v.norm.*`, 292 in total;
+Three heads, all detected from the weights (`--no-predictor` / `--no-pooler` trim them):
+
+- **attentive pooler** (only in `VJEPA2ForVideoClassification` fine-tunes such as `*-ssv2`): N plain
+  pre-norm self-attention layers (**no rope, no mask**) over the token stream, then **one learned
+  query token cross-attends to all of it**. That cross attention has **no output projection**
+  (upstream calls it out), the query is not normalized (only the stream is), and the query carries
+  the residual into the MLP;
+- **classifier**: one linear layer on the pooled vector -> `--mode N` prints top-N labels, the
+  `id2label` table is stored as `vjepa2.labels`. The embedding output follows the same choice:
+  with a pooler, `--mode embed` / `--embed` return the pooler output (official
+  `get_vision_features` picks it the same way);
+- **masked-latent predictor** (12 x 384-d layers + mask tokens + the 1024<->384 projections, ~45 MB
+  at f16): `--mode predict --ask "ctx=0:4096,tgt=4096:8192[,mask=1]"` (`a:b` half-open ranges,
+  `a-b` inclusive, `/` between items). Same flow as upstream: encoder features at the context
+  tokens -> 1024->384 -> append mask tokens -> **sort by position** -> the narrow stack (own rope
+  tables) -> LN -> unsort, keep the target tokens -> 384->1024. The predictor graph is cached per
+  `(n_ctx, n_tgt)` and only the indices/tables are refilled per call (~10 ms to rebuild otherwise);
+- gotcha 1: transformers' `VJEPA2Predictor.forward` **never forwards `mask_index`**, so it always
+  uses index 1 (in the released weights tokens 1..9 are all zeros and only token 0 has norm
+  0.769). The engine defaults to 1 as well; `mask=0` selects the trained one;
+- gotcha 2: the predictor head_dim is 32, so each rotated segment has `seg/2 = 5` frequencies - the
+  table length is odd, the second pair member wraps to `(2u + 1) % 5` instead of `first + 1`. With
+  the encoder's seg 20 (`seg/2 == 10`) the two are indistinguishable, so only the predictor exposes it.
+
+Parity: `python scripts/ref_vjepa2.py --model <hf_dir> --video clip.mp4 --out ref_vjepa2` dumps
+`v_patch_out / v_blk0_out / v_final / v_pooled` (plus `v_logits / v_probs` for a fine-tune) and
+`ref_p_latents.npy` + `predict_spec.txt` (feed it to `--mode predict --ask "$(cat ...)"`). Run the
+engine with `--dump-dir ref_vjepa2` and diff the `cpp_*.bin` files (ggml `ne` order: 2-D tensors are
+`[dim, tokens]`, column-major). Measured on ViT-L/fpc64-256, 19 cores:
+
+| comparison | result |
+|---|---|
+| **same patch input** (feed the engine's `patches` to the official model), 24 layers | cos **1.000000**, max 0.065 - the graph itself is exact |
+| end to end `v_patch_out` / block 0 | 6.9e-4 / 7.1e-4 relative |
+| end to end, 24 layers | per-token cos 0.91 (8192-token full attention is hypersensitive to sub-grey-level input noise; mean pooling recovers) |
+| mean-pooled / attention-pooled feature | cos **0.9994 .. 0.9998** |
+| SSv2 pooler + 174-way head | identical top-1 label (0.916 vs 0.921), probabilities within **4.5e-3**, same top-4 set |
+| predictor (4096 / 1024 target tokens) | cos **0.998**, max 0.5 |
+
+All end-to-end residual comes from resampling: the engine follows PIL, HF's video processor uses the
+torch antialiased path, pixel level mean 1.7e-4 (max 0.0175 normalized, about half a grey level).
+For a harder check use `--outtype f32` (1.2 GB) plus the same-input method. Debug:
+`VJEPA2_MAX_LAYERS=N` truncates the stack; `--dump-dir` also exports
+`v_blk0_qkv / v_blk0_q_rope / v_blk0_k_rope / v_blk0_attn / v_logits / v_probs`.
+
+What is reused: the block body, the flash-attn wiring and the pair-rotation rope all come from
+`core/vit_block.hpp` (the same file moondream / VideoChat3 / VideoMAE / ViViT use - this backend only
+added the "second angle table" and "no rope" switches); clip packing is videomae's `pack_clip`; the
+Conv3d fold and the ggml ops (`flash_attn_ext`, `norm`, `gelu_erf`, `mul_mat`, `get_rows`,
+`concat`) as well as the GGUF readers (`gguf`, `_lib`) are shared with every other backend. What is
+hand-written is only this architecture's graph wiring (the 3-D rope tables, the pooler's cross
+attention, the predictor's sort/unsort) - ggml's `ggml_rope_*` cannot express the upstream
+"tiled frequency" bug, so the rotation has to be mul/add.
 
 ### Qwen2.5-VL
 
@@ -641,13 +739,15 @@ setup. moondream3.1 numbers are in [Status](#status).
 
 ```
 src/
-  core/                shared layer: vqa::Model interface, mmap/UTF-8/JSON helpers, byte-level
-                       BPE tokenizer, image & video-frame decoding (the single stb_image
-                       implementation lives here), architecture discovery, model discovery +
-                       the single-resident slot (model_registry, shared by Web UI and MCP)
+  core/                shared layer, split by responsibility (see src/core/README.md):
+                       vqa.hpp + engine/ (ggml plumbing) + blocks/ (shared graph bodies)
+                       + media/ (decode, resample, mel) + text/ (BPE, UTF-8, JSON)
+                       + runtime/ (discovery, registry, load preamble, HTTP UI) + util/ (mmap)
   models/moondream/    moondream3.1 backend (engine + vision tower + multi-crop preprocessing
                        + region head + server/batch)
   models/videochat3/   VideoChat3-4B backend (vision preprocessing + graphs)
+  models/vjepa2/       V-JEPA 2 backend (3-D rope + space-time attention + pooler /
+                       classifier / masked predictor)
   models/videomae/     VideoMAE video tower backend (clip preprocessing + space-time attention
                        + classifier / embedding)
   models/qwen3_5/      Qwen3.5 / Marlin / VideoJev backend (gated-delta + full-attention hybrid
@@ -674,28 +774,42 @@ ggml/                  the only third-party dependency (clone it, not tracked)
 - **Debug switches**: `VC3_DUMP_DIR=<dir>` dumps intermediate tensors, `VC3_MAX_LAYERS=N`
   truncates the stack for layer-by-layer comparison, `VC3_NO_FUSION=1` falls back to the
   unfused SwiGLU, `--dump-ids` tokenizes and exits.
-- **Shared layer (`src/core`)**: no duplicated implementations across backends — `vqa.hpp`
-  (interface), `backend.hpp` (CUDA-first bring-up + the thread default, which counts **physical**
-  cores because SMT hurts these GEMV/small-GEMM shapes), `gguf_util.hpp` (metadata readers +
-  tensor→f32), `weight_load.hpp` (mmap binding, 1D→host-F32 promotion, and the CPU zero-copy /
-  GPU upload buffer assignment), `load_util.hpp` (LoadOptions plumbing, the per-backend
-  `<PREFIX>_DUMP_DIR` override, and chat-template token id resolution), `vit_block.hpp` (the one ViT block body, shared by moondream / VideoChat3 /
-  VideoMAE, differences via hooks), `llm_block.hpp` (the Qwen-style causal decoder layer body,
-  decoder-side sibling of `vit_block.hpp`: the hand-rolled per-layer decoder loops collapse into
-  one graph builder — VideoChat3 / SmolVLM / MOSS-VL (its cross-attention layers ride the
-  hooks.attention override) live here; null weight fields skip the corresponding op, and
-  backend-only behavior hangs off BlockHooks), `qwen2vl_tower.hpp` (the whole Qwen2.5-VL vision
-  tower shared op-for-op by the qwen2vl and qwen25omni engines: Conv3d patch embed, window
-  attention with periodic full-attention layers, 4-section 2D M-RoPE, the merger; call-site
-  differences are only cfg fields and nullable debug hooks), `resample.hpp` (smart_resize, PIL-semantics antialias
-  bicubic resize, bilinear position-table interpolation — these used to live inside the
-  videochat3 directory and get include'd back out of it by three other backends),
-  `audio_feats.hpp` (audio front-end primitives — FFT / Hann windows / mel filterbanks /
-  log-mel — where the Qwen2.5-Omni whisper-family and EmbedGemma-2 Gemma4-family implementations
-  sit side by side, numerically not interchangeable by design and not to be "unified"),
-  `attention.hpp` (KV cache + masks), `stage_buf.hpp` (device-side staging), `ggml_dump.hpp`
-  (parity dumps), `sampler.hpp`, `tokenizer.cpp`, `media_io.cpp`.
-- **Tokenizer data**: `scripts/gen_unicode_ranges.py` regenerates `src/core/unicode_ranges.inc`.
+- **Shared layer (`src/core`)**: no duplicated implementations across backends. The directory is
+  split by responsibility - the index is [`src/core/README.md`](src/core/README.md) - and every core
+  header is included root-relative from `src/` (`#include "core/engine/weight_load.hpp"`), so adding
+  a subdirectory never rewrites an include:
+  - `vqa.hpp` - the only header at the root: `vqa::Model`, capabilities, media types;
+  - `engine/` - `backend.hpp` (CUDA-first bring-up + the thread default, which counts **physical**
+    cores because SMT hurts these GEMV/small-GEMM shapes), `weight_load.hpp` (mmap binding,
+    1D→host-F32 promotion, CPU zero-copy / GPU upload buffer ownership), `gguf_util.hpp` (metadata
+    readers + tensor→f32), `ggml_dump.hpp` (parity dumps), `attention.hpp` (KV cache + masks),
+    `stage_buf.hpp` (on-device staging shared across graphs), `sampler.hpp`;
+  - `blocks/` - `vit_block.hpp` (the one ViT block body plus the generic pair-rotation RoPE, shared
+    by moondream / VideoChat3 / VideoMAE / ViViT / V-JEPA 2, differences via hooks),
+    `llm_block.hpp` (Qwen-style causal decoder layer, now hosting VideoChat3 / SmolVLM / MOSS-VL;
+    an empty weight field skips that op), `qwen2vl_tower.hpp` (the whole Qwen2.5-VL vision tower,
+    op-for-op identical in qwen2vl and qwen25omni);
+  - `media/` - `resample.hpp` (smart_resize, PIL-semantics antialiased bicubic, position-table
+    interpolation; it used to live inside the videochat3 directory and be included *backwards* by
+    three other backends), `media_io.hpp` (image / video-frame decode, the single stb_image
+    implementation), `jpeg_decode.hpp` (libjpeg-turbo, pixel-identical to PIL),
+    `audio_feats.hpp` (FFT / Hann / mel / log-mel: the Qwen2.5-Omni whisper family and the
+    EmbedGemma-2 Gemma4 family coexist on purpose - do not "unify" their float behavior),
+    `video_pipe.cpp` (ffmpeg frame sampling);
+  - `text/` - `tokenizer` (byte-level BPE + the Qwen2 regex pre-tokenizer), `utf8` (UTF-8 codec +
+    the GPT-2 byte<->unicode alphabet), `json` (recursive-descent parser) and `json_scan` (key scans
+    for HF configs, no DOM), `unicode_ranges.inc` (generated);
+  - `runtime/` - `model_registry` (which GGUFs this build can run, tokenizer resolution, the
+    single-resident slot shared by the Web UI and MCP), `vqa_registry` (arch name -> factory table,
+    the only file that knows the backend list), `backend_factories`, `load_util` (LoadOptions
+    plumbing + the per-backend `<PREFIX>_DUMP_DIR` override + chat-template token ids),
+    `vram_guard`, `http_server` (embedded Web UI);
+  - `util/` - `mmap` (read-only map + whole-file read), `aligned_buf` (64-byte aligned buffer).
+- **Before adding to the shared layer**: `src/core/README.md` carries the "where does new code go"
+  table and the four-step recipe for pulling a duplicated implementation in (prove both copies
+  already agree numerically, diff them before merging, default new behavior off, then run
+  `scripts/ref_*.py` and `scripts/smoke.sh`).
+- **Tokenizer data**: `scripts/gen_unicode_ranges.py` regenerates `src/core/text/unicode_ranges.inc`.
 
 ## License
 

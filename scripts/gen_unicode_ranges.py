@@ -11,7 +11,7 @@ Usage: python scripts/gen_unicode_ranges.py
 import sys
 import unicodedata
 
-OUT = "src/core/unicode_ranges.inc"
+OUT = "src/core/text/unicode_ranges.inc"
 MAX_CP = 0x110000
 
 

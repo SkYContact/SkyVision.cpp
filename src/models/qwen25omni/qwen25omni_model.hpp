@@ -3,7 +3,7 @@
 // The talker GGUF (speech output) loads as an optional sibling.
 #pragma once
 
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
 #include "ggml-backend.h"
 #include "ggml.h"

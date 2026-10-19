@@ -2,7 +2,7 @@
 // moondream/torch/image_crops.py + PIL Resample.c (bit-exact target).
 #include "moondream_preprocess.hpp"
 
-#include "resample.hpp"
+#include "core/media/resample.hpp"
 
 #include <algorithm>
 #include <cmath>

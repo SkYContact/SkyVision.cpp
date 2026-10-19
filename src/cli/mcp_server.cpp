@@ -14,11 +14,11 @@
 // Tools mirror what vqa::Model can do - the same surface the Web UI drives:
 // list_models / load_model / describe_image / ask_image / detect_objects /
 // point_objects / gaze_point / analyze_video / classify_video.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
-#include "json.hpp"
-#include "media_io.hpp"
-#include "model_registry.hpp"
+#include "core/text/json.hpp"
+#include "core/media/media_io.hpp"
+#include "core/runtime/model_registry.hpp"
 
 #include <cctype>
 #include <cstdarg>

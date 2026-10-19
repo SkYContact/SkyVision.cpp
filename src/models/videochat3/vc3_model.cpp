@@ -10,9 +10,9 @@
 //     with flash attention and an explicit F16 causal mask.
 //   * the vision tower runs as its own graph per clip: patch embed, 27 blocks
 //     with 2D rope and full (non causal) attention, final LN, merge, projector.
-#include "vqa.hpp"
-#include "vit_block.hpp"
-#include "llm_block.hpp"
+#include "core/vqa.hpp"
+#include "core/blocks/vit_block.hpp"
+#include "core/blocks/llm_block.hpp"
 
 #include <functional>
 #include <array>
@@ -25,17 +25,18 @@
 #ifdef GGML_USE_CUDA
 #   include "ggml-cuda.h"   // ggml_backend_cuda_init
 #endif
-#include "tokenizer.hpp"
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "weight_load.hpp"
-#include "stage_buf.hpp"
+#include "core/text/tokenizer.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/engine/weight_load.hpp"
+#include "core/engine/stage_buf.hpp"
 #include "vc3_preprocess.hpp"
-#include "attention.hpp"
-#include "sampler.hpp"
-#include "vqa_util.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/util/aligned_buf.hpp"
+#include "core/util/mmap.hpp"
 
 #include <algorithm>
 #include <chrono>

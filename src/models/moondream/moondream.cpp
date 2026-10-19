@@ -27,8 +27,8 @@
 #endif
 #include "ggml-alloc.h"
 
-#include "attention.hpp"
-#include "sampler.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/sampler.hpp"
 #include "gguf.h"
 
 #include <cstdio>
@@ -66,11 +66,12 @@
 // src/core so that every backend shares one implementation. vqa::Tokenizer
 // defaults to the plain GPT-2 mode this vocabulary expects (no Qwen-style
 // regex pre-tokenizer, no <|...|> specials).
-#include "tokenizer.hpp"
-#include "vqa_util.hpp"
-#include "backend.hpp"
-#include "ggml_dump.hpp"
-#include "weight_load.hpp"
+#include "core/text/tokenizer.hpp"
+#include "core/util/mmap.hpp"
+#include "core/text/utf8.hpp"
+#include "core/engine/backend.hpp"
+#include "core/engine/ggml_dump.hpp"
+#include "core/engine/weight_load.hpp"
 using vqa::MMap;
 using vqa::Tokenizer;
 using vqa::init_byte_table;

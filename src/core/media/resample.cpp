@@ -1,5 +1,5 @@
 // resample.cpp - see resample.hpp.
-#include "resample.hpp"
+#include "core/media/resample.hpp"
 
 #include <algorithm>
 #include <cmath>

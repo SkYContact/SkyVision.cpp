@@ -1,4 +1,4 @@
-#include "media_io.hpp"
+#include "core/media/media_io.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -18,7 +18,7 @@
 // the libjpeg family); PNG/BMP stay on stb. Dispatch is by content (SOI
 // magic), so file extensions never decide the engine.
 #ifdef VQA_HAVE_LIBJPEG
-#include "jpeg_decode.hpp"
+#include "core/media/jpeg_decode.hpp"
 #endif
 
 #ifdef _WIN32
@@ -36,7 +36,13 @@ namespace {
 
 // JPEG stream sniff: Start Of Image marker.
 bool has_soi(const uint8_t * b, size_t n) {
+#ifdef VQA_HAVE_LIBJPEG
     return looks_like_jpeg(b, n);
+#else
+    // no vendored libjpeg-turbo: same test inline (jpeg_decode.hpp is not
+    // included in this configuration, its decoder would not be linked)
+    return n >= 2 && b[0] == 0xFF && b[1] == 0xD8;
+#endif
 }
 
 bool file_has_soi(const std::string & path) {

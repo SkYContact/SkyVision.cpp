@@ -15,22 +15,22 @@
 //     2-layer MLP with GELU; a final gather undoes the window reorder;
 //   * the text trunk is plain Qwen2: RMSNorm, GQA, qkv bias, SwiGLU, and
 //     section MRoPE (16/24/24 of head_dim/2) over 3 position axes.
-#include "vqa.hpp"
+#include "core/vqa.hpp"
 
-#include "attention.hpp"
-#include "backend.hpp"
+#include "core/engine/attention.hpp"
+#include "core/engine/backend.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
-#include "ggml_dump.hpp"
+#include "core/engine/ggml_dump.hpp"
 #include "gguf.h"
-#include "gguf_util.hpp"
-#include "load_util.hpp"
-#include "qwen2vl_tower.hpp"
-#include "resample.hpp"
-#include "sampler.hpp"
-#include "weight_load.hpp"
+#include "core/engine/gguf_util.hpp"
+#include "core/runtime/load_util.hpp"
+#include "core/blocks/qwen2vl_tower.hpp"
+#include "core/media/resample.hpp"
+#include "core/engine/sampler.hpp"
+#include "core/engine/weight_load.hpp"
 
 #include <algorithm>
 #include <chrono>

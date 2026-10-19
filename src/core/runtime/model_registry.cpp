@@ -1,5 +1,5 @@
 // model_registry.cpp - model discovery + the single-resident model slot.
-#include "model_registry.hpp"
+#include "core/runtime/model_registry.hpp"
 
 #include "gguf.h"
 
