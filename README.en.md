@@ -408,6 +408,10 @@ python convert/convert_vjepa2.py --src models/vjepa2-vitl-fpc64-256 -o vjepa2-f1
 vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --ask x --mode embed   # 1024-d feature JSON
 ```
 
+Ready-to-run weights (no conversion needed): `hf download SkyContact/VJEPA2-ViT-L-fpc64-256-GGUF`
+(encoder + masked-latent predictor, mirrored on ModelScope) and
+`SkyContact/VJEPA2-ViT-L-fpc16-256-SSv2-GGUF` (the 174-way SSv2 fine-tune, also mirrored).
+
 This is the encoder half of the world model: a 1024-d mean-pooled video feature, no text, no
 classifier.
 

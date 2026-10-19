@@ -446,6 +446,10 @@ python convert/convert_vjepa2.py --src models/vjepa2-vitl-fpc64-256 -o vjepa2-f1
 vqa-cli --model vjepa2-f16.gguf --video clip.mp4 --ask x --mode embed   # 1024 维特征 JSON
 ```
 
+预转好的权重（免转换直接下）：
+`hf download SkyContact/VJEPA2-ViT-L-fpc64-256-GGUF`（编码器 + masked-latent predictor，魔搭同名）·
+`hf download SkyContact/VJEPA2-ViT-L-fpc16-256-SSv2-GGUF`（SSv2 174 类分类微调，魔搭同名）。
+
 这是纯编码器（世界模型的一半）：输出 1024 维 mean-pooled 视频特征，不生成文本、也没有分类头。
 
 - Conv3d（`kernel=stride=(tubelet,patch,patch)`）折成一次 matmul，token 顺序 `(t', h', w')`、

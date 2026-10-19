@@ -8,6 +8,7 @@ command line:
 
     python scripts/upload_gguf.py --file videojev-4b-q8_0.gguf \\
         --card scripts/cards/VideoJev-4B-GGUF.md \\
+        --ms-card scripts/cards/VideoJev-4B-GGUF.ms.md \\
         --hf-repo  SkyContact/VideoJev-4B-GGUF \\
         --ms-repo  SkyContact/VideoJev-4B-GGUF \\
         --remote-name VideoJev-4B-q8_0.gguf --commit-message "VideoJev-4B q8_0"
@@ -18,6 +19,15 @@ what would happen (plus the auth identity each side resolves to).
 import argparse
 import os
 import sys
+
+
+def _hf_stored_token():
+    """Token saved by `hf auth login` (~/.cache/huggingface/token)."""
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
 
 
 def hf_upload(path, card, repo, remote_name, message, dry):
@@ -38,7 +48,8 @@ def hf_upload(path, card, repo, remote_name, message, dry):
     print(f"[hf] done: https://huggingface.co/{repo}", flush=True)
 
 
-def ms_upload(path, card, repo, remote_name, message, dry, base_model="", chinese_name=""):
+def ms_upload(path, card, repo, remote_name, message, dry, base_model="", chinese_name="",
+              license_name="Apache License 2.0"):
     from modelscope.hub.api import HubApi
 
     token = os.environ.get("MODELSCOPE_API_TOKEN") or None
@@ -56,7 +67,7 @@ def ms_upload(path, card, repo, remote_name, message, dry, base_model="", chines
     if not exists:
         # original_model_id is what ModelScope turns into the lineage edge; it has to
         # be a repository that exists on *this* hub, otherwise the edge is dropped
-        api.create_model(repo, visibility=5, license="Apache License 2.0",
+        api.create_model(repo, visibility=5, license=license_name,
                          chinese_name=chinese_name or repo,
                          original_model_id=base_model, token=token)
     # note: the SDK takes repo_id (model_id is only used by create_model)
@@ -72,6 +83,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--file", required=True, help="local .gguf")
     ap.add_argument("--card", default="", help="markdown model card -> README.md")
+    ap.add_argument("--ms-card", default="",
+                    help="ModelScope card (defaults to --card); the two hubs want "
+                         "different relative links, hence the separate file")
+    ap.add_argument("--license", default="Apache License 2.0",
+                    help="ModelScope license label used when creating the repo")
     ap.add_argument("--hf-repo", default="", help="e.g. SkyContact/VideoJev-4B-GGUF")
     ap.add_argument("--ms-repo", default="", help="e.g. SkyContact/VideoJev-4B-GGUF")
     ap.add_argument("--remote-name", default="", help="file name inside the repo")
@@ -92,15 +108,17 @@ def main():
     both = not (args.hf or args.ms)
     rc = 0
     if (both or args.hf) and args.hf_repo:
-        if not os.environ.get("HF_TOKEN") and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
-            print("[hf] HF_TOKEN not set - run `hf auth login` or export it", file=sys.stderr)
+        if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                or _hf_stored_token()):
+            print("[hf] no token - run `hf auth login` or export HF_TOKEN", file=sys.stderr)
             rc = 1
         else:
             hf_upload(args.file, args.card, args.hf_repo, remote, msg, args.dry_run)
     if (both or args.ms) and args.ms_repo:
         try:
-            ms_upload(args.file, args.card, args.ms_repo, remote, msg, args.dry_run,
-                      base_model=args.base_model, chinese_name=args.chinese_name)
+            ms_upload(args.file, args.ms_card or args.card, args.ms_repo, remote, msg,
+                      args.dry_run, base_model=args.base_model,
+                      chinese_name=args.chinese_name, license_name=args.license)
         except Exception as e:
             print(f"[ms] failed: {type(e).__name__}: {e}", file=sys.stderr)
             rc = 1
