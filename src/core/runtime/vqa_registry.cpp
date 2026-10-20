@@ -85,6 +85,11 @@ const ArchEntry kArchs[] = {
     // a GGUF shipped without a readable vocab_size key (server garbage)
     { { "qwen3_5", "marlin", "videojev" }, create_qwen3_5,
       TokenizerMode::Qwen2Regex, "models/Qwen3.5-2B", 248320, false, false, "" },
+    // MiniCPM-V 4.7 (openbmb, 1B dense / 35B-A3B MoE): the text trunk IS
+    // qwen3_5_text, so it runs on the qwen3_5 backend's minicpm mode - SigLIP
+    // canvas tower + 16x window/MLP mergers instead of the Qwen3-VL ViT.
+    { { "minicpmv47", "minicpm_v4_7", nullptr }, create_qwen3_5,
+      TokenizerMode::Qwen2Regex, "models/MiniCPM-V-4.7-1B", 248094, false, false, "" },
     { { "moss_vl", nullptr }, create_moss_vl,
       TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false, "moss.html" },
     // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk

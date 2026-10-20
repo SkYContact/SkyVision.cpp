@@ -57,6 +57,12 @@ parity_*/
 # dev scratch images (regenerate with scripts)
 test_image.png
 test_scene.png
+test_slices.png
+test_slices_small.png
+tmp_vframes/
+cpp_minicpm_dump/
+tmp_env/
+.venv-cpm/
 
 # dev notes & third-party reference code — kept locally, not for publication
 docs/

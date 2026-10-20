@@ -39,6 +39,7 @@
 #include "core/media/resample.hpp"
 #include "core/engine/weight_load.hpp"
 #include "qwen3_5_preprocess.hpp"
+#include "minicpm_preprocess.hpp"   // MiniCPM-V 4.7 (qwen3_5_text trunk + SigLIP canvas tower)
 
 #include <algorithm>
 #include <chrono>
@@ -81,6 +82,18 @@ struct TxtLayer {
     ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;
 };
 
+// MiniCPM-V 4.7 window-attention merger (insert_layer_id=6) + the 2x2 projection
+// MLP that follows the tower. The window half pools each 2x2 patch window into one
+// token, the projection half merges 2x2 again (16x total).
+struct McpmVitMerger {
+    ggml_tensor *norm1_w = nullptr, *norm1_b = nullptr;    // layer_norm1
+    ggml_tensor *attn_w = nullptr, *attn_b = nullptr;      // fused q|k|v (bias)
+    ggml_tensor *attn_o_w = nullptr, *attn_o_b = nullptr;  // out_proj
+    ggml_tensor *pre_norm_w = nullptr, *pre_norm_b = nullptr;
+    ggml_tensor *fc1_w = nullptr, *fc1_b = nullptr;        // window_hidden -> window_intermediate
+    ggml_tensor *fc2_w = nullptr, *fc2_b = nullptr;        // window_intermediate -> hidden
+};
+
 struct TextGraph {
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
@@ -91,11 +104,16 @@ struct TextGraph {
 
 class Qwen3_5 : public vqa::Model {
 public:
+    // The front ends gate --frames on caps() *before* load(), so the video
+    // capability has to be visible at construction; load() refines it per arch.
+    Qwen3_5() { caps_.image = true; caps_.video = true; }
     ~Qwen3_5() override;
     bool load(const std::string & gguf_path, const std::string & tokenizer_path,
               const vqa::LoadOptions & opt = vqa::LoadOptions()) override;
     const vqa::Capabilities & caps() const override { return caps_; }
-    const char * name() const override { return has_head ? "videojev" : "qwen3.5"; }
+    const char * name() const override {
+        return minicpm ? "minicpm-v-4.7" : (has_head ? "videojev" : "qwen3.5");
+    }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp,
              std::string & out_text) override;
@@ -123,6 +141,16 @@ private:
     bool alloc_state();
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                        int * n_tokens, int * grid /* t, h, w (merged) */, int token_budget = 0);
+    // MiniCPM-V 4.7 (see minicpm_preprocess.hpp): SigLIP tower -> window merger at
+    // insert layer -> post LN -> 2x2 projection MLP, one pass per crop.
+    bool encode_vision_minicpm(const vqa::MediaInput & media, std::vector<float> & feats,
+                               int * n_tokens, int * grid);
+    bool encode_crop_minicpm(const minicpm::Crop & crop, std::vector<float> & feats,
+                             int * n_tokens);
+    int mcpm_crop_no = 0;    // dump suffix when a plan has several crops
+    int mcpm_ncrops = 1;
+    std::string mcpm_prompt(const std::string & user_text, bool video) const;
+    bool mcpm_mpos(const std::vector<int> & ids, std::vector<int> & mpos);
     // VideoJev decision graph tap: gather hidden rows by index and score them
     // with the cosine head, replacing the lm head as the graph output.
     struct ScoreTap {
@@ -165,6 +193,18 @@ private:
     int ssm_n_group = 16, ssm_dt_rank = 16;
 
     VisConfig vc;
+    // ---- MiniCPM-V 4.7: same text trunk, SigLIP canvas tower + 16x mergers ----
+    bool minicpm = false;
+    minicpm::VisConfig mvc;
+    ggml_tensor *m_patch_w = nullptr, *m_patch_b = nullptr;
+    ggml_tensor *m_post_norm_w = nullptr, *m_post_norm_b = nullptr;   // tower post_layernorm
+    ggml_tensor *m_out_head = nullptr;                               // lm_head (untied)
+    McpmVitMerger mv;
+    int id_image_start = 248078, id_image_end = 248079;   // <image> / </image> for canvas mrope
+    int id_slice_start = 248088, id_slice_end = 248089;   // <slice> / </slice>
+    // per visual block (image or video frame): token counts per crop + canvas geometry
+    std::vector<std::vector<int>> mcpm_crop_tokens;
+    std::vector<minicpm::BlockGeom> mcpm_blocks;
     int id_image_pad = 248056, id_video_pad = 248057;
     int id_vision_start = 248053, id_vision_end = 248054;
     int id_eos = 0, id_endoftext = 248044;
@@ -322,8 +362,9 @@ bool Qwen3_5::load(const std::string & gguf_path, const std::string & tokenizer_
 
     caps_ = {};
     caps_.image = true;
+    // MiniCPM-V 4.7: images and video frames both go through the canvas layout
     caps_.video = true;
-    caps_.timestamps_prompt = true;
+    caps_.timestamps_prompt = !minicpm;
     fprintf(stderr, "marlin: ready (%d text layers [%d full-attn], %d vision layers, ctx %d)\n",
             n_layer, n_full_layers, vc.n_layer, n_ctx);
     return true;
@@ -368,6 +409,34 @@ bool Qwen3_5::load_weights(const char * path) {
     vc.layernorm_eps = vqa::gguf::f32(gu, "marlin.vision.layer_norm_epsilon", vc.layernorm_eps);
     vc.rope_theta = vqa::gguf::f32(gu, "marlin.vision.rope_theta", vc.rope_theta);
     vc.out_hidden = vqa::gguf::u32(gu, "marlin.vision.out_hidden_size", vc.out_hidden);
+    // MiniCPM-V 4.7 rides the same text trunk but brings a SigLIP canvas tower:
+    // no rope (learned position table addressed by nearest bucket ids), a window
+    // merger inserted after vision layer `insert_layer`, and a projection MLP.
+    // The tower's own sizes come from the shared marlin.vision.* keys.
+    minicpm = ggml_get_tensor(wctx, "v.pos_emb.weight") != nullptr;
+    if (minicpm) {
+        mvc.n_embd  = vc.n_embd;
+        mvc.n_head  = vc.n_head;
+        mvc.n_layer = vc.n_layer;
+        mvc.n_ff    = vc.n_ff;
+        mvc.patch   = vc.patch;
+        mvc.ln_eps  = vc.layernorm_eps;
+        mvc.pos_side     = vqa::gguf::u32(gu, "minicpm.vision.pos_side", mvc.pos_side);
+        mvc.insert_layer = vqa::gguf::u32(gu, "minicpm.vision.insert_layer", mvc.insert_layer);
+        mvc.window       = vqa::gguf::u32(gu, "minicpm.vision.window", mvc.window);
+        mvc.merge        = vqa::gguf::u32(gu, "minicpm.vision.merge", mvc.merge);
+        mvc.downsample   = vqa::gguf::u32(gu, "minicpm.downsample", mvc.downsample);
+        if (const char * e = getenv("MINICPM_DOWNSAMPLE"))   // "4x" / "16x" override
+            mvc.downsample = (strncmp(e, "4", 1) == 0) ? 4 : 16;
+        id_image_start   = vqa::gguf::u32(gu, "minicpm.image_start_id", id_image_start);
+        id_image_end     = vqa::gguf::u32(gu, "minicpm.image_end_id", id_image_end);
+        id_slice_start   = vqa::gguf::u32(gu, "minicpm.slice_start_id", id_slice_start);
+        id_slice_end     = vqa::gguf::u32(gu, "minicpm.slice_end_id", id_slice_end);
+        mvc.max_slice_nums = vqa::gguf::u32(gu, "minicpm.vision.max_slice_nums",
+                                            mvc.max_slice_nums);
+        if (const char * e = getenv("MINICPM_SCALE_RES")) mvc.scale_resolution = atoi(e);
+        if (const char * e = getenv("MINICPM_NO_SLICES")) mvc.max_slice_nums = 1;
+    }
     has_mtp = vqa::gguf::u32(gu, "marlin.has_mtp", 0) != 0;
     marlin_skills = vqa::gguf::u32(gu, "marlin.skills", 0) != 0;
     id_image_pad = vqa::gguf::u32(gu, "marlin.image_token_id", id_image_pad);
@@ -520,6 +589,29 @@ bool Qwen3_5::load_weights(const char * path) {
         L.fc1_w = g("mlp.fc1.weight");
         L.fc1_b = g("mlp.fc1.bias");
     }
+    if (minicpm) {
+        // SigLIP tower post-norm + the window merger + the untied lm head. The
+        // tower blocks themselves reuse the v.blk.N.* bindings above, and the
+        // 2x2 projection MLP reuses mm.norm/mm.fc1/mm.fc2 (different shapes from
+        // the qwen3_5 merger; only one mode is ever active).
+        m_post_norm_w = gt("v.post_norm.weight");
+        m_post_norm_b = gt("v.post_norm.bias");
+        mv.norm1_w  = gt("vm.norm1.weight");   mv.norm1_b  = gt("vm.norm1.bias");
+        mv.attn_w   = gt("vm.attn.weight");    mv.attn_b   = gt("vm.attn.bias");
+        mv.attn_o_w = gt("vm.wo.weight");      mv.attn_o_b = gt("vm.wo.bias");
+        mv.pre_norm_w = gt("vm.pre_norm.weight"); mv.pre_norm_b = gt("vm.pre_norm.bias");
+        mv.fc1_w    = gt("vm.fc1.weight");     mv.fc1_b    = gt("vm.fc1.bias");
+        mv.fc2_w    = gt("vm.fc2.weight");     mv.fc2_b    = gt("vm.fc2.bias");
+        m_out_head  = ggml_get_tensor(wctx, "output.weight");   // untied head (optional)
+        if (!m_post_norm_w || !mv.norm1_w || !mv.fc1_w || !mm_fc1_w)
+            { fprintf(stderr, "minicpm: merger/tower tensors incomplete\n"); return false; }
+        if (!m_out_head) fprintf(stderr, "minicpm: no output.weight, falling back to tied head\n");
+        fprintf(stderr, "minicpm-v tower: %d layers (d %d, h %d, patch %d), window merger "
+                        "after layer %d, canvas %dx\n",
+                mvc.n_layer, mvc.n_embd, mvc.n_head, mvc.patch, mvc.insert_layer,
+                mvc.downsample);
+    }
+
     // VideoJev decision head (optional): fp32 CosineDecisionHead q/k projections
     jev_q_w = ggml_get_tensor(wctx, "jev_head_q.weight");
     jev_q_b = ggml_get_tensor(wctx, "jev_head_q.bias");
@@ -588,11 +680,17 @@ void Qwen3_5::dump(const ggml_cgraph * gf, const char * name) {
 // layer-0 parity truncation) lives once in vqa::vit::vit_attention_hook
 // (core/vit_block.hpp); this backend only supplies its parameters below.
 
+// MiniCPM-V 4.7 tower (16x canvas path): SigLIP encoder -> window-attention
+// merger after `insert_layer` -> post_layernorm -> 2x2 projection MLP into the
+// text width. One image, one graph; the tower blocks are the shared
+// vqa::vit::block with no rope (position info is a learned table that the host
+// folds into the patch embedding input, exactly like qwen3_5 folds its table).
 bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                            int * n_tokens, int * grid, int token_budget) {
     *n_tokens = 0;
     grid[0] = grid[1] = grid[2] = 0;
     if (media.empty()) return true;
+    if (minicpm) return encode_vision_minicpm(media, feats, n_tokens, grid);
     const int T = (int)media.frames.size();
     const int src_h = media.height, src_w = media.width;
     const int factor = vc.patch * vc.merge;                       // 32
@@ -843,6 +941,272 @@ bool Qwen3_5::encode_vision(const vqa::MediaInput & media, std::vector<float> & 
     grid[0] = gt; grid[1] = mh; grid[2] = mw;
     fprintf(stderr, "vision: %d patches (%dx%d, %d step%s) -> %d tokens%s\n", N, gh, gw,
             gt, gt == 1 ? "" : "s", *n_tokens, stop_after ? " (truncated for parity)" : "");
+    return true;
+}
+
+// One vision-encoder pass over one crop (thumbnail or a detail crop): the tower,
+// the window merger at `insert_layer` (16x only) and the 2x2 projection MLP.
+bool Qwen3_5::encode_crop_minicpm(const minicpm::Crop & crop, std::vector<float> & feats,
+                                  int * n_tokens) {
+    *n_tokens = 0;
+    // multi-crop plans get per-crop dump names (patches0, patches1, ...) so the
+    // parity tooling can compare every crop instead of just the last one
+    const std::string sfx = mcpm_ncrops > 1 ? std::to_string(mcpm_crop_no) : std::string();
+    const std::string nm_patches = "patches" + sfx, nm_pos = "v_pos_in" + sfx;
+    const std::string nm_patch_out = "v_patch_out" + sfx, nm_vm = "vm_out" + sfx;
+    const std::string nm_tower = "v_tower_out" + sfx, nm_proj = "v_proj_out" + sfx;
+    const int p = mvc.patch, D = mvc.n_embd, NH = mvc.n_head, HD = D / NH;
+    std::vector<float> pos;
+    const std::vector<float> & patches = crop.patches;
+    int gh = crop.gh, gw = crop.gw;     // halved by the 16x window merger below
+    const int C3 = 3 * p * p;
+    int N = gh * gw;
+    {
+        // learned position table: nearest bucket ids, folded on the host (the
+        // table is [pos_side*pos_side, D], one row per table cell)
+        std::vector<int> pids;
+        minicpm::nearest_pos_ids(gh, gw, mvc.pos_side, pids);
+        pos.resize((size_t)D * N);
+        for (int i = 0; i < N; i++)
+            memcpy(pos.data() + (size_t)i * D, pos_table_host.data() + (size_t)pids[i] * D,
+                   sizeof(float) * D);
+    }
+
+    struct ggml_init_params ip = { 96ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    ggml_context * gctx = ggml_init(ip);
+    if (!gctx) return false;
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, 32768, false);
+
+    ggml_tensor * t_patches = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, C3, N);
+    ggml_set_name(t_patches, nm_patches.c_str());
+    ggml_tensor * t_pos = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, D, N);
+    ggml_set_name(t_pos, nm_pos.c_str());
+    ggml_tensor * t_widx = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, N);
+    ggml_set_name(t_widx, "vm_widx");
+    // window attention mask: block diagonal over groups of window^2 tokens. The
+    // patch count is final before the tower runs, so the tensor exists up front.
+    // "4x" mode never runs the window merger, so it needs no mask.
+    ggml_tensor * t_vmask = nullptr;
+    if (mvc.downsample == 16) {
+        t_vmask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, N, N);
+        ggml_set_name(t_vmask, "vm_mask");
+    }
+
+    ggml_tensor * x = ggml_mul_mat(gctx, v_patch_w, t_patches);
+    x = ggml_add(gctx, x, v_patch_b);    // SigLIP conv bias stays in-graph
+    x = ggml_add(gctx, x, t_pos);
+    ggml_set_name(x, nm_patch_out.c_str());
+
+    vqa::vit::VitHookEnv env;
+    env.gctx = gctx; env.gf = gf;
+    env.n_head = NH; env.n_embd = D;
+    env.vhd = HD; env.vhd_f = HD;
+    env.no_rope = true;                 // SigLIP: position comes from the table add
+    env.N = N;
+    vqa::vit::BlockHooks bh;
+    bh.attention = vqa::vit::vit_attention_hook;
+    bh.ud = &env;
+
+    std::vector<int> widx;   // window gather order, built when the merger fires
+
+    // window-attention merger: pool each 2x2 patch window into one token
+    auto window_merge = [&](ggml_tensor * xin) -> ggml_tensor * {
+        minicpm::window_index(gh, gw, mvc.window, widx);
+        ggml_tensor * xr = ggml_get_rows(gctx, xin, t_widx);      // window-major stream
+        ggml_tensor * l = ggml_norm(gctx, xr, mvc.ln_eps);
+        l = ggml_mul(gctx, l, mv.norm1_w);
+        l = ggml_add(gctx, l, mv.norm1_b);
+
+        ggml_tensor * qkv = ggml_mul_mat(gctx, mv.attn_w, l);
+        qkv = ggml_add(gctx, qkv, mv.attn_b);
+        const size_t off = (size_t)NH * HD * qkv->nb[0];
+        auto hv = [&](int blk) {
+            return ggml_view_3d(gctx, qkv, HD, NH, N, (size_t)HD * qkv->nb[0], qkv->nb[1],
+                                (size_t)blk * off);
+        };
+        ggml_tensor * q = hv(0), * k = hv(1), * v = hv(2);
+        // one 4-token flash-attn per window: the stream is window-major, so the
+        // mask is just a block diagonal over groups of `window^2`
+        ggml_tensor * qf = ggml_view_3d(gctx, q, HD, N, NH, q->nb[2], q->nb[1], 0);
+        ggml_tensor * kf = ggml_view_3d(gctx, k, HD, N, NH, k->nb[2], k->nb[1], 0);
+        ggml_tensor * vf = ggml_view_3d(gctx, v, HD, N, NH, v->nb[2], v->nb[1], 0);
+        ggml_tensor * fa = ggml_flash_attn_ext(gctx, qf, kf, vf, t_vmask,
+                                               1.0f / sqrtf((float)HD), 0.0f, 0.0f);
+        ggml_tensor * ao = ggml_reshape_2d(gctx, ggml_cont(gctx, fa), D, N);
+        ao = ggml_mul_mat(gctx, mv.attn_o_w, ao);
+        ao = ggml_add(gctx, ao, mv.attn_o_b);
+        ggml_tensor * h = ggml_add(gctx, xr, ao);
+
+        // window mean as the residual of the pooling MLP
+        const int ws = mvc.window * mvc.window, nw = N / ws;
+        ggml_tensor * h3 = ggml_reshape_3d(gctx, h, D, ws, nw);
+        ggml_tensor * mean = nullptr;
+        for (int t = 0; t < ws; t++) {
+            ggml_tensor * tv = ggml_view_3d(gctx, h3, D, 1, nw, h3->nb[1], h3->nb[2],
+                                            (size_t)t * h3->nb[1]);
+            mean = mean ? ggml_add(gctx, mean, tv) : tv;
+        }
+        mean = ggml_scale(gctx, mean, 1.0f / (float)ws);
+        mean = ggml_reshape_2d(gctx, mean, D, nw);    // back to [D, nw] for the add
+
+        ggml_tensor * flat = ggml_reshape_2d(gctx, h, (int64_t)D * ws, nw);
+        flat = ggml_norm(gctx, flat, mvc.ln_eps);
+        flat = ggml_mul(gctx, flat, mv.pre_norm_w);
+        flat = ggml_add(gctx, flat, mv.pre_norm_b);
+        ggml_tensor * o = ggml_mul_mat(gctx, mv.fc1_w, flat);
+        o = ggml_add(gctx, o, mv.fc1_b);
+        o = ggml_gelu(gctx, o);                  // gelu_pytorch_tanh
+        o = ggml_mul_mat(gctx, mv.fc2_w, o);
+        o = ggml_add(gctx, o, mv.fc2_b);
+        return ggml_add(gctx, o, mean);
+    };
+
+    for (int il = 0; il < mvc.n_layer; il++) {
+        vqa::vit::BlockWeights bw{vl[il].norm0_w, vl[il].norm0_b, vl[il].wqkv_w, vl[il].wqkv_b,
+                                  vl[il].wo_w, vl[il].wo_b, vl[il].norm1_w, vl[il].norm1_b,
+                                  vl[il].fc0_w, vl[il].fc0_b, vl[il].fc1_w, vl[il].fc1_b};
+        bh.probe_layer0 = nullptr;               // no layer-0 parity sink for this tower yet
+        x = vqa::vit::block(gctx, x, bw, mvc.ln_eps, bh, il);
+        if (!x) { ggml_free(gctx); return false; }
+        // "4x" mode skips the vit merger: the tower runs full resolution and only
+        // the projection MLP merges 2x2 (4x more visual tokens than the default)
+        if (mvc.downsample == 16 && il == mvc.insert_layer) {
+            x = window_merge(x);
+            ggml_set_name(x, nm_vm.c_str());
+            gh /= mvc.window; gw /= mvc.window;
+            N = gh * gw;
+            env.N = N;
+            fprintf(stderr, "minicpm: window merger after layer %d -> %d tokens\n", il, N);
+        }
+    }
+
+    // post_layernorm, then the 2x2 projection MLP into the text width
+    x = ggml_norm(gctx, x, mvc.ln_eps);
+    x = ggml_mul(gctx, x, m_post_norm_w);
+    x = ggml_add(gctx, x, m_post_norm_b);
+    ggml_set_name(x, nm_tower.c_str());
+
+    const int mh = gh / mvc.merge, mw = gw / mvc.merge;
+    const int n_out = mh * mw;
+    std::vector<int> midx;
+    minicpm::merge_index(gh, gw, mvc.merge, midx);
+    ggml_tensor * t_midx = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, (int64_t)midx.size());
+    ggml_set_name(t_midx, "pm_idx");
+    ggml_tensor * cat = nullptr;
+    for (int k = 0; k < mvc.merge * mvc.merge; k++) {
+        ggml_tensor * iv = ggml_view_1d(gctx, t_midx, n_out, (size_t)k * n_out * sizeof(int));
+        ggml_tensor * g = ggml_get_rows(gctx, x, iv);     // [D, n_out]
+        cat = cat ? ggml_concat(gctx, cat, g, 0) : g;      // dim0 = (ky, kx, dim)
+    }
+    cat = ggml_norm(gctx, cat, mvc.ln_eps);
+    cat = ggml_mul(gctx, cat, mm_norm_w);
+    cat = ggml_add(gctx, cat, mm_norm_b);
+    ggml_tensor * h = ggml_mul_mat(gctx, mm_fc1_w, cat);
+    h = ggml_add(gctx, h, mm_fc1_b);
+    h = ggml_gelu_erf(gctx, h);                 // nn.GELU() == exact erf
+    h = ggml_mul_mat(gctx, mm_fc2_w, h);
+    h = ggml_add(gctx, h, mm_fc2_b);
+    ggml_set_name(h, nm_proj.c_str());
+    ggml_build_forward_expand(gf, h);
+
+    if (!dump_dir.empty()) {
+        const char * dump_names[] = { nm_patches.c_str(), nm_pos.c_str(), nm_patch_out.c_str(),
+                                      nm_vm.c_str(), nm_tower.c_str(), nm_proj.c_str(), nullptr };
+        vqa::dump::mark_sinks(gctx, gf, dump_names);
+        vqa::dump::finalize_sinks(gctx, gf, backend);
+    }
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "minicpm vision graph allocation failed\n");
+        ggml_free(gctx);
+        return false;
+    }
+    ggml_backend_tensor_set(t_patches, patches.data(), 0, sizeof(float) * patches.size());
+    ggml_backend_tensor_set(t_pos, pos.data(), 0, sizeof(float) * pos.size());
+    if (!widx.empty()) ggml_backend_tensor_set(t_widx, widx.data(), 0, sizeof(int) * widx.size());
+    ggml_backend_tensor_set(t_midx, midx.data(), 0, sizeof(int) * midx.size());
+    // window attention mask: block diagonal over groups of window^2 tokens
+    if (t_vmask) {
+        const int N0 = gh * gw * mvc.window * mvc.window;   // back to the patch count
+        const int ws = mvc.window * mvc.window;
+        std::vector<int> spans;
+        for (int s = 0; s < N0; s += ws) spans.push_back(s);
+        vqa::set_blockdiag_mask(t_vmask, spans);
+    }
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "minicpm vision compute failed\n");
+        ggml_free(gctx);
+        return false;
+    }
+    ggml_tensor * out = ggml_graph_get_tensor(gf, nm_proj.c_str());
+    feats.resize((size_t)out->ne[0] * out->ne[1]);
+    ggml_backend_tensor_get(out, feats.data(), 0, sizeof(float) * feats.size());
+    *n_tokens = (int)out->ne[1];
+    dump(gf, nm_patches.c_str());
+    dump(gf, nm_pos.c_str());
+    dump(gf, nm_patch_out.c_str());
+    dump(gf, nm_vm.c_str());
+    dump(gf, nm_tower.c_str());
+    dump(gf, nm_proj.c_str());
+    ggml_free(gctx);
+    mcpm_crop_no++;
+    if (getenv("MINICPM_VERBOSE"))
+        fprintf(stderr, "minicpm crop: %dx%d patches -> %d tokens\n", gw, gh, *n_tokens);
+    return true;
+}
+
+// Whole media input: one plan per image / video frame, each plan = thumbnail plus
+// (slice_mode) up to max_slice_nums detail crops. Features concatenate in prompt
+// order; the per-block geometry is cached for the canvas M-RoPE pass.
+bool Qwen3_5::encode_vision_minicpm(const vqa::MediaInput & media, std::vector<float> & feats,
+                                    int * n_tokens, int * grid) {
+    *n_tokens = 0;
+    grid[0] = grid[1] = grid[2] = 0;
+    if (media.empty()) return true;
+    const bool video = media.kind == vqa::MediaKind::Video;
+    const int nframe = video ? (int)media.frames.size() : 1;
+    const int merge_factor = (mvc.downsample == 4) ? 2 : 4;   // patches per LLM token
+    feats.clear();
+    mcpm_blocks.clear();
+    mcpm_crop_tokens.clear();
+    mcpm_crop_no = 0;
+    mcpm_ncrops = 1;
+    int total = 0;
+    for (int f = 0; f < nframe; f++) {
+        minicpm::ImagePlan plan;
+        if (!minicpm::prepare_image(media.frames[f].rgb.data(), media.width, media.height, mvc,
+                                    /*allow_slices=*/!video, plan))
+            return false;
+        mcpm_ncrops = (video ? nframe : 1) * (int)plan.crops.size();
+        minicpm::BlockGeom geom;
+        geom.rows = plan.rows;
+        geom.cols = plan.cols;
+        std::vector<int> crop_tokens;
+        crop_tokens.reserve(plan.crops.size());
+        for (size_t ci = 0; ci < plan.crops.size(); ci++) {
+            std::vector<float> cf;
+            int n = 0;
+            if (!encode_crop_minicpm(plan.crops[ci], cf, &n)) return false;
+            crop_tokens.push_back(n);
+            feats.insert(feats.end(), cf.begin(), cf.end());
+            total += n;
+        }
+        geom.thumb_h = plan.crops[0].gh / merge_factor;
+        geom.thumb_w = plan.crops[0].gw / merge_factor;
+        if (plan.rows && plan.crops.size() > 1) {
+            geom.slice_h = plan.crops[1].gh / merge_factor;
+            geom.slice_w = plan.crops[1].gw / merge_factor;
+        }
+        mcpm_blocks.push_back(geom);
+        mcpm_crop_tokens.push_back(crop_tokens);
+        if (f == 0) { grid[0] = 1; grid[1] = geom.thumb_h; grid[2] = geom.thumb_w; }
+        if (!video)
+            fprintf(stderr, "minicpm image %dx%d: %zu crop%s, %dx%d/%dx%d grids\n",
+                    media.width, media.height, plan.crops.size(),
+                    plan.crops.size() == 1 ? "" : "s", geom.thumb_w, geom.thumb_h,
+                    geom.slice_w, geom.slice_h);
+    }
+    grid[0] = nframe;
+    *n_tokens = total;
     return true;
 }
 
@@ -1229,13 +1593,16 @@ bool Qwen3_5::build_text_graph(TextGraph & g, int T, int S, int n_img, int state
         return true;
     }
 
+    // MiniCPM-V 4.7 ships an untied lm_head (tie_word_embeddings=false); every
+    // other tenant ties the head to the token embedding.
+    ggml_tensor * head = m_out_head ? m_out_head : tok_embd;
     if (logits_all) {
-        g.logits = ggml_mul_mat(g.ctx, tok_embd, x);       // [vocab, T] speculative verify
+        g.logits = ggml_mul_mat(g.ctx, head, x);           // [vocab, T] speculative verify
     } else if (T > 1) {
         ggml_tensor * last = ggml_view_2d(g.ctx, x, D, 1, x->nb[1], (size_t)(T - 1) * x->nb[1]);
-        g.logits = ggml_mul_mat(g.ctx, tok_embd, last);    // tied lm head
+        g.logits = ggml_mul_mat(g.ctx, head, last);        // tied lm head
     } else {
-        g.logits = ggml_mul_mat(g.ctx, tok_embd, x);
+        g.logits = ggml_mul_mat(g.ctx, head, x);
     }
     ggml_set_name(g.logits, "logits");
     ggml_build_forward_expand(g.gf, g.logits);
@@ -1372,6 +1739,12 @@ bool Qwen3_5::run_text(TextGraph & g, const std::vector<int> & toks,
 }
 
 std::string Qwen3_5::render_prompt(int n_img_tokens, const std::string & user_text, bool video) const {
+    // MiniCPM-V: canvas markers (<image>/</image>) plus the per-image id tag, no
+    // <|vision_start|> wrapper (chat_template.jinja + replace_image_token)
+    if (minicpm) {
+        (void)n_img_tokens;   // the visual block comes from the encoded crops
+        return minicpm::wrap_prompt(mcpm_prompt(user_text, video), user_text);
+    }
     // chat_template.jinja: single vision block for the whole video, plain text
     // prompt after it (Qwen3_5's training format; timestamps live in the mrope
     // t-axis, not in the prompt text)
@@ -1387,6 +1760,48 @@ std::string Qwen3_5::render_prompt(int n_img_tokens, const std::string & user_te
     // non-thinking artifact, so generations start clean
     s += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     return s;
+}
+
+// Visual part of the prompt: for an image the id tag plus one block (thumbnail +
+// detail crops), for a video one block per frame with no id tag (the processor
+// only numbers images).
+std::string Qwen3_5::mcpm_prompt(const std::string & user_text, bool video) const {
+    (void)user_text;
+    std::string vis;
+    const char * pad = video ? "<|video_pad|>" : "<|image_pad|>";
+    for (size_t b = 0; b < mcpm_crop_tokens.size(); b++) {
+        const std::vector<int> & ct = mcpm_crop_tokens[b];
+        if (ct.empty()) continue;
+        if (!video && b == 0) vis += "<image_id>0</image_id>";   // image-only setting
+        minicpm::append_image_block(vis, ct.data(), (int)ct.size(), mcpm_blocks[b].rows,
+                                    mcpm_blocks[b].cols, pad, "<image>", "</image>",
+                                    "<slice>", "</slice>");
+    }
+    return vis;
+}
+
+// Canvas M-RoPE for MiniCPM-V 4.7 (see minicpm::canvas_mpos): image tokens sit on a
+// 2-D canvas instead of a 1-D run, so the three rope channels are not equal inside
+// the visual span. Also refreshes last_mpos / mrope_delta for the decode steps.
+bool Qwen3_5::mcpm_mpos(const std::vector<int> & ids, std::vector<int> & mpos) {
+    if (!minicpm::canvas_mpos(ids, mcpm_blocks, id_image_start, id_image_end,
+                              id_slice_start, id_slice_end, id_image_pad, id_video_pad, mpos))
+        return false;
+    const int T = (int)ids.size();
+    last_mpos = { mpos[(size_t)T - 1], mpos[(size_t)2 * T - 1], mpos[(size_t)3 * T - 1] };
+    const int mx = std::max({last_mpos[0], last_mpos[1], last_mpos[2]});
+    mrope_delta = (mx + 1) - T;
+    if (getenv("MINICPM_DUMP_MPOS")) {
+        // canvas M-RoPE rows for the oracle comparison (ref --pos-only)
+        fprintf(stderr, "minicpm mpos t:");
+        for (int i = 0; i < T; i++) fprintf(stderr, " %d", mpos[i]);
+        fprintf(stderr, "\nminicpm mpos h:");
+        for (int i = 0; i < T; i++) fprintf(stderr, " %d", mpos[(size_t)T + i]);
+        fprintf(stderr, "\nminicpm mpos w:");
+        for (int i = 0; i < T; i++) fprintf(stderr, " %d", mpos[(size_t)2 * T + i]);
+        fprintf(stderr, "\nminicpm mpos delta: %d\n", mrope_delta);
+    }
+    return true;
 }
 
 int Qwen3_5::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
@@ -1465,6 +1880,12 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     // final assistant turn keeps the non-thinking prefix from render_prompt
     const std::string text = gp.history + render_prompt(n_img, user_text, video_kind);
     const std::vector<int> ids = tok_.encode(text);
+    if (minicpm && getenv("MINICPM_DUMP_IDS")) {
+        // prompt id stream for the oracle comparison (scripts/ref_minicpmv47.py --ids-only)
+        fprintf(stderr, "minicpm ids:");
+        for (int id : ids) fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n");
+    }
     const int pad_id = video_kind ? id_video_pad : id_image_pad;
     std::vector<int> img_pos;
     for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == pad_id) img_pos.push_back(i);
@@ -1479,7 +1900,10 @@ bool Qwen3_5::ask(const vqa::MediaInput & media, const std::string & prompt,
     // counter advances by max(h, w)
     std::vector<int> mpos;
     mpos.reserve((size_t)4 * ids.size());
-    {
+    if (minicpm) {
+        // canvas M-RoPE: (t, h, w) laid out per the reference get_rope_index
+        if (!mcpm_mpos(ids, mpos)) return false;
+    } else {
         std::vector<int> axis[3];
         int cur = 0;
         for (size_t i = 0; i < ids.size();) {
