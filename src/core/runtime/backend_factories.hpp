@@ -12,6 +12,7 @@ namespace vqa {
 Model * create_moondream();
 Model * create_videochat3();
 Model * create_qwen3_5();
+Model * create_qwen3vl();
 Model * create_moss_vl();
 Model * create_videomae();
 Model * create_vjepa2();

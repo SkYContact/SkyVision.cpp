@@ -90,6 +90,11 @@ const ArchEntry kArchs[] = {
     // canvas tower + 16x window/MLP mergers instead of the Qwen3-VL ViT.
     { { "minicpmv47", "minicpm_v4_7", nullptr }, create_qwen3_5,
       TokenizerMode::Qwen2Regex, "models/MiniCPM-V-4.7-1B", 248094, false, false, "" },
+    // Qwen3-VL dense family (OneStreamer-4B = a Qwen3-VL-4B-Instruct SFT): its own
+    // backend - 36 dense layers, no q|gate, IMROPE 24/20/20 over the full
+    // head_dim, DeepStack (vision blocks 5/11/17 merged into text layers 0..2)
+    { { "qwen3vl", "qwen3_vl", nullptr }, create_qwen3vl,
+      TokenizerMode::Qwen2Regex, "models/OneStreamer-4B", 151936, false, false, "" },
     { { "moss_vl", nullptr }, create_moss_vl,
       TokenizerMode::Qwen2Regex, "models/Moss-VL-Realtime-q4k", 151936, false, false, "moss.html" },
     // SmolVLM (Idefics3): SigLIP tower + pixel-shuffle connector + SmolLM2 trunk

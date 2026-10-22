@@ -184,6 +184,12 @@ set(QWEN35_SRC
     src/models/qwen3_5/qwen3_5_preprocess.cpp
     src/models/qwen3_5/qwen3_5_model.cpp)
 
+#   src/models/qwen3vl/      Qwen3-VL backend (dense Qwen3-VL trunk + IMROPE +
+#                            DeepStack; OneStreamer-4B runs on it)
+set(QWEN3VL_SRC
+    src/models/qwen3vl/qwen3vl_preprocess.cpp
+    src/models/qwen3vl/qwen3vl_model.cpp)
+
 #   src/models/moss_vl/      MOSS-VL-Realtime backend (cross-attention text decoder)
 set(MOSS_VL_SRC
     src/models/moss_vl/moss_vl_preprocess.cpp
@@ -238,6 +244,7 @@ add_executable(vqa-cli
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC}
     ${QWEN35_SRC}
+    ${QWEN3VL_SRC}
     ${MOSS_VL_SRC}
     ${VIDEOMAE_SRC}
     ${VJEPA2_SRC}

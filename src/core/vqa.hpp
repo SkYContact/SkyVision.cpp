@@ -182,6 +182,10 @@ public:
     }
     virtual std::string format_system(const std::string & sys) const { (void)sys; return std::string(); }
     virtual const char * silence_piece() const { return ""; }
+    // Default realtime-narration system prompt for this architecture. The
+    // protocol it describes (three-state markers, or <|silence|>) is model
+    // specific, so the backend owns the text; "" = let the front end decide.
+    virtual const char * realtime_system_prompt() const { return ""; }
 };
 
 // Backend factories (one per architecture) live in backend_factories.hpp,

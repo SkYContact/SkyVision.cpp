@@ -340,10 +340,14 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
         {
             std::lock_guard<std::mutex> lk(g_mu);
             vqa::Model * m = g_reg.loaded();
-            if (m && s->use_sys_prompt)
-                // the chat template belongs to the backend, not this protocol
-                // layer — asking the model keeps front ends template-agnostic
-                gp.history = m->format_system(RT_SYSTEM_PROMPT);
+            if (m && s->use_sys_prompt) {
+                // the chat template AND the protocol prompt belong to the
+                // backend, not this protocol layer — asking the model keeps front
+                // ends template-agnostic (RT_SYSTEM_PROMPT is only the fallback
+                // for backends that do not declare one)
+                const char * sys = m->realtime_system_prompt();
+                gp.history = m->format_system((sys && sys[0]) ? sys : RT_SYSTEM_PROMPT);
+            }
             if (m) s->silence_tok = m->silence_piece();
             if (!m || g_reg.loaded_id() != model_id) {
                 s->push_event("{\"error\":\"model no longer loaded\"}\n");
@@ -354,8 +358,11 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
                 continue;
             }
         }
-        s->push_event(out.empty() ? "{\"event\":\"silence\"}\n"
-                                  : "{\"event\":\"turn_end\"}\n");
+        // the three-state protocol answers with a bare control token when it has
+        // nothing to report (</Silence> / </Standby>), so those count as silence
+        const bool no_answer = out.empty() || out == s->silence_tok || out == "</Standby>";
+        s->push_event(no_answer ? "{\"event\":\"silence\"}\n"
+                                : "{\"event\":\"turn_end\"}\n");
     }
 }
 
@@ -706,6 +713,14 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                 send_json(c, "{\"ok\":true}"); return true;
             }
             if (realtime) {
+                // ?sys=1 seeds the model's own streaming protocol prompt (the
+                // three-state markers / <|silence|>); off by default so plain
+                // question-answering sessions stay unaffected
+                if (query_param(req.query, "sys") == "1" && g_reg.loaded()) {
+                    vqa::Model * m = g_reg.loaded();
+                    const char * sysp = m->realtime_system_prompt();
+                    gp.history = m->format_system((sysp && sysp[0]) ? sysp : RT_SYSTEM_PROMPT);
+                }
                 // the engine keeps ONE live session; a fresh HTTP session name
                 // must reset it, otherwise turn 1 splices onto a stranger's KV
                 static std::set<std::string> rt_sessions;

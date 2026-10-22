@@ -90,6 +90,8 @@ public:
         return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
              + assistant + "<|im_end|>\n";
     }
+    // the real_time_generate narration prompt (its own protocol: <|silence|>)
+    const char * realtime_system_prompt() const override;
 
     // tunables, set before load()
     int n_ctx = 8192;
@@ -1133,6 +1135,20 @@ bool VideoChat3::run_text(TextGraph & g, const std::vector<int> & toks, const st
     g.ctx = nullptr;
     return true;
 }
+
+// the official real_time_generate system prompt: makes the model narrate what
+// the camera sees and stay silent (<|silence|>) when nothing relevant happens
+static const char VC3_RT_SYSTEM[] =
+    "You are a helpful AI assistant. You perceive and understand the surrounding environment in real-time "
+    "through the camera and interact with the user. Whether or not the user actively asks questions, you "
+    "continuously observe and analyze visual information, maintaining awareness of the environment.\n\n"
+    "- Continuous Perception: Always observe and analyze the visual information captured by the camera.\n"
+    "- Observation-Based Answers: All answers must be based on visual observations, including historical "
+    "and real-time data.\n"
+    "- If you notice significant changes, promptly update your answers; when you cannot answer or have "
+    "finished, output <|silence|>.";
+
+const char * VideoChat3::realtime_system_prompt() const { return VC3_RT_SYSTEM; }
 
 std::string VideoChat3::render_prompt(int n_img_tokens, const std::string & user_text, bool video,
                                        const std::vector<std::pair<float,int>> * clip_marks) const {
