@@ -413,11 +413,18 @@ bool Qwen3_5::load_weights(const char * path) {
     // no rope (learned position table addressed by nearest bucket ids), a window
     // merger inserted after vision layer `insert_layer`, and a projection MLP.
     // The tower's own sizes come from the shared marlin.vision.* keys.
-    // Probe the window merger, not v.pos_emb.weight: every qwen3_5 checkpoint
-    // carries v.pos_emb.weight (the VideoJev SigLIP tower too), and probing it
-    // misroutes VideoJev into the minicpm loader, which then fails on the
-    // missing vm.* tensors.
-    minicpm = ggml_get_tensor(wctx, "vm.norm1.weight") != nullptr;
+    // Dispatch on the GGUF's own architecture field - minicpmv47 has its own
+    // arch name in the registry, so no guessing can collide. Tensor probing for
+    // this split is fragile: v.pos_emb.weight is carried by every qwen3_5
+    // checkpoint (the VideoJev / Marlin / Qwen3.5 SigLIP towers all have it),
+    // and each future qwen3_5-trunk model would add another colliding
+    // signature. vm.norm1.weight stays only as the fallback for checkpoints
+    // written with no arch field at all.
+    {
+        const std::string gguf_arch = vqa::gguf::str(gu, "general.architecture");
+        minicpm = gguf_arch == "minicpmv47" || gguf_arch == "minicpm_v4_7" ||
+                  (gguf_arch.empty() && ggml_get_tensor(wctx, "vm.norm1.weight") != nullptr);
+    }
     if (minicpm) {
         mvc.n_embd  = vc.n_embd;
         mvc.n_head  = vc.n_head;
