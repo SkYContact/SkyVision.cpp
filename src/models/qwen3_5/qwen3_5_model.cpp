@@ -413,7 +413,11 @@ bool Qwen3_5::load_weights(const char * path) {
     // no rope (learned position table addressed by nearest bucket ids), a window
     // merger inserted after vision layer `insert_layer`, and a projection MLP.
     // The tower's own sizes come from the shared marlin.vision.* keys.
-    minicpm = ggml_get_tensor(wctx, "v.pos_emb.weight") != nullptr;
+    // Probe the window merger, not v.pos_emb.weight: every qwen3_5 checkpoint
+    // carries v.pos_emb.weight (the VideoJev SigLIP tower too), and probing it
+    // misroutes VideoJev into the minicpm loader, which then fails on the
+    // missing vm.* tensors.
+    minicpm = ggml_get_tensor(wctx, "vm.norm1.weight") != nullptr;
     if (minicpm) {
         mvc.n_embd  = vc.n_embd;
         mvc.n_head  = vc.n_head;
