@@ -154,5 +154,106 @@ inline void snapshot_to_f32_host(ggml_tensor * t, std::vector<float> & out) {
     gguf::tensor_to_f32(t, out.data());
 }
 
+// ---------------------------------------------------------------------------
+// (5) split bind for MoE models (Strata-style two-tier placement).
+//
+// In a MoE the routed expert FFN weights are the bulk of the checkpoint but
+// each token touches only n_expert_used of them (8/128 for Keye, 8/64 for
+// moondream), so they can stay in host memory (zero-copy mmap, computed by
+// the CPU backend) while everything else - attention, norms, embeddings, the
+// vision tower - is uploaded to the GPU. This lets a 19 GB 30B-A3B checkpoint
+// run on a 12 GB card: GPU keeps ~3 GB of dense weights + KV + compute, the
+// experts stream from RAM at ~1 GB per decoded token of traffic.
+//
+// The node assignment itself is done by ggml_backend_sched with op_offload:
+// mul_mats whose src0 lives in a host buffer run on the CPU backend, the rest
+// on the device, with automatic activation copies at the split points.
+
+// default predicate: the engine's expert weight naming conventions
+// (llama.cpp "ffn_*_exps", moondream's "moe_*_w"). VQA_GPULAYERS=N moves the
+// first N layers' experts to the device as well (layer-granular expert
+// caching: fewer host↔device split points, faster decode at the cost of VRAM).
+inline bool moe_expert_pred(const char * name) {
+    if (strstr(name, "_exps") == nullptr && strstr(name, "moe_up_w") == nullptr &&
+        strstr(name, "moe_down_w") == nullptr) return false;
+    if (const char * gl = getenv("VQA_GPULAYERS")) {
+        int n = atoi(gl);
+        int layer = -1;
+        if (const char * b = strstr(name, "blk.")) layer = atoi(b + 4);
+        if (const char * b = strstr(name, ".blk.")) layer = atoi(b + 5);
+        if (layer >= 0 && layer < n) return false;   // this layer's experts go on the device
+    }
+    return true;
+}
+
+struct SplitBound {
+    ggml_backend_buffer_t dev_buf = nullptr;    // device weights (owned, free it)
+    ggml_backend_buffer_t host_buf = nullptr;   // mmap wrap for host tensors (from_ptr)
+    std::vector<ggml_tensor *> host_tensors;    // tensors kept in host memory
+    bool ok = false;
+};
+
+// Split placement for one no_alloc weight context: predicate(name) == true
+// keeps the tensor in host memory (mmap), everything else is allocated on
+// `dev` and uploaded. `hosts` carries promoted host f32 blocks the same way
+// bind_to_backend does (CPU side only).
+inline SplitBound split_bind_to_backends(ggml_context * wctx, ggml_backend_t dev,
+                                         const MMap & mm,
+                                         bool (*keep_on_host)(const char *) = moe_expert_pred,
+                                         const std::vector<HostBlock> & hosts = {}) {
+    SplitBound out;
+    std::vector<std::pair<ggml_tensor *, const void *>> uploads;   // device uploads
+    std::vector<ggml_tensor *> dev_tensors;
+    size_t dev_total = 0, host_total = 0;
+    const char * keep_env = getenv("VQA_SPLIT_KEEP");              // force everything host
+    const bool all_host = keep_env && !strcmp(keep_env, "all");
+    for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t)) {
+        if ((keep_on_host && keep_on_host(t->name)) || all_host) {
+            t->buffer = nullptr;
+            out.host_tensors.push_back(t);
+            host_total += ggml_nbytes(t);
+        } else {
+            uploads.push_back({t, t->data});
+            dev_tensors.push_back(t);
+            dev_total += ggml_nbytes(t);
+        }
+    }
+    if (dev_tensors.empty()) { out.ok = true; return out; }
+
+    // host side: wrap the mmap so the CPU backend can compute on it in place
+    out.host_buf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
+    if (!out.host_buf) { fprintf(stderr, "split: host buffer failed\n"); return out; }
+    for (ggml_tensor * t : out.host_tensors) {
+        t->buffer = out.host_buf;
+        // promoted f32 blocks live in their own host allocations
+        const char * p = (const char *) t->data;
+        for (const HostBlock & h : hosts) {
+            if (!h.data || h.size == 0) continue;
+            if (p >= (const char *) h.data && p < (const char *) h.data + h.size) {
+                // best effort: wrap the block too (rare path - experts are
+                // quantized 2D/3D, never promoted)
+                ggml_backend_buffer_t b = ggml_backend_cpu_buffer_from_ptr((void *) h.data, h.size);
+                if (b) t->buffer = b;
+                break;
+            }
+        }
+    }
+
+    // device side: allocate just the dev subset and upload
+    for (auto & u : uploads) u.first->data = nullptr;
+    out.dev_buf = ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(dev),
+                                                   dev_tensors.data(), (int) dev_tensors.size());
+    if (!out.dev_buf) {
+        fprintf(stderr, "split: device allocation failed (need %.2f GB)\n", dev_total / 1e9);
+        return out;
+    }
+    for (auto & u : uploads)
+        ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
+    fprintf(stderr, "split weights: %.2f GB on %s, %.2f GB experts in host mmap (%zu tensors)\n",
+            dev_total / 1e9, ggml_backend_name(dev), host_total / 1e9, out.host_tensors.size());
+    out.ok = true;
+    return out;
+}
+
 }  // namespace weights
 }  // namespace vqa
