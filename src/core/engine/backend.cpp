@@ -98,6 +98,24 @@ ggml_backend_t init_backend(bool use_gpu, int & n_threads) {
         return nullptr;
     }
     if (n_threads <= 0) n_threads = default_n_threads();
+    // VQA_POLL=<0-100> (polling level): worker threads spin-wait for work
+    // instead of sleeping. Without it every op pays a wake-the-threads sync
+    // (~0.5-1 ms on Windows), which on decode-sized ops costs ~10x - measured:
+    // a 2048x4096 Q4_K GEMV runs 1.0 ms -> 0.087 ms with poll=100. The trade
+    // is idle CPU burn while the model sits between steps, so it stays opt-in.
+    static ggml_threadpool_t poll_pool = nullptr;   // backend keeps the pointer
+    const char * poll_env = getenv("VQA_POLL");
+    if (poll_env && atoi(poll_env) > 0) {
+        struct ggml_threadpool_params tp = ggml_threadpool_params_default(n_threads);
+        tp.poll = (uint32_t) atoi(poll_env);
+        poll_pool = ggml_threadpool_new(&tp);
+        if (poll_pool) {
+            ggml_backend_cpu_set_threadpool(backend, poll_pool);
+            fprintf(stderr, "backend: %s (%d threads, poll=%s)\n",
+                    ggml_backend_name(backend), n_threads, poll_env);
+            return backend;
+        }
+    }
     ggml_backend_cpu_set_n_threads(backend, n_threads);
     fprintf(stderr, "backend: %s (%d threads)\n", ggml_backend_name(backend), n_threads);
     return backend;
