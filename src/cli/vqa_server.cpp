@@ -14,6 +14,7 @@
 #include "core/util/mmap.hpp"
 #include "core/media/media_io.hpp"
 #include "core/runtime/model_registry.hpp"
+#include "core/runtime/vqa_spec.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -480,6 +481,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
     using namespace vqa::http;
     // --- API ---
     if (req.method == "GET" && req.path == "/api/models") { send_json(c, models_json()); return true; }
+    if (req.method == "GET" && req.path == "/api/specs") { send_json(c, vqa::specs_to_json()); return true; }
 
     if (req.path.rfind("/api/model/", 0) == 0) {
         std::string rest = req.path.substr(11);

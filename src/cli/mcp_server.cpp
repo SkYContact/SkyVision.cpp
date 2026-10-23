@@ -19,6 +19,7 @@
 #include "core/text/json.hpp"
 #include "core/media/media_io.hpp"
 #include "core/runtime/model_registry.hpp"
+#include "core/runtime/vqa_spec.hpp"
 
 #include <cctype>
 #include <cstdarg>
@@ -290,6 +291,28 @@ bool has_skill(const vqa::Capabilities & c, const char * skill) {
     return c.image;
 }
 
+// static per-arch capability spec (vqa_spec.hpp): the "what could this model
+// do with the right weights present" answer, as opposed to caps_json's
+// "what did the loaded weights actually provide".
+vqa::json::Value spec_json(const std::string & arch) {
+    auto o = vqa::json::Value::make_object();
+    const vqa::ArchSpec * s = vqa::spec_of(arch);
+    auto arr = [](const std::vector<std::string> & v) {
+        auto a = vqa::json::Value::make_array();
+        for (const auto & x : v) a.push(vqa::json::Value::make_string(x));
+        return a;
+    };
+    if (!s) return o;
+    std::vector<std::string> tasks, modes;
+    for (vqa::Task t : s->tasks) tasks.push_back(vqa::task_name(t));
+    for (vqa::Mode m : s->modes) modes.push_back(vqa::mode_name(m));
+    o.set("tasks", arr(tasks));
+    o.set("modes", arr(modes));
+    o.set("inputs", arr(s->inputs));
+    if (!s->note.empty()) o.set("note", vqa::json::Value::make_string(s->note));
+    return o;
+}
+
 vqa::json::Value caps_json(const vqa::ModelEntry & e, const vqa::Capabilities & c) {
     auto o = vqa::json::Value::make_object();
     o.set("image", vqa::json::Value::make_bool(c.image));
@@ -365,6 +388,7 @@ bool tool_list_models(const vqa::json::Value & a, std::string & out, std::string
         o.set("size_bytes", vqa::json::Value::make_number((double)e.size));
         o.set("path", vqa::json::Value::make_string(e.path));
         o.set("loaded", vqa::json::Value::make_bool(e.id == g_reg.loaded_id()));
+        o.set("spec", spec_json(e.arch));
         arr.push(std::move(o));
     }
     auto root = vqa::json::Value::make_object();

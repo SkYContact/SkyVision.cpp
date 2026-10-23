@@ -14,6 +14,7 @@
 #include "core/text/json.hpp"
 #include "core/media/media_io.hpp"
 #include "core/runtime/model_registry.hpp"
+#include "core/runtime/vqa_spec.hpp"
 #include "core/text/tokenizer.hpp"
 #include "core/util/mmap.hpp"
 
@@ -49,6 +50,7 @@ void usage() {
         "               [--threshold T]         grounding probability threshold (default: model)\n"
         "               --serve [port]          Web UI (default 8899)\n"
         "               --mcp                   MCP server on stdio (agent tools: see README)\n"
+        "               --specs                 print the capability spec table (JSON), then exit\n"
         "\n"
         "options:\n"
         "  --max-tokens N   max new tokens (default 256)\n"
@@ -128,6 +130,7 @@ int main(int argc, char ** argv) {
         else if (a == "--host") serve_host = next("--host");
         else if (a == "--models-dir") models_dir = next("--models-dir");
         else if (a == "--mcp") mcp_mode = true;
+        else if (a == "--specs") { printf("%s\n", vqa::specs_to_json().c_str()); return 0; }
         else if (a == "--batch") batch_path = next("--batch");
         else if (a == "--ask" || a == "-p") ask_text = next("--ask");
         else if (a == "--mode") mode = next("--mode");

@@ -161,6 +161,7 @@ set(VQA_CORE_SRC
     src/core/text/json_scan.cpp
     src/core/text/tokenizer.cpp
     src/core/runtime/vqa_registry.cpp
+    src/core/runtime/vqa_spec.cpp
     src/core/runtime/model_registry.cpp
     src/core/runtime/vram_guard.cpp
     src/core/media/media_io.cpp
