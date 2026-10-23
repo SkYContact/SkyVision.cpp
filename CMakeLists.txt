@@ -235,11 +235,19 @@ set(EMBG2_SRC
 set(SIGLIP_SRC
     src/models/siglip/siglip_model.cpp)
 
+#   src/models/keye_vl/      Kwai Keye-VL-2.0-30B-A3B (Qwen3 MoE trunk + DSA
+#                            sparse attention + SigLIP tower with merge projector)
+set(KEYE_VL_SRC
+    src/models/keye_vl/keye_vl_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
     src/cli/vqa_server.cpp
     src/cli/mcp_server.cpp
+    src/core/engine/expert_cache.cpp
+    src/core/engine/moe_compute.cpp
+    src/core/engine/step_graph.cpp
     ${VQA_CORE_SRC}
     ${MOONDREAM_SRC}
     ${VIDEOCHAT3_SRC}
@@ -253,8 +261,16 @@ add_executable(vqa-cli
     ${MAGE_VL_SRC}
     ${QWEN25OMNI_SRC}
     ${EMBG2_SRC}
-    ${SIGLIP_SRC})
+    ${SIGLIP_SRC}
+    ${KEYE_VL_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
+# expert_cache.cpp (CUDA async prefetch) includes cuda_runtime.h and calls the
+# CUDA runtime directly, so vqa-cli needs the toolkit headers/libs too
+if (TARGET ggml-cuda)
+    find_package(CUDAToolkit QUIET)
+    target_include_directories(vqa-cli PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(vqa-cli PRIVATE CUDA::cudart)
+endif()
 target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC})
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)

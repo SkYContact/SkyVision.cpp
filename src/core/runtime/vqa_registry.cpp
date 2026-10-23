@@ -126,6 +126,11 @@ const ArchEntry kArchs[] = {
     // SigLIP image tower: pooled embedding (get_image_features) / classifier
     { { "siglip", nullptr }, create_siglip,
       TokenizerMode::Qwen2Regex, "models/siglip-base", 0, false, true, "" },
+    // Kwai Keye-VL-2.0-30B-A3B: Qwen3 MoE trunk + DSA sparse attention +
+    // SigLIP tower; the mmproj gguf sits next to the main gguf (CPU by
+    // default - the 19 GB Q4 checkpoint does not fit a 12 GB GPU)
+    { { "keye-vl2", "keye_vl2", nullptr }, create_keye_vl,
+      TokenizerMode::Qwen2Regex, "models/keye-vl2", 151936, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {
