@@ -60,7 +60,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 // step_graph.cpp: the cgraph under construction during StepGraph::build(),
@@ -1045,6 +1047,90 @@ bool KeyeVL2::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logi
     return true;
 }
 
+// KEYE_PROFILE=1: per-op decode timing. A single-backend sched with an eval
+// callback that always splits re-executes the graph one node at a time (the
+// sched splits via internal graph views), timing each op as it goes. This is
+// many times slower than one whole-graph compute and the per-node dispatch
+// overhead inflates small ops, so read it for ratios, not absolutes.
+namespace keye_profile {
+std::map<std::string, double> ms_by_op;
+double ms_all = 0.0, ms_mmid = 0.0;
+std::chrono::steady_clock::time_point last;
+bool started = false;
+long calls = 0;
+
+// split only at the ops that plausibly dominate a MoE decode step; everything
+// between two splits is one segment attributed to the closing op. Splitting
+// per node would measure only the sched's per-split dispatch overhead
+// (~4400 nodes/step -> every op looked like ~20 ms of nothing).
+bool is_split_op(ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_GLU:
+        case GGML_OP_ROPE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool cb(ggml_tensor * t, bool ask, void *) {
+    if (ask) {
+        if (!started) { last = std::chrono::steady_clock::now(); started = true; }
+        return is_split_op(t);
+    }
+    double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - last).count();
+    last = std::chrono::steady_clock::now();
+    ms_all += ms;
+    if (t->op == GGML_OP_MUL_MAT_ID) ms_mmid += ms;
+    ms_by_op[ggml_op_name(t->op)] += ms;
+    return true;
+}
+}  // namespace keye_profile
+
+static bool profiled_text_compute(ggml_backend_t backend, ggml_cgraph * gf) {
+    static const bool on = getenv("KEYE_PROFILE") != nullptr;
+    static const bool timed = getenv("KEYE_TIME") != nullptr;
+    if (!on) {
+        auto t0 = std::chrono::steady_clock::now();
+        enum ggml_status ec = ggml_backend_graph_compute(backend, gf);
+        if (timed)
+            fprintf(stderr, "keye-time: %.1f ms/step\n",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+        return ec == GGML_STATUS_SUCCESS;
+    }
+
+    using namespace keye_profile;
+    ggml_backend_sched_t sched =
+        ggml_backend_sched_new(&backend, nullptr, 1, (size_t)ggml_graph_n_nodes(gf),
+                               /*parallel*/ false, /*op_offload*/ false);
+    if (!sched) return false;
+    ggml_backend_sched_set_eval_callback(sched, cb, nullptr);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) { ggml_backend_sched_free(sched); return false; }
+    enum ggml_status ec = ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_free(sched);
+    if (ec != GGML_STATUS_SUCCESS) return false;
+
+    calls++;
+    fprintf(stderr, "keye-profile[call %ld]: nodes %d, whole-graph equivalent %.1f ms, mul_mat_id %.1f ms\n",
+            calls, ggml_graph_n_nodes(gf), ms_all, ms_mmid);
+    if (calls % 8 == 0) {
+        std::vector<std::pair<double, std::string>> ranked;
+        double sum = 0;
+        for (const auto & kv : ms_by_op) { ranked.emplace_back(kv.second, kv.first); sum += kv.second; }
+        std::sort(ranked.rbegin(), ranked.rend());
+        fprintf(stderr, "keye-profile cumulative after %ld calls (%.0f ms total):\n", calls, sum);
+        for (const auto & r : ranked)
+            fprintf(stderr, "  %-12s %9.1f ms  %5.1f%%\n", r.second.c_str(), r.first, 100.0 * r.first / sum);
+    }
+    return true;
+}
+
 bool KeyeVL2::run_text(TextGraph & g, const std::vector<int> & toks,
                        const std::vector<int> & pos4, const std::vector<float> * img_feats,
                        const std::vector<int> * img_pos, std::vector<float> & logits,
@@ -1074,7 +1160,7 @@ bool KeyeVL2::run_text(TextGraph & g, const std::vector<int> & toks,
             fprintf(stderr, "text compute failed (split)\n");
             return false;
         }
-    } else if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
+    } else if (!profiled_text_compute(backend, g.gf)) {
         fprintf(stderr, "text compute failed\n");
         return false;
     }
