@@ -16,6 +16,32 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 
 ## 支持的后端
 
+按 GGUF 架构标签 10 秒选型（此矩阵由 capability spec 表生成——`vqa-cli --specs` /
+`GET /api/specs` 是同一份 JSON，README 内嵌块用 `scripts/gen_backend_table.py` 重新生成，勿手改）；
+各后端的详细结构说明见下方人工维护的表格：
+
+<!-- AUTO-GENERATED capability matrix - scripts/gen_backend_table.py, do not edit by hand -->
+| 架构标签 | 别名 | 输入 | 任务 | 流式 | 标记 |
+|---|---|---|---|---|---|
+| `moondream3` | `moondream` | 图像 + 文本 | ask caption detect point gaze | — | 需 `*-vision.gguf` |
+| `videochat3` | — | 图像 + 视频 + 文本 | ask | — | — |
+| `qwen3_5` | — | 图像 + 视频 + 文本 | ask caption | — | — |
+| `marlin` | — | 图像 + 视频 + 文本 | ask caption | — | — |
+| `videojev` | — | 视频 + 文本 | score | — | — |
+| `minicpmv47` | `minicpm_v4_7` | 图像 + 视频 + 文本 | ask | — | — |
+| `qwen3vl` | `qwen3_vl` | 图像 + 视频 + 文本 | ask | ✅ | — |
+| `moss_vl` | — | 图像 + 视频 + 文本 | ask | ✅ | — |
+| `smolvlm` | `idefics3` | 图像 + 文本 | ask | — | — |
+| `qwen2vl` | `qwen2_5_vl` | 图像 + 文本 | ask | — | — |
+| `videomae` | `vivit` | 图像 + 视频 | classify embed | — | 纯视觉 |
+| `vjepa2` | `vjepa` | 图像 + 视频 | classify embed | — | 纯视觉 |
+| `mage_vl` | — | 图像 + 视频 + 文本 | ask gate | ✅ | — |
+| `qwen25omni` | `qwen2_5_omni` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
+| `embgemma2` | — | 图像 + 视频 + 音频 + 文本 | embed | — | — |
+| `siglip` | — | 图像 | classify embed | — | 纯视觉 |
+| `keye-vl2` | `keye_vl2` | 图像 + 视频 + 文本 | ask | — | — |
+<!-- /AUTO-GENERATED capability matrix -->
+
 | 后端 | 架构标签 | 输入 | 说明 |
 |---|---|---|---|
 | **moondream3.1-9B-A2B** | `moondream3` | 图像 | MoE 文本 + SigLIP 视觉塔；五个官方技能（caption / query / detect / point / gaze）、Web UI、批量推理 |
