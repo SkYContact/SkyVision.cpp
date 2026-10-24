@@ -1,0 +1,312 @@
+name: cpu-regression
+
+# Layered CPU regression for the vqa-cli engine.
+#
+#   L0 (this file's `l0-smoke` job) - always-on smoke, PR / push / daily:
+#     1. CPU-only build of vqa-cli (ggml cloned separately - it is gitignored)
+#     2. `vqa-cli --specs` must emit a non-empty JSON spec table with the full
+#        expected arch set (content-checked, not just exit code)
+#     3. real SmolVLM-256M q8 weights are downloaded from HF (a failed download
+#        FAILS the job - curl -f, no `|| true`, no skip) and verified (GGUF
+#        magic + minimum size)
+#     4. one real `--ask` on a generated red-circle PNG; the answer must name
+#        both the color and the shape
+#
+#   L1 (`l1-parity` job) - manual only (workflow_dispatch): torch-oracle
+#     numeric parity via scripts/parity_*.py. Heavy HF downloads, never in the
+#     PR path.
+#
+# Verified locally (win32 Git Bash, CPU-only build) before landing; the exact
+# q8 GGUF from SkyContact/SmolVLM-256M-GGUF answers "red circle" for the same
+# generated image.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'convert/**'
+      - 'scripts/parity_*.py'
+      - '.github/workflows/cpu-regression.yml'
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'convert/**'
+      - 'scripts/parity_*.py'
+      - '.github/workflows/cpu-regression.yml'
+  schedule:
+    - cron: '0 18 * * *'   # daily 18:00 UTC catch-all (catches ggml master drift)
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'L1 parity suite to run (l1-parity job)'
+        type: choice
+        default: 'layer0'
+        options: ['layer0', 'vc3_e2e', 'videojev', 'all']
+
+permissions:
+  contents: read
+
+env:
+  # same pinned source the Dockerfile clones (master of ggml org)
+  GGML_REF: master
+  HF_BASE: https://huggingface.co
+  SMOLVLM_REPO: SkyContact/SmolVLM-256M-GGUF
+  SMOLVLM_FILE: smolvlm-256m-q8_0.gguf
+
+jobs:
+  # ---------------------------------------------------------------- L0
+  l0-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ ccache ca-certificates
+
+      # ggml/ and vendor/libjpeg-turbo/ are gitignored (see README): clone them
+      # like the Dockerfile does. libjpeg is optional (stb_image fallback), so
+      # L0 skips it; the smoke image is PNG.
+      - name: Clone ggml
+        run: |
+          git clone --depth 1 --branch "$GGML_REF" https://github.com/ggml-org/ggml ggml
+          rm -rf ggml/.git
+
+      - name: Build vqa-cli (CPU only)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+          cmake --build build --target vqa-cli
+          test -x build/vqa-cli
+
+      # content assertion: parse the JSON, not just the exit code
+      - name: Capability spec table must be complete
+        run: |
+          build/vqa-cli --specs > specs.json 2> specs.err
+          python3 - <<'PY'
+          import json
+          specs = json.load(open('specs.json'))
+          assert isinstance(specs, list) and specs, 'specs must be a non-empty JSON list'
+          archs = [s['arch'] for s in specs]
+          # expected set as of master 922e987 (capability spec layer commit
+          # 7bcb86 + later additions: the table has 17 archs, not 14)
+          expected = {
+              'embgemma2', 'keye-vl2', 'mage_vl', 'marlin', 'minicpmv47',
+              'moondream3', 'moss_vl', 'qwen25omni', 'qwen2vl', 'qwen3_5',
+              'qwen3vl', 'siglip', 'smolvlm', 'videochat3', 'videojev',
+              'videomae', 'vjepa2',
+          }
+          got = set(archs)
+          assert len(archs) == len(got), f'duplicate arch entries: {archs}'
+          assert got == expected, f'arch set mismatch\nmissing: {sorted(expected - got)}\nextra: {sorted(got - expected)}'
+          for s in specs:
+              assert s.get('arch') and s.get('tasks'), f'incomplete spec entry: {s}'
+          print(f'spec table OK: {len(specs)} archs')
+          PY
+
+      # weights: cache them, but a cache miss must download or FAIL (never skip)
+      - name: SmolVLM weights cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/skyvision-weights
+          key: smolvlm-256m-q8_0-v1
+      - name: Download SmolVLM-256M q8 weights
+        run: |
+          mkdir -p ~/.cache/skyvision-weights/tok
+          f=~/.cache/skyvision-weights/$SMOLVLM_FILE
+          if [ ! -s "$f" ]; then
+            echo "cache miss: downloading $SMOLVLM_FILE from $SMOLVLM_REPO"
+            curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 \
+              -o "$f" "$HF_BASE/$SMOLVLM_REPO/resolve/main/$SMOLVLM_FILE"
+          fi
+          # verify content: GGUF magic + a plausible size (~400 MB)
+          test "$(head -c 4 "$f")" = "GGUF" || { echo "not a GGUF file"; exit 1; }
+          sz=$(stat -c %s "$f")
+          test "$sz" -ge 200000000 || { echo "weights too small: $sz bytes"; exit 1; }
+          ls -l "$f"
+          if [ ! -s ~/.cache/skyvision-weights/tok/tokenizer.json ]; then
+            curl -fSL --retry 3 -o ~/.cache/skyvision-weights/tok/tokenizer.json \
+              "$HF_BASE/$SMOLVLM_REPO/resolve/main/tokenizer.json"
+          fi
+          test -s ~/.cache/skyvision-weights/tok/tokenizer.json
+
+      # no binary assets in the repo: build the test picture with the stdlib
+      # (320x240 white canvas, filled red circle - same generator verified
+      # locally, where SmolVLM-256M q8 answers "The image depicts a red circle.")
+      - name: Generate test image
+        run: |
+          python3 - <<'PY'
+          import struct, zlib
+          w, h = 320, 240
+          cx, cy, r = w // 2, h // 2, 90
+          raw = bytearray()
+          for y in range(h):
+              raw.append(0)  # PNG filter: none
+              for x in range(w):
+                  inside = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+                  raw += bytes((220, 30, 30)) if inside else bytes((255, 255, 255))
+          def chunk(tag, data):
+              return (struct.pack('>I', len(data)) + tag + data +
+                      struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+          png = (b'\x89PNG\r\n\x1a\n' +
+                 chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+                 chunk(b'IDAT', zlib.compress(bytes(raw), 9)) +
+                 chunk(b'IEND', b''))
+          open('smoke_circle.png', 'wb').write(png)
+          print('wrote', len(png), 'bytes')
+          PY
+
+      - name: Real ask on CPU (SmolVLM)
+        run: |
+          build/vqa-cli \
+            --model ~/.cache/skyvision-weights/$SMOLVLM_FILE \
+            --tokenizer ~/.cache/skyvision-weights/tok \
+            --image smoke_circle.png \
+            --ask "What shape and color is in this image?" \
+            --cpu --max-tokens 64 --quiet \
+            > ask.out 2> ask.err
+          echo '--- stderr (model load + perf)'; tail -5 ask.err
+          python3 - <<'PY'
+          import sys
+          text = open('ask.out').read().strip()
+          assert text, 'empty answer'
+          low = text.lower()
+          # the generated image is unambiguous: a red circle on white. greedy
+          # decode must name both the color and the shape.
+          assert 'red' in low, f'answer does not name the color: {text!r}'
+          assert 'circle' in low, f'answer does not name the shape: {text!r}'
+          tokens = len(text.split())
+          assert tokens > 0, 'zero-token answer'
+          print(f'answer OK ({tokens} words): {text[:160]}')
+          PY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l0-smoke-logs
+          path: |
+            specs.json
+            specs.err
+            ask.out
+            ask.err
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- L1
+  # manual only: torch-oracle numeric parity. These pull multi-GB original
+  # checkpoints from HF (moondream3.1 safetensors alone is ~19 GB) and a CPU
+  # torch install, so they are never part of the PR path.
+  l1-parity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain + torch (CPU)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ ccache ca-certificates python3-pip
+          pip3 install --break-system-packages \
+            --index-url https://download.pytorch.org/whl/cpu torch
+          pip3 install --break-system-packages transformers safetensors huggingface_hub numpy pillow
+
+      - name: Build vqa-cli (CPU only)
+        run: |
+          git clone --depth 1 --branch "$GGML_REF" https://github.com/ggml-org/ggml ggml
+          rm -rf ggml/.git
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=OFF -DGGML_CUDA=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF -DGGML_OPENMP=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+          cmake --build build --target vqa-cli
+
+      - name: Generate test media
+        run: |
+          # same red-circle generator as L0, plus a 4-frame "video" directory
+          python3 - <<'PY'
+          import struct, zlib, os
+          w, h = 320, 240
+          cx, cy, r = w // 2, h // 2, 90
+          raw = bytearray()
+          for y in range(h):
+              raw.append(0)
+              for x in range(w):
+                  inside = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+                  raw += bytes((220, 30, 30)) if inside else bytes((255, 255, 255))
+          def chunk(tag, data):
+              return (struct.pack('>I', len(data)) + tag + data +
+                      struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+          png = (b'\x89PNG\r\n\x1a\n' +
+                 chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+                 chunk(b'IDAT', zlib.compress(bytes(raw), 9)) +
+                 chunk(b'IEND', b''))
+          open('smoke_circle.png', 'wb').write(png)
+          os.makedirs('smoke_frames', exist_ok=True)
+          for i in range(4):
+              open(f'smoke_frames/f{i:02d}.png', 'wb').write(png)
+          print('media ready')
+          PY
+          printf '%s\n' '{"questions":[{"id":"q1","task":"choice","query":"What color is the object in the video?","options":["red","blue","green"]}]}' > smoke_questions.json
+
+      - name: Run parity suite (${{ inputs.suite }})
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          suite='${{ inputs.suite }}'
+          run_layer0() {
+            echo '== layer0: moondream3.1 embedding + block 0 parity (downloads ~19 GB safetensors)'
+            hf download moondream/moondream3.1-9B-A2B --local-dir models/moondream3.1-9B-A2B
+            python3 scripts/parity_layer0.py
+            n=$(ls parity/*.npy 2>/dev/null | wc -l)
+            test "$n" -gt 0 || { echo 'parity_layer0 produced no dumps'; exit 1; }
+            echo "layer0 OK: $n dump tensors"
+          }
+          run_vc3_e2e() {
+            echo '== vc3_e2e: official VideoChat3-4B vs engine, end to end'
+            hf download MCG-NJU/VideoChat3-4B --local-dir models/VideoChat3-4B
+            python3 scripts/parity_vc3_e2e.py \
+              --ckpt models/VideoChat3-4B \
+              --frames smoke_frames \
+              --ask "What color is the object?" --image
+          }
+          run_videojev() {
+            echo '== videojev: official VideoJev-4B oracle vs engine scoring'
+            hf download ZhuYuhan/VideoJev-4B --local-dir models/VideoJev-4B
+            python3 scripts/parity_videojev.py \
+              --model models/VideoJev-4B \
+              --frames smoke_frames \
+              --questions smoke_questions.json
+          }
+          case "$suite" in
+            layer0)    run_layer0 ;;
+            vc3_e2e)   run_vc3_e2e ;;
+            videojev)  run_videojev ;;
+            all)       run_layer0; run_vc3_e2e; run_videojev ;;
+            *) echo "unknown suite: $suite"; exit 2 ;;
+          esac
+
+      - name: Upload parity artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l1-parity-dumps
+          path: |
+            parity/
+            *.npz
+          if-no-files-found: ignore
