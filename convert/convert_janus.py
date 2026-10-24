@@ -96,9 +96,10 @@ def read_config(src_dir):
 def write_metadata(gw, cfg, outtype):
     gw.add_name("janus")
     gw.add_file_type({
+        "f16": gguf.LlamaFileType.MOSTLY_F16,
         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
         "q4_0": gguf.LlamaFileType.MOSTLY_Q4_0,
-    }.get(outtype, gguf.LlamaFileType.ALL_F32))
+    }[outtype])
     gw.add_uint32("general.quantization_version", 2)
 
     gw.add_uint32("janus.block_count", cfg["n_layer"])
