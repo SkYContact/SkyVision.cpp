@@ -91,23 +91,11 @@ public:
     const char * name() const override { return "mage-vl-4b"; }
     bool ask(const vqa::MediaInput & media, const std::string & prompt,
              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
-    // rt streaming: frames-only turns go through the gate (System 1 decides
-    // whether the event is response-worthy); questions bypass it
+    // rt streaming: bounded-replay live session (see the impl for the window
+    // semantics). Frames-only turns go through the gate; questions bypass it.
     bool ask_session(const vqa::MediaInput & media, const std::string & prompt,
-                     const vqa::GenParams & gp, std::string & out_text) override {
-        if (!prompt.empty() || !gate_ready_) return ask(media, prompt, "", gp, out_text);
-        std::vector<float> scores;
-        if (!gate_scores(media, scores) || scores.empty()) return ask(media, "", "", gp, out_text);
-        const float tau = [] { const char * e = getenv("MAGE_GATE_TAU"); return e ? atof(e) : 0.5f; }();
-        if (scores.back() < tau) {
-            fprintf(stderr, "gate: silence (p=%.3f < %.2f)\n", (double)scores.back(), (double)tau);
-            out_text.clear();
-            return true;   // silent turn: nothing for the stream to emit
-        }
-        fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
-        return ask(media, "Please describe the video content in detail based on the provided information.",
-                   "", gp, out_text);
-    }
+                     const vqa::GenParams & gp, std::string & out_text) override;
+    void session_reset() override;
 
     // ChatML template knowledge for the front ends (same convention as
     // moss_vl: gp.history is prepended verbatim and already carries the
@@ -202,7 +190,8 @@ private:
     bool build_gate_graph();
     void gate_cleanup();
     // perception tokens for one segment: per-frame mean-pooled [T, 2560]
-    bool gate_scores(const vqa::MediaInput & media, std::vector<float> & scores);
+    bool gate_scores(const vqa::MediaInput & media, std::vector<float> & scores,
+                     std::vector<float> * feats_out = nullptr, int * per_frame_out = nullptr);
     std::string gate_path;                 // discovered *-gate.gguf
     bool gate_ready_ = false;
 
@@ -231,6 +220,29 @@ private:
     vqa::AlignedBuf gate_f32_;                  // small gate tensors as host F32
     std::vector<float> gate_emb0_;              // cls embed row 0 (target token)
     bool gate_graph_built_ = false;
+
+    // ---- bounded-replay live session (ask_session) ------------------------
+    // The gate path already runs the vision tower on every turn; its per-frame
+    // merged rows are frame-local (tower attention is block-diagonal per
+    // frame), so silent turns bank them into a sliding window for free. Speak
+    // / question turns replay only the window - system, prior (frames+answer)
+    // turns, this turn's frames - in one prefill, instead of the offline
+    // ask()'s full-history rebuild. Eviction drops the oldest completed turns
+    // first, then trims single-turn streaks frame by frame (qwen3vl session
+    // semantics).
+    struct SessTurn { int frames; std::string ask; std::string answer; };
+    bool sess_on_ = false;
+    std::string sess_sys_;               // system block captured at session start
+    std::vector<float> sess_feats_;      // [rows, n_embd] every window frame
+    std::vector<double> sess_secs_;      // per-frame stream timestamps
+    std::vector<SessTurn> sess_turns_;   // completed (frames + ask + answer)
+    int sess_per_frame_ = 0;             // vision rows per frame (fixed geometry)
+    int sess_max_frames_ = 64;           // MAGE_SESSION_FRAMES
+    int sess_cur_frames_ = 0;            // frames of the turn being generated
+    void session_append(const std::vector<float> & feats, int per_frame, int nF,
+                        const vqa::MediaInput & media);
+    void session_evict();
+    void session_drop_turn();
 
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 };
@@ -1153,7 +1165,8 @@ bool MageVL::build_gate_graph() {
 // Gate scoring over a whole segment: per-frame mean-pooled perception tokens
 // run through pre_net -> mamba (recurrent) -> post_net, the last frame's token
 // goes through the cls pair. Returns per-frame p(speak).
-bool MageVL::gate_scores(const vqa::MediaInput & media, std::vector<float> & scores) {
+bool MageVL::gate_scores(const vqa::MediaInput & media, std::vector<float> & scores,
+                         std::vector<float> * feats_out, int * per_frame_out) {
     scores.clear();
     if (!gate_ready_) return false;
     std::vector<float> feats;
@@ -1258,6 +1271,8 @@ bool MageVL::gate_scores(const vqa::MediaInput & media, std::vector<float> & sco
         scores.push_back(e1 / (e0 + e1));
     }
     if (gate_dbg) { fclose(gate_dbg); fprintf(stderr, "gate: perception tokens dumped\n"); }
+    if (feats_out) *feats_out = std::move(feats);       // session window harvest
+    if (per_frame_out) *per_frame_out = T;
     return true;
 }
 
@@ -1620,6 +1635,218 @@ bool MageVL::ask(const vqa::MediaInput & media, const std::string & prompt,
             (int)ids.size(), ms_prefill, ms_prefill > 0 ? ids.size() * 1000.0 / ms_prefill : 0.0,
             n_dec, ms_decode, ms_decode > 0 ? n_dec * 1000.0 / ms_decode : 0.0);
     return true;
+}
+
+// ---------------------------------------------------------------- live session
+void MageVL::session_reset() {
+    sess_on_ = false;
+    sess_feats_.clear();
+    sess_secs_.clear();
+    sess_turns_.clear();
+    sess_per_frame_ = 0;
+}
+
+bool MageVL::ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                         const vqa::GenParams & gp, std::string & out_text) {
+    // no gate weights = no cheap silent turn; encoding every frame just to
+    // bank it would cost more than the offline path saves
+    if (!gate_ready_) return ask(media, prompt, "", gp, out_text);
+    if (const char * e = getenv("MAGE_SESSION_FRAMES")) sess_max_frames_ = std::max(4, atoi(e));
+    if (!sess_on_) {
+        sess_on_ = true;
+        sess_sys_ = gp.history.empty()
+            ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            : gp.history;
+        fprintf(stderr, "session: start (window %d frames)\n", sess_max_frames_);
+    }
+    stage_cb = gp.on_stage;
+    stage_ud = gp.on_stage_ud;
+    out_text.clear();
+
+    // 1. gate the new frames; the gate's vision encode doubles as the harvest
+    //    (per-frame rows are frame-local: tower attention is block-diagonal)
+    std::vector<float> scores, feats_new;
+    int per_new = 0;
+    const bool have_media = !media.frames.empty();
+    if (have_media && !gate_scores(media, scores, &feats_new, &per_new)) return false;
+
+    const bool question = !prompt.empty();
+    if (!question && have_media && !scores.empty()) {
+        const float tau = [] { const char * e = getenv("MAGE_GATE_TAU"); return e ? atof(e) : 0.5f; }();
+        if (scores.back() < tau) {
+            const int nF = per_new > 0 ? (int)(feats_new.size() / per_new / n_embd) : 0;
+            session_append(feats_new, per_new, nF, media);
+            session_evict();
+            fprintf(stderr, "gate: silence (p=%.3f < %.2f), window %d frames\n",
+                    (double)scores.back(), (double)tau, (int)sess_secs_.size());
+            return true;   // silent turn: the LLM never runs
+        }
+        fprintf(stderr, "gate: response (p=%.3f >= %.2f)\n", (double)scores.back(), (double)tau);
+    }
+
+    // 2. bank the frames, keep the window bounded; the frame cap must also
+    //    respect the token budget (48 q6 frames x 220 tok > n_ctx 8192)
+    if (have_media) {
+        const int nF = per_new > 0 ? (int)(feats_new.size() / per_new / n_embd) : 0;
+        session_append(feats_new, per_new, nF, media);
+    }
+    if (sess_per_frame_ > 0) {
+        const int fit = (n_ctx - gp.max_tokens - 512) / sess_per_frame_;
+        if (fit < sess_max_frames_) sess_max_frames_ = std::max(2, fit);
+    }
+    session_evict();
+    if (sess_secs_.empty()) {
+        // nothing banked yet (text-only first turn): the offline path still
+        // knows how to answer without frames
+        fprintf(stderr, "session: no frames yet, falling back to offline ask\n");
+        return ask(media, prompt, "", gp, out_text);
+    }
+
+    // 3. replay: system + prior (frames + answer) turns + this turn's frames,
+    //    reusing ask()'s renderer for the current segment so block formats
+    //    stay identical
+    const std::string ask_text = question
+        ? prompt
+        : "Please describe the video content in detail based on the provided information.";
+    auto frame_block = [](double sec, int per) {
+        char ts[32];
+        snprintf(ts, sizeof(ts), "<%.1f seconds>", sec);
+        std::string s = ts;
+        s += "<|vision_start|>";
+        for (int i = 0; i < per; i++) s += "<|image_pad|>";
+        s += "<|vision_end|>";
+        return s;
+    };
+
+    std::vector<int> ids;
+    std::vector<int> img_pos;
+    int max_new = gp.max_tokens;
+    for (int attempt = 0; ; attempt++) {
+        std::string hist = sess_sys_;
+        size_t fpos = 0;
+        for (const auto & t : sess_turns_) {
+            hist += "<|im_start|>user\n";
+            for (int i = 0; i < t.frames; i++, fpos++) hist += frame_block(sess_secs_[fpos], sess_per_frame_);
+            hist += t.ask + "<|im_end|>\n<|im_start|>assistant\n" + t.answer + "<|im_end|>\n";
+        }
+        std::vector<float> cur_secs(sess_secs_.begin() + fpos, sess_secs_.end());
+        const int turn_frames = (int)cur_secs.size();
+        const int n_img = (int)(sess_feats_.size() / n_embd);
+        // no pending frames = no current segment: n_img_tokens must be 0 or
+        // the renderer adds one untimestamped image block on top of history
+        const std::string text = render_prompt(cur_secs.empty() ? 0 : sess_per_frame_, ask_text, true,
+                                               cur_secs.empty() ? nullptr : &cur_secs, hist);
+        ids = tok_.encode(text);
+        img_pos.clear();
+        for (int i = 0; i < (int)ids.size(); i++) if (ids[i] == id_image_pad) img_pos.push_back(i);
+        if ((int)img_pos.size() != n_img) {
+            fprintf(stderr, "session: placeholder mismatch (%d image_pad vs %d rows)\n",
+                    (int)img_pos.size(), n_img);
+            return false;
+        }
+        if ((int)ids.size() + max_new <= n_ctx) {   // fits: remember the turn extent
+            sess_cur_frames_ = turn_frames;
+            break;
+        }
+        if (sess_turns_.empty()) {
+            max_new = n_ctx - (int)ids.size();
+            if (max_new <= 0) {
+                fprintf(stderr, "session: window alone (%d tok) overflows n_ctx %d\n",
+                        (int)ids.size(), n_ctx);
+                return false;
+            }
+            sess_cur_frames_ = turn_frames;
+            break;
+        }
+        if (attempt >= 8) { fprintf(stderr, "session: replay keeps overflowing n_ctx\n"); return false; }
+        session_drop_turn();   // shed history and re-render
+    }
+    fprintf(stderr, "session: replay %d tok (%d image, %d frames), max_new %d\n",
+            (int)ids.size(), (int)img_pos.size(), (int)sess_secs_.size(), max_new);
+
+    // 4. generate (same driver as ask(): fresh KV, one prefill, decode loop)
+    n_past = 0;
+    kv.clear();
+    auto t0 = std::chrono::steady_clock::now();
+    TextGraph g;
+    std::vector<float> logits;
+    if (!run_text(g, ids, img_pos.empty() ? nullptr : &sess_feats_,
+                  img_pos.empty() ? nullptr : &img_pos, logits))
+        return false;
+    auto t1 = std::chrono::steady_clock::now();
+
+    int next = sample(logits, gp);
+    int n_dec = 0;
+    for (int step = 0; step < max_new; step++) {
+        if (next == id_eos || next == id_endoftext) break;
+        const std::string piece = tok_.decode({next});
+        out_text += piece;
+        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+        n_dec++;
+        if (step + 1 >= max_new) break;
+        if (!run_text(g, {next}, nullptr, nullptr, logits)) break;
+        next = sample(logits, gp);
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    const double ms_pre = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double ms_dec = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    fprintf(stderr, "[perf] replay prefill %d tok in %.0f ms (%.1f tok/s) | decode %d tok in %.0f ms (%.2f tok/s)\n",
+            (int)ids.size(), ms_pre, ms_pre > 0 ? ids.size() * 1000.0 / ms_pre : 0.0,
+            n_dec, ms_dec, ms_dec > 0 ? n_dec * 1000.0 / ms_dec : 0.0);
+
+    // 5. complete the turn
+    if (!out_text.empty())
+        sess_turns_.push_back({sess_cur_frames_, ask_text, out_text});
+    return true;
+}
+
+// banks one segment's per-frame rows + stream timestamps into the window;
+// a geometry change resets the window (fixed-geometry sessions, like qwen3vl)
+void MageVL::session_append(const std::vector<float> & feats, int per_frame, int nF,
+                            const vqa::MediaInput & media) {
+    if (nF <= 0 || per_frame <= 0) return;
+    if (sess_per_frame_ && per_frame != sess_per_frame_) {
+        fprintf(stderr, "session: frame geometry changed (%d -> %d rows), resetting window\n",
+                sess_per_frame_, per_frame);
+        sess_feats_.clear(); sess_secs_.clear(); sess_turns_.clear();
+    }
+    sess_per_frame_ = per_frame;
+    const float * p = feats.data();
+    const size_t rows = (size_t)nF * per_frame;
+    sess_feats_.insert(sess_feats_.end(), p, p + rows * n_embd);
+    const double def_fps = media.fps > 0 ? media.fps : 2.0;
+    for (int f = 0; f < nF; f++) {
+        const double t = f < (int)media.timestamps.size() ? (double)media.timestamps[f]
+                                                          : f / def_fps;
+        sess_secs_.push_back(t);
+    }
+}
+
+// window eviction, qwen3vl session semantics: drop whole oldest completed
+// turns first, then trim a single over-long streak frame by frame
+void MageVL::session_evict() {
+    const size_t row = (size_t)sess_per_frame_ * n_embd;
+    auto drop_front_turn = [&] {
+        const int n = sess_turns_.front().frames;
+        sess_feats_.erase(sess_feats_.begin(), sess_feats_.begin() + (size_t)n * row);
+        sess_secs_.erase(sess_secs_.begin(), sess_secs_.begin() + n);
+        sess_turns_.erase(sess_turns_.begin());
+    };
+    while ((int)sess_secs_.size() > sess_max_frames_ && sess_turns_.size() > 1)
+        drop_front_turn();
+    while ((int)sess_secs_.size() > sess_max_frames_) {
+        sess_feats_.erase(sess_feats_.begin(), sess_feats_.begin() + row);
+        sess_secs_.erase(sess_secs_.begin());
+        if (!sess_turns_.empty()) sess_turns_.front().frames = std::max(0, sess_turns_.front().frames - 1);
+    }
+}
+
+void MageVL::session_drop_turn() {
+    if (sess_turns_.empty()) return;
+    const int n = sess_turns_.front().frames;
+    sess_feats_.erase(sess_feats_.begin(), sess_feats_.begin() + (size_t)n * sess_per_frame_ * n_embd);
+    sess_secs_.erase(sess_secs_.begin(), sess_secs_.begin() + n);
+    sess_turns_.erase(sess_turns_.begin());
 }
 
 }  // namespace mage_vl
