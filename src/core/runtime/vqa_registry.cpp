@@ -131,6 +131,11 @@ const ArchEntry kArchs[] = {
     // default - the 19 GB Q4 checkpoint does not fit a 12 GB GPU)
     { { "keye-vl2", "keye_vl2", nullptr }, create_keye_vl,
       TokenizerMode::Qwen2Regex, "models/keye-vl2", 151936, false, false, "" },
+    // DeepSeek Janus-Pro (1B/7B, understanding path): timm SigLIP tower +
+    // MLP aligner + llama trunk; the generation side (VQ tokenizer) is not
+    // part of this engine
+    { { "janus", "janus_pro", nullptr }, create_janus,
+      TokenizerMode::DeepSeekBpe, "models/Janus-Pro-1B", 102400, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

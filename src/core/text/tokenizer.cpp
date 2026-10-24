@@ -138,6 +138,69 @@ static size_t pretoken_len(const std::string & text, size_t pos, bool gpt2 = fal
     return len0;   // every byte is covered by one of the alternatives
 }
 
+// DeepSeek-LLM pre-tokenizer (Janus): an isolated Split sequence, not one
+// regex. Stage order matters - each stage splits the fragments the previous
+// stages produced, which for leftmost scanning means: try the earlier class
+// first, and any character no stage claims stays a single-codepoint piece.
+//   1 [\r\n]                                  isolated newline
+//   2 \s? <latin run>                         latin = letters EXCEPT the CJK
+//   3 \s? <punct run>                         lump; punct = ASCII/extended
+//   4 \s+ (end of string only)                punctuation below
+//   5 <CJK run>   6 <single digit>            CJK lump [0x800-0xD7FF]+[4E00-9FA5]
+// The "CJK" range famously lumps Greek/Cyrillic/Hangul in with Han - that is
+// exactly what the official tokenizer.json's regexes sum to.
+static inline bool ds_cjk(uint32_t cp) {
+    return (cp >= 0x800 && cp <= 0xD7FF) || (cp >= 0x4E00 && cp <= 0x9FA5);
+}
+static inline bool ds_latin(uint32_t cp) {
+    return is_letter(cp) && !ds_cjk(cp);
+}
+static inline bool ds_punct(uint32_t cp) {
+    if ((cp >= 0x21 && cp <= 0x2F) || (cp >= 0x3A && cp <= 0x7E)) return true;
+    if (cp >= 0x2018 && cp <= 0x201F) return true;          // ‘-‟
+    if (cp >= 0x3000 && cp <= 0x3002) return true;          // 　-。
+    if (cp >= 0xFF01 && cp <= 0xFF0F) return true;          // ！-／
+    if (cp >= 0xFF1A && cp <= 0xFF5E) return true;          // ：-～
+    return false;
+}
+static size_t ds_pretoken_len(const std::string & text, size_t pos) {
+    const size_t n = text.size();
+    size_t i = pos;
+    uint32_t cp0 = cp_at(text, i);
+    const size_t len0 = i - pos;
+
+    if (cp0 == '\r' || cp0 == '\n') return len0;
+
+    auto run = [&](size_t j, bool (*cls)(uint32_t)) {
+        size_t k = j;
+        while (k < n) {
+            size_t k2 = k;
+            if (!cls(cp_at(text, k2))) break;
+            k = k2;
+        }
+        return k;
+    };
+
+    // \s? <latin> / \s? <punct>: one leading space may join the run, but a lone
+    // space that nothing follows must NOT be consumed here
+    if (is_space(cp0)) {
+        size_t j = i;
+        uint32_t cp1 = 0;
+        if (j < n) { size_t j2 = j; cp1 = cp_at(text, j2); j = j2; }
+        if (ds_latin(cp1)) { size_t k = run(j, ds_latin); return k - pos; }
+        if (ds_punct(cp1)) { size_t k = run(j, ds_punct); return k - pos; }
+        // stage 4: whitespace only matches as a run at the very end
+        const size_t e = scan_space(text, pos);
+        if (e >= n) return e - pos;
+        return len0;   // unmatched single char (isolated piece)
+    }
+    if (ds_latin(cp0)) return run(pos, ds_latin) - pos;
+    if (ds_punct(cp0)) return run(pos, ds_punct) - pos;
+    if (ds_cjk(cp0))   return run(pos, ds_cjk) - pos;
+    if (is_number(cp0)) return len0;   // individual digits
+    return len0;
+}
+
 // ---------------------------------------------------------------- load
 bool Tokenizer::load(const char * path, TokenizerMode mode) {
     std::string js;
@@ -145,9 +208,11 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
     init_byte_table();
 
     use_pretokenizer = (mode == TokenizerMode::Qwen2Regex || mode == TokenizerMode::Gpt2Regex);
+    if (mode == TokenizerMode::DeepSeekBpe) use_pretokenizer = true;
     use_added_tokens = use_pretokenizer || mode == TokenizerMode::GemmaSP;
     gpt2_pretok = (mode == TokenizerMode::Gpt2Regex);
     gemma_sp = (mode == TokenizerMode::GemmaSP);
+    deepseek_pretok = (mode == TokenizerMode::DeepSeekBpe);
 
     // vocab
     size_t vp = js.find("\"vocab\"");
@@ -247,7 +312,8 @@ bool Tokenizer::load(const char * path, TokenizerMode mode) {
             id_to_piece.size(), merge_rank.size(), added.size(),
             mode == TokenizerMode::Qwen2Regex ? "qwen2 regex"
             : mode == TokenizerMode::Gpt2Regex ? "gpt2 regex"
-            : mode == TokenizerMode::GemmaSP ? "gemma sentencepiece" : "plain gpt2");
+            : mode == TokenizerMode::GemmaSP ? "gemma sentencepiece"
+            : mode == TokenizerMode::DeepSeekBpe ? "deepseek split" : "plain gpt2");
     return !id_to_piece.empty();
 }
 
@@ -363,7 +429,9 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
                 if (p != std::string::npos && p < stop) stop = p;
             }
             while (i < stop) {
-                size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (stop - i);
+                size_t n = use_pretokenizer
+                    ? (deepseek_pretok ? ds_pretoken_len(text, i) : pretoken_len(text, i, gpt2_pretok))
+                    : (stop - i);
                 if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
                 if (i + n > stop) n = stop - i;   // safe: added tokens start with ASCII
                 if (gemma_sp) encode_piece_gemma(text.substr(i, n), out);
@@ -372,7 +440,9 @@ std::vector<int> Tokenizer::encode(const std::string & text) const {
             }
             continue;
         }
-        size_t n = use_pretokenizer ? pretoken_len(text, i, gpt2_pretok) : (text.size() - i);
+        size_t n = use_pretokenizer
+            ? (deepseek_pretok ? ds_pretoken_len(text, i) : pretoken_len(text, i, gpt2_pretok))
+            : (text.size() - i);
         if (n == 0) { size_t j = i; cp_at(text, j); n = j - i; }
         if (gemma_sp) encode_piece_gemma(text.substr(i, n), out);
         else encode_piece(text.substr(i, n), out);

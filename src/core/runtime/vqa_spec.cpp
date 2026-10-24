@@ -118,6 +118,9 @@ const SpecRow kSpecs[] = {
     { "keye-vl2", "keye_vl2", "image video text", "ask",
       false, false, false, false, "models/keye-vl2", "",
       "expert residency cache (KEYE_EXPERTCACHE=1) fits the 19GB checkpoint a 12GB card" },
+    { "janus", "janus_pro", "image text", "ask",
+      false, false, false, false, "models/Janus-Pro-1B", "",
+      "understanding path only; the generation VQ decoder is not part of this engine" },
 };
 
 ArchSpec row_to_spec(const SpecRow & r) {

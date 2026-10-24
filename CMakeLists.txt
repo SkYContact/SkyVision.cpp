@@ -217,6 +217,11 @@ set(QWEN25OMNI_SRC
     src/models/qwen25omni/qwen25omni_talker.cpp
     src/models/qwen25omni/qwen25omni_t2w.cpp)
 
+#   src/models/janus/        DeepSeek Janus-Pro backend (timm SigLIP + aligner +
+#                           llama trunk; understanding path only)
+set(JANUS_SRC
+    src/models/janus/janus_model.cpp)
+
 #   src/models/smolvlm/      SmolVLM / Idefics3 backend (SigLIP + SmolLM2)
 set(SMOLVLM_SRC
     src/models/smolvlm/smolvlm_model.cpp)
@@ -259,6 +264,7 @@ add_executable(vqa-cli
     ${VJEPA2_SRC}
     ${QWEN2VL_SRC}
     ${SMOLVLM_SRC}
+    ${JANUS_SRC}
     ${MAGE_VL_SRC}
     ${QWEN25OMNI_SRC}
     ${EMBG2_SRC}
