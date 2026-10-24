@@ -55,6 +55,7 @@
   <div id="status"></div>
   <div id="out"></div>
 
+  <div id="rtsec">
   <h2>实时流观察（模型主动解说）</h2>
   <div class="sub" style="margin-bottom:8px">
     输入源：视频文件路径 / 摄像头（Windows 填 <code>video=摄像头名</code>）/ 流 URL。模型按节奏观察新画面，
@@ -80,9 +81,23 @@
   </div>
   <div id="rtstatus"></div>
   <div id="log"></div>
+  </div>
 </div>
 <script>
 const MODEL = '__MODEL_ID__';
+// streaming capability is declared by GET /api/specs (modes), not by this
+// page knowing which backend it serves; offline-only archs just lose the panel
+const ARCH = '__MODEL_ARCH__';
+fetch('/api/specs').then(r => r.json()).then(specs => {
+  const spec = specs.find(s => s.arch === ARCH || (s.aliases || []).includes(ARCH));
+  if (!spec) return;
+  const sub = document.querySelector('.sub');
+  sub.textContent = spec.arch + ' · ' + spec.inputs.filter(i => i !== 'text').join(' / ') +
+    ' 问答 + 多轮会话' + (spec.modes.includes('streaming') ? ' + 实时流观察' : '');
+  if (spec.note) sub.title = spec.note;
+  if (!spec.modes.includes('streaming'))
+    document.getElementById('rtsec').style.display = 'none';
+});
 // 换载在服务器后台线程执行：/load 立即返回 {"loading":true}，轮询 /status 到 ready
 async function wait_model(st) {
   let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });

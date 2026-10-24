@@ -68,6 +68,28 @@
 </div>
 <script>
 const MODEL = '__MODEL_ID__';
+// what this model accepts comes from GET /api/specs - the page knows the spec
+// vocabulary (inputs / speech_output), not which backend it is serving
+const ARCH = '__MODEL_ARCH__';
+fetch('/api/specs').then(r => r.json()).then(specs => {
+  const spec = specs.find(s => s.arch === ARCH || (s.aliases || []).includes(ARCH));
+  if (!spec) return;
+  const sub = document.getElementById('sub');
+  sub.textContent = spec.arch + ' · ' + spec.inputs.filter(i => i !== 'text').join(' / ') +
+    ' 输入，文本' + (spec.speech_output ? ' + 语音' : '') + '回答';
+  if (spec.note) sub.title = spec.note;
+  if (!spec.speech_output) {
+    document.getElementById('speak').checked = false;
+    document.getElementById('speak').closest('label.chk').style.display = 'none';
+  }
+  if (!spec.inputs.includes('audio')) {
+    const dz = document.getElementById('dropAud');
+    dz.style.display = 'none';
+    document.getElementById('recBtn').style.display = 'none';
+    document.getElementById('dropImg').style.flex = '';
+  }
+  if (!spec.inputs.includes('image')) document.getElementById('dropImg').style.display = 'none';
+});
 // 换载在服务器后台线程执行：/load 立即返回 {"loading":true}，轮询 /status 到 ready
 async function wait_model(st) {
   let r = await fetch('/api/model/' + encodeURIComponent(MODEL) + '/load', { method: 'POST' });

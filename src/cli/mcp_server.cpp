@@ -309,6 +309,11 @@ vqa::json::Value spec_json(const std::string & arch) {
     o.set("tasks", arr(tasks));
     o.set("modes", arr(modes));
     o.set("inputs", arr(s->inputs));
+    // the three spec flags callers branch on (Web UI picker, script chaining);
+    // absent-when-false would force every consumer to treat missing as unknown
+    o.set("pure_vision", vqa::json::Value::make_bool(s->pure_vision));
+    o.set("needs_vision_gguf", vqa::json::Value::make_bool(s->needs_vision_gguf));
+    o.set("speech_output", vqa::json::Value::make_bool(s->speech_output));
     if (!s->note.empty()) o.set("note", vqa::json::Value::make_string(s->note));
     return o;
 }

@@ -40,12 +40,8 @@
   <div class="row">
     <select id="mode">
       <option value="ask">提问</option>
-      <option value="ask-think">提问（思考）</option>
-      <option value="caption-short">描述（短）</option>
-      <option value="caption-normal">描述（标准）</option>
-      <option value="caption-long">描述（长）</option>
-      <option value="detect">目标检测</option>
-      <option value="point">目标定位</option>
+      <!-- task options are generated at load from GET /api/specs (spec.tasks),
+           this page no longer hardcodes the per-backend skill list -->
     </select>
     <input type="text" id="q" placeholder="问题 / 目标名（如 person, clock）">
     <button class="primary" id="go">运行</button>
@@ -77,6 +73,49 @@ const drop = document.getElementById('drop'), file = document.getElementById('fi
 const imgbox = document.getElementById('imgbox'), img = document.getElementById('img');
 const overlay = document.getElementById('overlay');
 let blob = null, iw = 0, ih = 0;
+
+// the legal skill set comes from GET /api/specs for this model's arch - the
+// page itself only knows the shared task vocabulary, not moondream specifics
+const TASK_LABEL = { ask: '提问', caption: '描述', detect: '目标检测', point: '目标定位',
+                     gaze: '注视点预测', classify: '分类', embed: '向量', score: '打分', gate: '门控' };
+const ARCH = '__MODEL_ARCH__';
+let gazeSrc = null;
+fetch('/api/specs').then(r => r.json()).then(specs => {
+  const spec = specs.find(s => s.arch === ARCH || (s.aliases || []).includes(ARCH));
+  if (!spec) return;
+  const sel = document.getElementById('mode');
+  for (const t of spec.tasks) {
+    if (t === 'ask') continue;
+    if (t === 'caption') {   // length is a generic caption knob, not a backend skill
+      for (const len of ['short', 'normal', 'long']) {
+        const o = document.createElement('option');
+        o.value = 'caption-' + len;
+        o.textContent = '描述（' + { short: '短', normal: '标准', long: '长' }[len] + '）';
+        sel.appendChild(o);
+      }
+      continue;
+    }
+    const o = document.createElement('option');
+    o.value = t;
+    o.textContent = TASK_LABEL[t] || t;
+    sel.appendChild(o);
+  }
+  const sub = document.querySelector('.sub');
+  sub.textContent = spec.tasks.map(t => TASK_LABEL[t] || t).join(' / ');
+  if (spec.note) sub.title = spec.note;
+});
+
+// gaze start-point pick: click the image while the gaze task is selected
+img.onclick = () => {
+  if (document.getElementById('mode').value !== 'gaze') return;
+  const r = img.getBoundingClientRect();
+  const x = (event.clientX - r.left) / r.width, y = (event.clientY - r.top) / r.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  gazeSrc = { x, y };
+  const s = `<circle cx="${x*overlay.clientWidth}" cy="${y*overlay.clientHeight}" r="10"
+              fill="none" stroke="#7aa2f7" stroke-width="2"/>`;
+  overlay.innerHTML = s;
+};
 
 drop.ondragover = e => { e.preventDefault(); drop.classList.add('on'); };
 drop.ondragleave = () => drop.classList.remove('on');
@@ -111,7 +150,13 @@ btn.onclick = async () => {
   const qtext = document.getElementById('q').value;
   let mode = 'ask', q = qtext, n = 300;
   if (sel.startsWith('caption')) { mode = 'caption'; q = sel.split('-')[1]; n = 400; }
-  else if (sel !== 'ask') { mode = sel; if (!qtext) { out.textContent = '检测/定位需要在输入框里填目标名'; return; } }
+  else if (sel !== 'ask') {
+    mode = sel;
+    if (mode === 'gaze') {
+      if (!blob) { out.textContent = '注视点预测需要先放入图片'; return; }
+      if (!gazeSrc) { out.textContent = '先选择「注视点预测」后点击图中眼睛/人脸作为起点'; return; }
+    } else if (!qtext) { out.textContent = '检测/定位需要在输入框里填目标名'; return; }
+  }
   else if (!qtext && !blob) return;
   btn.disabled = true;
   out.textContent = '';
@@ -122,7 +167,9 @@ btn.onclick = async () => {
     await wait_model(status);
     status.textContent = '视觉编码…';
     const r = await fetch('/api/model/' + encodeURIComponent(MODEL) +
-                    '/ask?mode=' + mode + '&q=' + encodeURIComponent(q) + '&n=' + n + '&stream=1',
+                    '/ask?mode=' + mode + '&q=' + encodeURIComponent(q) +
+                    (mode === 'gaze' && gazeSrc ? '&x=' + gazeSrc.x + '&y=' + gazeSrc.y : '') +
+                    '&n=' + n + '&stream=1',
                     { method: 'POST', body: blob || new Uint8Array(0) });
     // NDJSON stream: {"phase":"vision"} then {"t":".."} per token, {"done"|"error"} at the end
     const reader = r.body.getReader();
@@ -161,6 +208,12 @@ btn.onclick = async () => {
       for (let i = 0; i + 1 < v.length; i += 2) pts.push([v[i], v[i+1]]);
       draw([], pts);
       out.textContent = pts.length ? '定位到 ' + pts.length + ' 个点' : '未定位到目标';
+    } else if (mode === 'gaze') {
+      const v = text.replace('gaze:', '').trim().split(/[\s,]+/).filter(Boolean).map(Number);
+      if (v.length >= 2) {
+        draw([], [[v[0], v[1]]]);
+        out.textContent = '注视点 ≈ (' + v[0].toFixed(3) + ', ' + v[1].toFixed(3) + ')';
+      } else out.textContent = text || '该起点没有检测到注视';
     } else {
       out.textContent = text;
     }

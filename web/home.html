@@ -32,20 +32,38 @@
   </div>
 </div>
 <script>
-fetch('/api/models').then(r => r.json()).then(d => {
+// capability text comes from GET /api/specs (the fixed task vocabulary) - no
+// per-backend knowledge lives here; unknown arch falls back to the arch label
+const TASK_LABEL = { ask: '问答', caption: '描述', detect: '检测', point: '定位',
+                     gaze: '注视', classify: '分类', embed: '向量', score: '打分', gate: '门控' };
+const INPUT_LABEL = { image: '图像', video: '视频', audio: '音频', text: '文本' };
+const specByArch = {};   // every canonical label + alias -> spec entry
+fetch('/api/specs')
+  .then(r => r.json())
+  .then(specs => { for (const s of specs) {
+      specByArch[s.arch] = s;
+      for (const a of s.aliases || []) specByArch[a] = s;
+  } })
+  .catch(() => {})       // spec endpoint down -> fall back to raw arch labels
+  .finally(() => fetch('/api/models').then(r => r.json()).then(d => {
   const grid = document.getElementById('grid');
   if (!d.models.length) { document.getElementById('empty').style.display = 'block'; return; }
   for (const m of d.models) {
     const gb = (m.size / 1073741824).toFixed(1);
+    const s = specByArch[m.arch];
+    const cap = s
+      ? s.tasks.map(t => TASK_LABEL[t] || t).join(' / ') + ' · ' +
+        s.inputs.filter(i => i !== 'text').map(i => INPUT_LABEL[i] || i).join(' + ')
+      : m.arch;
     const a = document.createElement('a');
     a.className = 'card';
     a.href = '/model/' + encodeURIComponent(m.id);
     a.innerHTML = `<div class="arch">${m.arch}</div>
       <div class="name">${m.id}</div>
-      <div class="meta"><b>${gb} GB</b> · ${m.quant} · ${m.arch === 'moondream3' ? '五技能 · 图像' : '图像 + 视频'}</div>`;
+      <div class="meta"><b>${gb} GB</b> · ${m.quant} · ${cap}</div>`;
     grid.appendChild(a);
   }
-});
+  }));
 // 后台换载提示：有模型在加载时轮询 /status 显示进度（切换期间提问返回 409）
 setInterval(async () => {
   const el = document.getElementById('loadbanner');

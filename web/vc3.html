@@ -48,8 +48,7 @@
     </select>
     <select id="mode" style="display:none">
       <option value="">普通问答</option>
-      <option value="caption">技能：Caption（场景+时间戳事件）</option>
-      <option value="find">技能：Find（时序定位）</option>
+      <!-- task options are generated at load from GET /api/specs -->
     </select>
     <button id="go">运行</button>
   </div>
@@ -77,15 +76,40 @@ async function wait_model(st) {
   if (!r.ok) throw new Error(j.error || 'load failed');
 }
 const ARCH = '__MODEL_ARCH__';
-// every text backend shares this page; only the label differs
-const ARCH_LABEL = {
-  videochat3: 'VideoChat3-4B', qwen3_5: 'Qwen3.5', qwen2vl: 'Qwen2.5-VL',
-  qwen2_5_vl: 'Qwen2.5-VL', marlin: 'Marlin', moss_vl: 'MOSS-VL',
-  videomae: 'VideoMAE', vivit: 'ViViT', moondream3: 'moondream3.1',
-};
-document.getElementById('sub').textContent =
-  (ARCH_LABEL[ARCH] || ARCH) + ' · ' + document.getElementById('sub').textContent;
-if (ARCH === 'marlin') document.getElementById('mode').style.display = '';
+// every text backend shares this page; what it can do comes from GET /api/specs
+// (canonical label + aliases), never from per-backend branches in this file
+const TASK_LABEL = { ask: '问答', caption: 'Caption（场景+时间戳事件）', detect: '检测',
+                     point: '定位', gaze: '注视', classify: '分类', embed: '向量',
+                     score: '打分', gate: '门控' };
+fetch('/api/specs').then(r => r.json()).then(specs => {
+  const spec = specs.find(s => s.arch === ARCH || (s.aliases || []).includes(ARCH));
+  if (!spec) return;
+  const sub = document.getElementById('sub');
+  const inputs = spec.inputs.filter(i => i !== 'text').join(' + ') || spec.inputs.join(' + ');
+  sub.textContent = spec.arch + ' · ' + inputs + ' · ' +
+    spec.tasks.join(' / ') + (spec.modes.includes('streaming') ? ' · 支持流式' : '');
+  if (spec.note) sub.title = spec.note;
+  // legal non-ask tasks render as mode options; nothing hardcoded per backend
+  const sel = document.getElementById('mode');
+  for (const t of spec.tasks) {
+    if (t === 'ask') continue;
+    const o = document.createElement('option');
+    o.value = t;
+    o.textContent = '技能：' + (TASK_LABEL[t] || t);
+    sel.appendChild(o);
+  }
+  if (sel.options.length > 1) sel.style.display = '';
+  // inputs constraint: no video in the spec -> no video upload, no frame picker
+  if (!spec.inputs.includes('video')) {
+    document.getElementById('mf').style.display = 'none';
+    document.getElementById('file').accept = 'image/*';
+    sub.textContent += ' · 仅图像输入';
+  }
+  if (!spec.inputs.includes('image'))
+    sub.textContent += ' · 仅视频输入';
+  if (spec.pure_vision) sub.textContent += ' · 纯视觉（无文本生成）';
+  if (spec.needs_vision_gguf) sub.textContent += ' · 需要 vision gguf';
+});
 const drop = document.getElementById('drop'), file = document.getElementById('file');
 const imgP = document.querySelector('img#preview'), vidP = document.querySelector('video#preview');
 let blob = null, isVideo = false;
