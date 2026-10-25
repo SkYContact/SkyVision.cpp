@@ -294,6 +294,12 @@ private:
     ggml_cgraph *agf = nullptr;
     ggml_tensor *a_frames_in = nullptr, *a_soft_out = nullptr;
     ggml_tensor *v_valid_in = nullptr;
+    // static single-token decode graph (same object across steps: the CPU
+    // rebuild - 64MB ctx init + ~1000-node graph - used to run per token)
+    ggml_context *dec_ctx = nullptr;
+    ggml_cgraph *dec_gf = nullptr;
+    ggml_gallocr_t dec_allocr = nullptr;
+    int dec_sp = -1;
     int ag_nt = -1;
     ggml_tensor *rope_freqs_shared = nullptr;   // host fallback if no per-layer tensor
     ggml_context * rf_ctx = nullptr;            // owns rope_freqs_shared
@@ -764,9 +770,42 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
     const int T = (int)toks.size();
     const int S = n_past + T;
     if (S > n_ctx) { fprintf(stderr, "context overflow (%d > %d)\n", S, n_ctx); return false; }
+    bool static_decode = false;
 
-    if (!build_text_graph(g, T, S, mm)) return false;
-    if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
+    // single-token decode: static graph keyed on the 256-padded KV width
+    // (no media splice, no dump): the CPU rebuild - 64MB ctx init + ~1000
+    // nodes + realloc - used to run once per token
+    if (T == 1 && !mm && dump_dir.empty() && !getenv("GEMMA4_PROBE_Q") && !getenv("GEMMA4_PROBE_ATTN") && !getenv("GEMMA4_PROBE_FA") && !getenv("GEMMA4_PROBE_EMB")) {
+        const int Sp = std::min(n_ctx, GGML_PAD(S, 256));
+        if (!dec_gf || dec_sp != Sp) {
+            if (dec_ctx) ggml_free(dec_ctx);
+            if (!dec_allocr) dec_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, true };
+            dec_ctx = ggml_init(ip);
+            TextGraph dg;
+            dg.ctx = dec_ctx;
+            if (!build_text_graph(dg, 1, S, nullptr)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
+            if (!ggml_gallocr_alloc_graph(dec_allocr, dg.gf)) {
+                fprintf(stderr, "gemma4: static decode graph alloc failed\n");
+                ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
+                return false;
+            }
+            dec_gf = dg.gf;
+            dec_sp = Sp;
+            g = dg;   // fresh handles: fall through to the normal upload code
+        } else {
+            g.ctx = nullptr;   // borrow the cached graph's input tensors
+            g.gf = dec_gf;
+            g.tok_in = ggml_graph_get_tensor(dec_gf, "tok_in");
+            g.pos_in = ggml_graph_get_tensor(dec_gf, "pos_in");
+            g.mask_full = ggml_graph_get_tensor(dec_gf, "mask_full");
+            g.mask_swa = ggml_graph_get_tensor(dec_gf, "mask_swa");
+            g.soft_in = nullptr; g.soft_pos_in = nullptr; g.logits = nullptr;
+        }
+        static_decode = true;
+    }
+    if (!static_decode && !build_text_graph(g, T, S, mm)) return false;
+    if (!static_decode && !ggml_gallocr_alloc_graph(allocr, g.gf)) {
         fprintf(stderr, "gemma4: text graph allocation failed\n");
         ggml_free(g.ctx);
         g.ctx = nullptr;
@@ -900,11 +939,15 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
     }
     if (!getenv("GEMMA4_PROBE_Q") && !getenv("GEMMA4_PROBE_ATTN") && !getenv("GEMMA4_PROBE_FA") && !getenv("GEMMA4_PROBE_EMB")) {
     logits_out.resize((size_t)n_vocab);
-    ggml_backend_tensor_get(g.logits, logits_out.data(), 0, sizeof(float) * n_vocab);
+    ggml_backend_tensor_get(static_decode ? ggml_graph_get_tensor(dec_gf, "logits") : g.logits,
+                            logits_out.data(), 0, sizeof(float) * n_vocab);
     }
     n_past = S;
-    ggml_free(g.ctx);
-    g.ctx = nullptr;
+    if (!static_decode || g.ctx == dec_ctx) {
+        // free only per-call graphs; the cached static graph (dec_ctx) stays
+        g.ctx = (g.ctx == dec_ctx) ? nullptr : g.ctx;
+        if (g.ctx) { ggml_free(g.ctx); g.ctx = nullptr; }
+    }
     return true;
 }
 
