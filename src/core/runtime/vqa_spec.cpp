@@ -121,10 +121,9 @@ const SpecRow kSpecs[] = {
     { "keye-vl2", "keye_vl2", "image video text", "ask",
       false, false, false, false, "models/keye-vl2", "",
       "expert residency cache (KEYE_EXPERTCACHE=1) fits the 19GB checkpoint a 12GB card. "
-      "VIDEO IS A SIMPLIFIED PER-FRAME PATH, not the official slow/fast dual-stream "
-      "packing pipeline (official: packed sequence through the tower with "
-      "packing_position_embedding + cross-frame varlen attention + <|frame|><hh:mm:ss> "
-      "markers + fast stream <|fast_start|>..|>); porting the official path is tracked as a TODO" },
+      "video = official default path (per-frame tower passes + <|frame|><hh:mm:ss> markers, "
+      "official mRoPE get_rope_index parity; the packing_position_embedding table is dead "
+      "code on the official video path). Opt-in slow/fast dual-stream frame_types not implemented" },
     { "janus", "janus_pro", "image text", "ask",
       false, false, false, false, "models/Janus-Pro-1B", "",
       "understanding path only; the generation VQ decoder is not part of this engine" },

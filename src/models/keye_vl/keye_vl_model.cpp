@@ -24,9 +24,17 @@
 //     the selected logits (= norm_topk_prob renormalization), two
 //     mul_mat_id calls (up and gate are separate expert tensors).
 //   * vision: host-side raster patchify + one matmul (engine convention,
-//     qwen2vl/siglip towers); video = per-frame independent encoding with
-//     "<|frame|><hh:mm:ss>" text markers between frames (the mmproj's
-//     packing position embedding is not used on this path).
+//     qwen2vl/siglip towers); video = the OFFICIAL default path: per-frame
+//     independent tower passes ("<|frame|><hh:mm:ss>" markers between
+//     frames). Verified against the official wrapper
+//     (modeling_keye_topk_mask_30ba3b.py): the official video call passes
+//     interpolate_pos_encoding=True (spatial position table, NOT the
+//     packing_position_embedding - that table is dead code on this path)
+//     and per-frame cu_seqlens, i.e. no cross-frame attention. mRoPE
+//     positions follow the official get_rope_index (bitwise-parity,
+//     2026-10-25). The opt-in slow/fast dual-stream frame_types feature
+//     (fast frames wrapped in <|fast_start|>/<|fast_end|> at lower
+//     resolution) is not implemented - the official default is all-slow.
 //
 // The 19 GB Q4_K_M checkpoint does not fit a 12 GB GPU, so this backend
 // defaults to CPU; set KEYE_GPU=1 to try the CUDA backend anyway.
@@ -1287,32 +1295,48 @@ bool KeyeVL2::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
     const int T = (int)toks.size();
 
-    // mRoPE positions, llama.cpp fork semantics (mtmd_image_tokens_get_decoder_pos):
-    // text tokens use the running index on all three axes; image tokens use
-    // (t = base, y = base + row, x = base + col) where base is the absolute
-    // sequence position the image block starts at. Image tokens still occupy
-    // one running slot each, so text resumes at base + n_tokens.
+    // mRoPE positions - official get_rope_index semantics
+    // (modeling_keye_topk_mask_30ba3b.py:788-935, verified against source):
+    // the sequence alternates TEXT runs and per-frame PAD runs. Per frame:
+    //   text run  -> arange(text_len) + st_idx on all three axes
+    //   pad run   -> (t=0, y=row, x=col) + text_len + st_idx
+    //   st_idx    = text_len + st_idx + max(gh-1, gw-1) + 1
+    // The h/w axes raise the base for everything after the frame (mrope
+    // delta). The previous fork semantics (absolute sequence base) diverge
+    // from the second frame on.
     std::vector<int> pos((size_t)4 * T, 0);
     std::vector<int> img_pos;
     {
+        int st = 0, st_idx = 0;
         size_t fi = 0;
-        int seen = 0, frame_base = 0, p = 0;
-        for (int i = 0; i < T; i++) {
-            if (!ff.empty() && toks[(size_t)i] == id_image_pad && fi < ff.size()) {
-                const FrameFeats & f = ff[fi];
-                const int k = seen % (f.gh * f.gw);
-                if (k == 0) frame_base = p;
-                pos[(size_t)i] = frame_base;                    // t
-                pos[(size_t)T + i] = frame_base + k / f.gw;     // y (row)
-                pos[(size_t)2 * T + i] = frame_base + k % f.gw; // x (col)
-                img_pos.push_back(i);
-                seen++;
-                if (seen % (f.gh * f.gw) == 0) fi++;
-            } else {
-                pos[(size_t)i] = pos[(size_t)T + i] = pos[(size_t)2 * T + i] = p;
+        while (fi < ff.size()) {
+            // find this frame's pad-run start from st
+            int ed = st;
+            while (ed < T && toks[(size_t)ed] != id_image_pad) ed++;
+            const int text_len = ed - st;
+            for (int k = 0; k < text_len; k++)
+                pos[(size_t)(st + k)] = pos[(size_t)T + (st + k)] =
+                pos[(size_t)2 * T + (st + k)] = st_idx + k;
+            const FrameFeats & f = ff[fi];
+            const int n = f.gh * f.gw;
+            const int base = st_idx + text_len;
+            for (int k = 0; k < n; k++) {
+                const int idx = ed + k;
+                pos[(size_t)idx] = base;
+                pos[(size_t)T + idx] = base + k / f.gw;
+                pos[(size_t)2 * T + idx] = base + k % f.gw;
+                img_pos.push_back(idx);
             }
-            p++;
+            st_idx = base + std::max(f.gh - 1, f.gw - 1) + 1;
+            st = ed + n;
+            fi++;
         }
+        for (int k = st; k < T; k++)
+            pos[(size_t)k] = pos[(size_t)T + k] = pos[(size_t)2 * T + k] = st_idx + (k - st);
+    }
+    if (getenv("KEYE_DUMP_POS")) {
+        FILE * fp = fopen("keye_pos_eng.bin", "wb");
+        if (fp) { fwrite(pos.data(), sizeof(int), pos.size(), fp); fclose(fp); }
     }
     std::vector<float> feats_all;
     for (const auto & f : ff) {
