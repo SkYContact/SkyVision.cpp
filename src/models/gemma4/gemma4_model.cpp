@@ -207,10 +207,15 @@ private:
     // unified projections (encoder-free multimodal)
     bool preprocess_image(const uint8_t * rgb, int w0, int h0,
                           std::vector<float> & patches, std::vector<int> & px,
-                          std::vector<int> & py, int & gw, int & gh);
+                          std::vector<int> & py, int & gw, int & gh,
+                          int budget_override = -1);
+    bool preprocess_video_hf(const uint8_t * rgb, int w0, int h0,
+                             std::vector<float> & patches, std::vector<int> & px,
+                             std::vector<int> & py, int & gw, int & gh, int budget);
     bool build_vision_graph(int np);
     bool run_vision(const std::vector<float> & patches, const std::vector<int> & px,
-                    const std::vector<int> & py, int np, std::vector<float> & soft);
+                    const std::vector<int> & py, int np, std::vector<float> & soft,
+                    const std::vector<float> * valid = nullptr);
     bool build_audio_graph(int ntok);
     bool run_audio(const std::vector<float> & frames, int ntok,
                    std::vector<float> & soft);
@@ -224,7 +229,9 @@ private:
         return (il % 6) == 5;
     }
 
-    vqa::Capabilities caps_;
+    // pre-load defaults so the CLI video gate lets frame dirs through; the
+    // authoritative per-file caps are re-derived in load() (has_media_weights)
+    vqa::Capabilities caps_ = []{ vqa::Capabilities c; c.image = c.video = c.audio = true; return c; }();
     vqa::Tokenizer tok_;
 
     // text hyper (defaults = gemma-4-12B config.json; GGUF keys override)
@@ -286,6 +293,7 @@ private:
     ggml_context *actx = nullptr;
     ggml_cgraph *agf = nullptr;
     ggml_tensor *a_frames_in = nullptr, *a_soft_out = nullptr;
+    ggml_tensor *v_valid_in = nullptr;
     int ag_nt = -1;
     ggml_tensor *rope_freqs_shared = nullptr;   // host fallback if no per-layer tensor
     ggml_context * rf_ctx = nullptr;            // owns rope_freqs_shared
@@ -493,6 +501,7 @@ bool Gemma4::load(const std::string & gguf_path, const std::string & tokenizer_p
     caps_ = {};
     if (has_media_weights) {
         caps_.image = true;
+        caps_.video = true;   // per-frame image chunks (mtmd) / HF framing
         caps_.audio = true;   // raw 16 kHz waveform, 640 samples / soft token
         // video deferred: <|video|> id 258884 exists but the unified video
         // framing (per-frame soft budgets, ordering) is unverified - reject
@@ -909,7 +918,8 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
 // embeddinggemma-2)
 bool Gemma4::preprocess_image(const uint8_t * rgb, int w0, int h0,
                               std::vector<float> & patches, std::vector<int> & px,
-                              std::vector<int> & py, int & gw, int & gh) {
+                              std::vector<int> & py, int & gw, int & gh,
+                              int budget_override) {
     const int P = v_patch;
     // sizing is an exact port of llama.cpp mtmd: clip_hparams
     // set_limit_image_tokens(70, 1120) on the 48 px patch (patch_area = 48*48)
@@ -918,8 +928,8 @@ bool Gemma4::preprocess_image(const uint8_t * rgb, int w0, int h0,
     // (The HF processor's num_soft_tokens=280 cap is NOT what llama.cpp applies;
     // honoring 280 here produced a 16x16 grid for 400x400 inputs where the
     // oracle computes 9x9, breaking image parity.)
-    const int tmin = getenv("GEMMA4_BUDGET") ? 0 : 70;
-    const int tmax = getenv("GEMMA4_BUDGET") ? atoi(getenv("GEMMA4_BUDGET")) : 1120;
+    const int tmin = budget_override > 0 ? budget_override : (getenv("GEMMA4_BUDGET") ? 0 : 70);
+    const int tmax = budget_override > 0 ? budget_override : (getenv("GEMMA4_BUDGET") ? atoi(getenv("GEMMA4_BUDGET")) : 1120);
     const int min_px = tmin * P * P, max_px = tmax * P * P;
     auto round_by = [P](float x) { return (int)std::round(x / P) * P; };
     auto ceil_by  = [P](float x) { return (int)std::ceil(x / P) * P; };
@@ -991,6 +1001,12 @@ bool Gemma4::build_vision_graph(int np) {
     v_py_in = ggml_new_tensor_1d(vctx, GGML_TYPE_I32, np);
     ggml_set_name(v_py_in, "v_py");
     ggml_set_input(v_py_in);
+    // HF video pads short frames to max_soft_tokens with zero patches and
+    // (-1,-1) positions: pos contribution is masked to zero there
+    // (Gemma4UnifiedVisionEmbedder.forward: clamp(min=0) * valid)
+    v_valid_in = ggml_new_tensor_1d(vctx, GGML_TYPE_F32, np);
+    ggml_set_name(v_valid_in, "v_valid");
+    ggml_set_input(v_valid_in);
 
     auto ln = [&](ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
         x = ggml_norm(vctx, x, ln_eps);
@@ -1012,8 +1028,10 @@ bool Gemma4::build_vision_graph(int np) {
                                            pos_size, nb1, 0);
         ggml_tensor * tbl_y = ggml_view_2d(vctx, v_postbl, v_postbl->ne[0],
                                            pos_size, nb1, pos_size * nb1);
-        x = ggml_add(vctx, x, ggml_get_rows(vctx, tbl_x, v_px_in));
-        x = ggml_add(vctx, x, ggml_get_rows(vctx, tbl_y, v_py_in));
+        ggml_tensor * pos = ggml_add(vctx, ggml_get_rows(vctx, tbl_x, v_px_in),
+                                      ggml_get_rows(vctx, tbl_y, v_py_in));
+        pos = ggml_mul(vctx, pos, ggml_reshape_2d(vctx, v_valid_in, 1, np));
+        x = ggml_add(vctx, x, pos);
     }
     x = ln(x, v_posn_w, v_posn_b);
     x = ggml_rms_norm(vctx, x, v_eps);
@@ -1035,13 +1053,24 @@ bool Gemma4::build_vision_graph(int np) {
 }
 
 bool Gemma4::run_vision(const std::vector<float> & patches, const std::vector<int> & px,
-                        const std::vector<int> & py, int np, std::vector<float> & soft) {
+                        const std::vector<int> & py, int np, std::vector<float> & soft,
+                        const std::vector<float> * valid) {
     if (!vgf || vg_np != np) {
         if (!build_vision_graph(np)) return false;
     }
     ggml_backend_tensor_set(v_patches_in, patches.data(), 0, sizeof(float) * patches.size());
-    ggml_backend_tensor_set(v_px_in, px.data(), 0, sizeof(int) * np);
-    ggml_backend_tensor_set(v_py_in, py.data(), 0, sizeof(int) * np);
+    // HF video padding rows carry (-1,-1): clamp to 0 for the pos-table
+    // gather (the row's pos contribution is killed by the valid mask)
+    std::vector<int> pxc = px, pyc = py;
+    for (auto & v : pxc) v = std::max(0, v);
+    for (auto & v : pyc) v = std::max(0, v);
+    ggml_backend_tensor_set(v_px_in, pxc.data(), 0, sizeof(int) * np);
+    ggml_backend_tensor_set(v_py_in, pyc.data(), 0, sizeof(int) * np);
+    if (valid) ggml_backend_tensor_set(v_valid_in, valid->data(), 0, sizeof(float) * np);
+    else {
+        std::vector<float> ones((size_t)np, 1.0f);
+        ggml_backend_tensor_set(v_valid_in, ones.data(), 0, sizeof(float) * np);
+    }
     if (ggml_backend_graph_compute(backend, vgf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "gemma4: vision compute failed\n");
         return false;
@@ -1107,13 +1136,92 @@ bool Gemma4::run_audio(const std::vector<float> & frames, int ntok,
     return true;
 }
 
+// HF Gemma4UnifiedVideoProcessor sizing (get_aspect_ratio_preserving_size):
+// largest floor-to-(pooling*patch) dims whose area fits max_soft*pooling^2
+// teacher patches; no min-upscale (short frames pad instead).
+bool Gemma4::preprocess_video_hf(const uint8_t * rgb, int w0, int h0,
+                                 std::vector<float> & patches, std::vector<int> & px,
+                                 std::vector<int> & py, int & gw, int & gh, int budget) {
+    const int P = v_patch, K = 3;
+    const double max_px_area = (double)budget * K * K * 16 * 16;   // teacher-patch area cap
+    const double factor = std::sqrt(max_px_area / ((double)w0 * h0));
+    const int side = K * 16;
+    auto floor_by = [side](float x) { return (int)std::floor(x / side) * side; };
+    int tw = floor_by((float)(factor * w0));
+    int th = floor_by((float)(factor * h0));
+    const int max_side = (budget / (K * K)) * side;
+    if (th == 0 && tw == 0) {
+        fprintf(stderr, "gemma4: hf-video resize to 0x0\n");
+        return false;
+    }
+    if (th == 0) { th = side; tw = std::min((int)std::floor((double)w0 / h0) * side, max_side); }
+    else if (tw == 0) { tw = side; th = std::min((int)std::floor((double)h0 / w0) * side, max_side); }
+    std::vector<float> resized;
+    vqa::img::resize_antialias(rgb, w0, h0, tw, th, resized, 3);   // bicubic
+    // torchvision resizes uint8 tensors and ROUNDS BACK to uint8 before the
+    // 1/255 rescale - mirror that quantization for bit-parity
+    for (auto & v : resized) v = std::min(255.0f, std::max(0.0f, std::round(v))) / 255.0f;
+
+    gw = tw / P;
+    gh = th / P;
+    const int P3 = 3 * P * P;
+    patches.assign((size_t)P3 * gw * gh, 0.0f);
+    px.assign((size_t)gw * gh, 0);
+    py.assign((size_t)gw * gh, 0);
+    int u = 0;
+    for (int cy = 0; cy < gh; cy++)
+        for (int cx = 0; cx < gw; cx++, u++) {
+            float * row = patches.data() + (size_t)u * P3;
+            int o = 0;
+            for (int dy = 0; dy < P; dy++) {
+                const float * s = resized.data() + ((size_t)(cy * P + dy) * tw + cx * P) * 3;
+                for (int dx = 0; dx < P; dx++)
+                    for (int c = 0; c < 3; c++)
+                        row[o++] = s[(size_t)dx * 3 + c];
+            }
+            px[(size_t)u] = cx;
+            py[(size_t)u] = cy;
+        }
+    return true;
+}
+
 // run the unified projections over the media and collect the splice blocks
 bool Gemma4::encode_media(const vqa::MediaInput & media, MediaSplice & mm) {
-    if (!media.empty()) {
-        // video rides the generic llama.cpp mtmd path: every frame is its own
-        // <|image> ... <image|> chunk (the <|video|> id exists but upstream
-        // does not use it; the HF video processor's 70-token budget likewise
-        // has no oracle here)
+    if (!media.empty() && media.kind == vqa::MediaKind::Video &&
+        getenv("GEMMA4_VIDEO_HF")) {
+        // HF official video framing, a port of Gemma4UnifiedVideoProcessor
+        // (verified against transformers 5.21.0.dev0, see docs/dev-notes):
+        // per frame - resize floor-to-48 under a 70*9 teacher-patch area cap
+        // (bicubic antialias), 48 px patchify, then PAD to exactly 70 patches
+        // (zero patch, (-1,-1) position, pos contribution masked in the graph).
+        // Token layout (replace_video_token): "mm:ss <|image> <|video|>*n
+        // <image|>" blocks joined by spaces, markers as REAL added ids.
+        const int budget = 70;
+        std::vector<float> allsoft, allvalid;
+        for (size_t fi = 0; fi < media.frames.size(); fi++) {
+            std::vector<float> patches, soft;
+            std::vector<int> px, py;
+            int gw, gh;
+            if (!preprocess_video_hf(media.frames[fi].rgb.data(), media.width, media.height,
+                                     patches, px, py, gw, gh, budget)) return false;
+            const int n = gw * gh;   // HF pads to 70 only for batching; the
+            // model strips (-1,-1) rows and scatters VALID embeddings onto the
+            // n placeholder tokens - so we skip padding entirely
+            if (const char * dp = getenv("GEMMA4_DUMP_PATCHES")) {
+                FILE * fp = fopen(dp, "wb");
+                if (fp) { fwrite(patches.data(), sizeof(float), patches.size(), fp); fclose(fp); }
+            }
+            if (!run_vision(patches, px, py, n, soft)) return false;
+            if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
+            mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
+            fprintf(stderr, "gemma4: hf-video frame %zu/%zu %dx%d -> %dx%d patches (cap %d)\n",
+                    fi + 1, media.frames.size(), media.width, media.height, gw, gh, budget);
+            mm.blocks.push_back({ id_video, id_eoi, id_video, n });
+            mm.soft_pos.resize(mm.soft_pos.size() + (size_t)n);
+        }
+    } else if (!media.empty()) {
+        // default video framing = generic llama.cpp mtmd path: every frame is
+        // its own <|image> ... <image|> chunk (upstream never uses <|video|>)
         for (size_t fi = 0; fi < media.frames.size(); fi++) {
             std::vector<float> patches, soft;
             std::vector<int> px, py;
@@ -1338,6 +1446,8 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
         std::vector<int> enc = tok_.encode("<|turn>user\n");
         ids.insert(ids.end(), enc.begin(), enc.end());
     }
+    int hf_frame = 0;
+    const std::vector<double> * hf_timestamps = &media.timestamps;
     if (!mm.empty()) {
         // media blocks sit between the turn opener and the user text: each
         // chunk = <|image|>/<|audio|> opener + soft placeholder rows +
@@ -1359,13 +1469,30 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
             // off): the raw added ids (255999/258882/...) are never seen in
             // training prompts and the model treats them as garbage (goes
             // blind, emits <|think|> and ends the turn)
-            if (!bare) {
+            if (!bare && blk.bo == id_video) {
+                // HF per-frame layout (replace_video_token):
+                //   "[ ]mm:ss " <|image>(real id) <|video|>*70 <image|>(real id)
+                // markers are REAL added ids (HF parses template specials),
+                // timestamps are ordinary pieces
+                const int fi = hf_frame++;
+                double ts = 0.0;
+                if (hf_timestamps && fi < (int)hf_timestamps->size())
+                    ts = (*hf_timestamps)[(size_t)fi];
+                char tbuf[8];
+                snprintf(tbuf, sizeof(tbuf), "%02d:%02d", (int)(ts / 60.0), ((int)ts) % 60);
+                std::vector<int> t = tok_.encode(std::string(fi ? " " : "") + tbuf + " ");
+                ids.insert(ids.end(), t.begin(), t.end());
+                ids.push_back(id_boi);
+                bo_len = (int)t.size() + 1;
+            } else if (!bare) {
                 std::vector<int> m = tok_.encode(blk.bo == id_boi ? "<|image>" : "<|audio>");
                 ids.insert(ids.end(), m.begin(), m.end());
                 bo_len = (int)m.size();
             }
             for (int i = 0; i < blk.n_rows; i++) ids.push_back(blk.placeholder);
-            if (!bare) {
+            if (!bare && blk.eo == id_eoi && blk.bo == id_video) {
+                ids.push_back(id_eoi);   // real added id in the HF layout
+            } else if (!bare && blk.eo != -1) {
                 std::vector<int> m = tok_.encode(blk.eo == id_eoi ? "<image|>" : "<audio|>");
                 ids.insert(ids.end(), m.begin(), m.end());
             }
