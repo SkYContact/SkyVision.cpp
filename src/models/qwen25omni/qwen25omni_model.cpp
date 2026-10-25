@@ -195,6 +195,13 @@ private:
                        double talker_seconds);
 
     int id_audio = 151646, id_audio_start = 151647, id_audio_end = 151648;
+    // static single-token decode graph: a fresh graph object per step reused
+    // the same ctx-pool address for nodes[0], colliding the CUDA-graph key
+    // (nodes[0] pointer) across steps and occasionally replaying a stale
+    // capture - outputs like "2 2 2 ..." appeared nondeterministically
+    TextGraph dec_g;
+    int dec_g_bucket = -1;
+    bool dec_g_talker = false;
     int id_image_pad = 151655, id_video_pad = 151656;
     int id_vision_start = 151652, id_vision_end = 151653;
     int id_im_start = 151644, id_im_end = 151645, id_eos = 151645;
@@ -1136,8 +1143,14 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         int S = n_past + 1;
         if (S <= 1024) { int b = 128; while (b < S) b <<= 1; S = b; }
         else           { S = ((S + 1023) / 1024) * 1024; }
-        TextGraph d;
-        if (!build_text_graph(d, 1, S, 0, 0, want_talker)) { ggml_free(d.ctx); return false; }
+        if (dec_g_bucket != S || dec_g_talker != want_talker) {
+            if (dec_g.ctx) ggml_free(dec_g.ctx);
+            dec_g = TextGraph{};
+            if (!build_text_graph(dec_g, 1, S, 0, 0, want_talker)) { ggml_free(dec_g.ctx); dec_g.ctx = nullptr; dec_g_bucket = -1; return false; }
+            dec_g_bucket = S;
+            dec_g_talker = want_talker;
+        }
+        TextGraph & d = dec_g;
         vqa::set_causal_mask(d.mask_in, n_past, 1);
         std::vector<int> p1((size_t)4, next_pos);
         std::vector<float> lg, hid, emb;
@@ -1146,7 +1159,6 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
             ggml_free(d.ctx);
             return false;
         }
-        ggml_free(d.ctx);
         n_past++;
         next_pos++;
         if (want_talker) {
