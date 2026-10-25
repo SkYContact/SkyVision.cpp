@@ -858,6 +858,13 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
         }
         if (!getenv("GEMMA4_PROBE_Q") && !getenv("GEMMA4_PROBE_FA") && !getenv("GEMMA4_PROBE_EMB"))
             ggml_backend_tensor_set(g.mask_swa, mv.data(), 0, sizeof(ggml_fp16_t) * mv.size());
+        if (getenv("GEMMA4_DUMP_MASK") && T > 1) {
+            FILE * fm = fopen("gemma4_prefill_mask_swa.bin", "wb");
+            if (fm) { fwrite(mv.data(), 2, mv.size(), fm);
+                      fprintf(fm, ""); fclose(fm);
+                      FILE * fs = fopen("gemma4_prefill_mask_swa.shape", "w");
+                      fprintf(fs, "%d %d\n", Sw, T); fclose(fs); }
+        }
         if (getenv("GEMMA4_DEBUG")) {
             const int r = T > 13 ? 13 : T - 1;   // row 13 only exists in prefill
             fprintf(stderr, "[dbg] mask_swa uploaded row%d: ", r);
@@ -1355,6 +1362,10 @@ bool Gemma4::generate(const std::vector<int> & ids, const vqa::GenParams & gp,
             std::vector<int> chunk(ids.begin() + i0, ids.begin() + i1);
             MediaSplice mc;
             if (mm) {
+                // blocks must be non-empty: MediaSplice::empty() gates the
+                // soft_in graph input, so a splice without them silently
+                // dropped ALL media embeddings (model saw markers only)
+                mc.blocks.push_back({ 0, -1, 0, 1 });
                 for (size_t k = 0; k < mm->soft_pos.size(); k++) {
                     const int pos = mm->soft_pos[k];
                     if (pos >= i0 && pos < i1) {
