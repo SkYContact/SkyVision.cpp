@@ -702,9 +702,11 @@ bool Gemma4::build_text_graph(TextGraph & g, int T, int S, const MediaSplice * m
         if (il == 0) ggml_set_name(attn_out, "t_l0_attn_out");
 
         ggml_tensor * f = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, attn_out, eps), L.ffn_norm);
-        ggml_tensor * gate = ggml_gelu(g.ctx, ggml_mul_mat(g.ctx, L.w_gate, f));  // tanh gelu
+        // GeGLU fused op (GEGLU default == tanh gelu, matches gemma4): one
+        // kernel instead of gelu + mul, no round-trip of [n_ff, T]
+        ggml_tensor * gate = ggml_mul_mat(g.ctx, L.w_gate, f);
         ggml_tensor * up = ggml_mul_mat(g.ctx, L.w_up, f);
-        f = ggml_mul_mat(g.ctx, L.w_down, ggml_mul(g.ctx, gate, up));
+        f = ggml_mul_mat(g.ctx, L.w_down, ggml_geglu_split(g.ctx, gate, up));
         cur = ggml_add(g.ctx, attn_out,
                        ggml_mul(g.ctx, ggml_rms_norm(g.ctx, f, eps), L.ffn_post_norm));
         if (il == 0) ggml_set_name(cur, "t_l0_out");
