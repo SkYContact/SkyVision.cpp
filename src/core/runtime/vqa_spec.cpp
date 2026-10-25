@@ -120,7 +120,11 @@ const SpecRow kSpecs[] = {
       "classifier needs a classification-head checkpoint (e.g. NSFW); the base release embeds only" },
     { "keye-vl2", "keye_vl2", "image video text", "ask",
       false, false, false, false, "models/keye-vl2", "",
-      "expert residency cache (KEYE_EXPERTCACHE=1) fits the 19GB checkpoint a 12GB card" },
+      "expert residency cache (KEYE_EXPERTCACHE=1) fits the 19GB checkpoint a 12GB card. "
+      "VIDEO IS A SIMPLIFIED PER-FRAME PATH, not the official slow/fast dual-stream "
+      "packing pipeline (official: packed sequence through the tower with "
+      "packing_position_embedding + cross-frame varlen attention + <|frame|><hh:mm:ss> "
+      "markers + fast stream <|fast_start|>..|>); porting the official path is tracked as a TODO" },
     { "janus", "janus_pro", "image text", "ask",
       false, false, false, false, "models/Janus-Pro-1B", "",
       "understanding path only; the generation VQ decoder is not part of this engine" },
