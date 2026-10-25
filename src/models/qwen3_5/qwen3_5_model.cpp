@@ -437,7 +437,7 @@ bool Qwen3_5::load_weights(const char * path) {
         mvc.window       = vqa::gguf::u32(gu, "minicpm.vision.window", mvc.window);
         mvc.merge        = vqa::gguf::u32(gu, "minicpm.vision.merge", mvc.merge);
         mvc.downsample   = vqa::gguf::u32(gu, "minicpm.downsample", mvc.downsample);
-        if (const char * e = getenv("MINICPM_DOWNSAMPLE"))   // "4x" / "16x" override
+        if (const char * e = getenv("MINICPM_PARITY_DOWNSAMPLE"))   // "4x" / "16x" override
             mvc.downsample = (strncmp(e, "4", 1) == 0) ? 4 : 16;
         id_image_start   = vqa::gguf::u32(gu, "minicpm.image_start_id", id_image_start);
         id_image_end     = vqa::gguf::u32(gu, "minicpm.image_end_id", id_image_end);
@@ -445,8 +445,8 @@ bool Qwen3_5::load_weights(const char * path) {
         id_slice_end     = vqa::gguf::u32(gu, "minicpm.slice_end_id", id_slice_end);
         mvc.max_slice_nums = vqa::gguf::u32(gu, "minicpm.vision.max_slice_nums",
                                             mvc.max_slice_nums);
-        if (const char * e = getenv("MINICPM_SCALE_RES")) mvc.scale_resolution = atoi(e);
-        if (const char * e = getenv("MINICPM_NO_SLICES")) mvc.max_slice_nums = 1;
+        if (const char * e = getenv("MINICPM_PARITY_SCALE_RES")) mvc.scale_resolution = atoi(e);
+        if (const char * e = getenv("MINICPM_PARITY_NO_SLICES")) mvc.max_slice_nums = 1;
     }
     has_mtp = vqa::gguf::u32(gu, "marlin.has_mtp", 0) != 0;
     marlin_skills = vqa::gguf::u32(gu, "marlin.skills", 0) != 0;

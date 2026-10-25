@@ -413,12 +413,10 @@ bool SmolVLM::preprocess(const vqa::MediaInput & media, std::vector<std::vector<
     const int w0 = media.width, h0 = media.height;
     const uint8_t * rgb = media.frames[0].rgb.data();
 
-    // step 1: longest edge (aspect preserved). HF's processor always upscales to
-    // 2048, which turns a 320x240 photo into 12 crops for no information gain; the
-    // engine caps it at 1024 (<= 2x2 tiles + global) because every extra crop costs
-    // a full attention pass over 1024 tokens. Set SMOLVLM_MAX_EDGE=2048 to follow
-    // the official preprocessing exactly (slower, same answers in our tests).
-    int longest = std::min(v_longest, 1024);
+    // step 1: longest edge (aspect preserved). HF's processor always resizes to
+    // 2048 - that is the official default (an old 1024 cap silently deviated;
+    // it is available via SMOLVLM_MAX_EDGE for constrained devices only).
+    int longest = v_longest;
     if (const char * e = getenv("SMOLVLM_MAX_EDGE")) {
         const int cap = atoi(e);
         if (cap > 0) longest = cap;

@@ -351,8 +351,16 @@ bool Qwen25VL::encode_vision(const vqa::MediaInput & media, std::vector<float> &
     if (media.empty()) return false;
     // smart_resize: multiples of patch*merge, total pixels within the official bounds
     const int factor = v_patch * v_merge;
-    const int min_px = 4 * factor * factor;               // 4*28*28
-    const int max_px = 16384 * factor * factor / 4;       // 4096 merged tokens cap
+    const int min_px = 4 * factor * factor;               // 4*28*28 (qwen_vl_utils min_pixels)
+    // official qwen_vl_utils max_pixels = 16384 tokens; override with
+    // Q2V_MAX_TOKENS for low-VRAM sessions (llama.cpp's old 4096 merged cap
+    // is NOT the official default and quartered large-image resolution)
+    int max_tokens = 16384;
+    if (const char * e = getenv("Q2V_MAX_TOKENS")) {
+        const int t = atoi(e);
+        if (t > 0) max_tokens = t;
+    }
+    const int max_px = max_tokens * factor * factor;
     int rh = 0, rw = 0;
     if (!vqa::img::smart_resize(media.height, media.width, factor, min_px, max_px, &rh, &rw)) {
         fprintf(stderr, "image too small for the vision tower\n");

@@ -1637,8 +1637,8 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
     sess_rdelta = plan.rope_delta;
     {
         // pinned sink prefix: the chat-template head of turn 1 (StreamingVLM's
-        // attention-sink idea). MOSS_RT_SINK overrides, 0 disables.
-        int s = 64;
+        // attention-sink idea) - NOT official model semantics, opt-in only.
+        int s = 0;
         if (const char * e = getenv("MOSS_RT_SINK")) s = atoi(e);
         sess_nsink = std::max(0, std::min(s, (int)plan.ids.size() / 2));
     }

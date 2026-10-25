@@ -414,7 +414,7 @@ bool Siglip::build_graph() {
     ggml_set_name(x, "v_final");
 
     ggml_tensor * out = x;
-    if (has_head && !getenv("SIGLIP_NO_HEAD")) {
+    if (has_head && !getenv("SIGLIP_PARITY_NO_HEAD")) {
         // torch.nn.MultiheadAttention with the probe as the ONLY query:
         // q = Wq·probe (1 token), k/v = Wk,Wv·image tokens (N), unmasked scaled
         // dot product, out_proj. in_proj packs the q|k|v output rows, so each

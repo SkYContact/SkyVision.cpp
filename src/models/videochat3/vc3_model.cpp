@@ -592,7 +592,10 @@ bool VideoChat3::encode_vision(const vqa::MediaInput & media, std::vector<float>
     // at a fraction of the cost; VC3_VIDEO_MP=0 restores full resolution up to
     // the context budget.
     if (media.kind == vqa::MediaKind::Video) {
-        double vmp = 0.75;
+        // default 0 = official qwen_vl_utils max_pixels (no self-imposed
+        // frame downscale); set VC3_VIDEO_MP (e.g. 0.75) to trade resolution
+        // for VRAM - it is a deliberate deviation, not an official value
+        double vmp = 0;
         if (const char * e = getenv("VC3_VIDEO_MP")) vmp = atof(e);
         if (vmp > 0 && (double)max_pixels > vmp * 1e6) {
             max_pixels = (long long)(vmp * 1e6);

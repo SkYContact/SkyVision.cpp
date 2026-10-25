@@ -531,7 +531,7 @@ bool KeyeVL2::load(const std::string & gguf_path, const std::string & tokenizer_
                    const vqa::LoadOptions & opt) {
     n_ctx = vqa::resolve_n_ctx(opt, n_ctx);
     vqa::apply_load_options(opt, "KEYE", n_threads, use_gpu, dump_dir);
-    no_dsa = getenv("KEYE_NO_DSA") != nullptr;
+    no_dsa = getenv("KEYE_PARITY_NO_DSA") != nullptr;
     ec_enabled = getenv("KEYE_EXPERTCACHE") != nullptr && getenv("KEYE_CPU") == nullptr;
     if (!init_backend()) return false;
     if (!load_text_weights(gguf_path.c_str())) return false;

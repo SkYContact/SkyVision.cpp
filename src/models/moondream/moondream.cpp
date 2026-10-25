@@ -427,16 +427,13 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
                 HD * sizeof(float), qkv->nb[1], (H + M.n_kv_head) * HD * sizeof(float)));
 
         if (verbose) fprintf(stderr, "[b] L%d tau ok\n", il);
-        static const bool no_tau = getenv("MD_NO_TAU");
+        // tau attention scaling (q,v *= tanh(wq.gelu(qkv)) + ps) - official
+        // moondream 3.1 architecture, non-optional
         struct ggml_tensor * sq = nullptr, * sv = nullptr;
-        if (!no_tau) {
-            sq = ggml_reshape_3d(gctx, ggml_add(gctx, tok_q, ps2), 1, H, T);
+        sq = ggml_reshape_3d(gctx, ggml_add(gctx, tok_q, ps2), 1, H, T);
         q = ggml_mul(gctx, q, sq);
-            sv = ggml_reshape_3d(gctx, ggml_add(gctx, tok_v, ps2), 1, H, T);
-            v = ggml_mul(gctx, v, sv);
-        } else {
-            v = ggml_cont(gctx, v);
-        }
+        sv = ggml_reshape_3d(gctx, ggml_add(gctx, tok_v, ps2), 1, H, T);
+        v = ggml_mul(gctx, v, sv);
         if (il == 0) { ggml_set_name(q, "d_l0_q_tau"); }
 
         q = ggml_rope_ext(gctx, q, pos, nullptr, M.n_rot, GGML_ROPE_TYPE_NEOX, n_ctx,
