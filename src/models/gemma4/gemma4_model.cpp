@@ -474,13 +474,11 @@ bool Gemma4::load(const std::string & gguf_path, const std::string & tokenizer_p
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::GemmaSP)) return false;
-    // Gemma4 parity with llama.cpp: the chat template is tokenized WITHOUT
-    // special matching, so <|turn>/<|channel>/<|think|> split into ordinary
-    // pieces (`<`,`|`,`turn`,`|`,...). Matching the added tokens (105/100/...)
-    // instead produces id sequences the model treats as garbage (prompt echo,
-    // media blindness). Media wrapper markers are spliced as explicit ids,
-    // mirroring mtmd's special-parse of its own markers.
-    tok_.use_added_tokens = false;
+    // Official tokenization: special matching ON - the HF tokenizer resolves
+    // <|turn>/<|think|>/<|channel>/media markers to their real added ids
+    // (105/98/100/255999/...), verified bitwise against the official
+    // Gemma4UnifiedProcessor (transformers 5.21.0.dev0). The old piecewise
+    // path was a llama.cpp quirk, not the official format.
 
     {
         vqa::assign_token_ids(tok_, {
@@ -566,7 +564,7 @@ bool Gemma4::build_text_graph(TextGraph & g, int T, int S, const MediaSplice * m
         ggml_tensor * x = ggml_get_rows(g.ctx, t_embed, g.tok_in);        // [D, T]
         x = ggml_cast(g.ctx, x, GGML_TYPE_F32);
         x = ggml_scale(g.ctx, x, sqrtf((float)n_embd));
-    if (g.soft_in && !getenv("GEMMA4_NO_SPLICE")) {
+    if (g.soft_in && !getenv("GEMMA4_PARITY_NO_SPLICE")) {
         // media rows overwrite the (scaled) placeholder embeddings with the
         // RAW projection output - the sqrt(n_embd) Gemma normalizer applies
         // to token-id rows only (llama.cpp build_inp_embd scale_rows)
@@ -790,7 +788,7 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
     // full-attn layers stay causal for EVERY row - llama.cpp keeps the dense
     // cache causal under LLAMA_NON_CAUSAL_TYPE_SWA_ONLY
     // (llama-kv-cache.cpp: causal_attn = swa_type == NONE)
-    if (getenv("GEMMA4_NOMASK")) {
+    if (getenv("GEMMA4_PARITY_NOMASK")) {
         std::vector<ggml_fp16_t> z((size_t)g.mask_full->ne[0] * T, ggml_fp32_to_fp16(0.0f));
         ggml_backend_tensor_set(g.mask_full, z.data(), 0, sizeof(ggml_fp16_t) * z.size());
         ggml_backend_tensor_set(g.mask_swa, z.data(), 0, sizeof(ggml_fp16_t) * z.size());
@@ -811,7 +809,7 @@ bool Gemma4::run_text(TextGraph & g, const std::vector<int> & toks,
             const int lo = std::max(0, qt - window + 1);
             int hi = std::min(Sw - 1, qt);
             if (mm && t < (int)mm->noncausal.size() && mm->noncausal[(size_t)t] &&
-                !getenv("GEMMA4_NO_BIDIR"))
+                !getenv("GEMMA4_PARITY_NO_BIDIR"))
                 hi = std::min(Sw - 1, std::min(qt + window - 1,
                                                n_past + mm->chunk_end[(size_t)t]));
             for (int s = lo; s <= hi; s++)
@@ -1223,12 +1221,15 @@ bool Gemma4::encode_media(const vqa::MediaInput & media, MediaSplice & mm) {
         std::vector<float> patches, soft;
         std::vector<int> px, py;
         int gw, gh;
-        if (!preprocess_image(media.frames[0].rgb.data(), media.width, media.height,
-                              patches, px, py, gw, gh)) return false;
+        // official Gemma4UnifiedImageProcessor sizing: same floor-to-48
+        // aspect algorithm as the video path, max_soft_tokens=280 (the old
+        // mtmd 70..1120 round-based sizing was a llama.cpp deviation)
+        if (!preprocess_video_hf(media.frames[0].rgb.data(), media.width, media.height,
+                                 patches, px, py, gw, gh, v_max_soft)) return false;
         const int np = gw * gh;
         if (!run_vision(patches, px, py, np, soft)) return false;
         int bo = id_boi, eo = id_eoi, ph = id_image;
-        if (getenv("GEMMA4_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
+        if (getenv("GEMMA4_ABLATION_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
         if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
         mm.blocks.push_back({ bo, eo, ph, np });
         mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
@@ -1307,6 +1308,33 @@ bool Gemma4::generate(const std::vector<int> & ids, const vqa::GenParams & gp,
     for (int id : { 258883, 258882 }) {
         if (id < (int)logits.size()) logits[(size_t)id] = -INFINITY;
     }
+    if (getenv("GEMMA4_FIRSTTOK")) {
+        // top-5 prefill logits for oracle comparison
+        std::vector<std::pair<float,int>> v;
+        for (int i = 0; i < (int)logits.size(); i++) v.push_back({logits[(size_t)i], i});
+        std::partial_sort(v.begin(), v.begin()+5, v.end(), std::greater<>());
+        fprintf(stderr, "FIRSTTOK:");
+        for (int k = 0; k < 5; k++) fprintf(stderr, " %d(%.3f)", v[(size_t)k].second, v[(size_t)k].first);
+        fprintf(stderr, "\n");
+    }
+    if (getenv("GEMMA4_FIRSTTOK")) {
+        // top-5 prefill logits for oracle comparison
+        std::vector<std::pair<float,int>> v;
+        for (int i = 0; i < (int)logits.size(); i++) v.push_back({logits[(size_t)i], i});
+        std::partial_sort(v.begin(), v.begin()+5, v.end(), std::greater<>());
+        fprintf(stderr, "FIRSTTOK:");
+        for (int k = 0; k < 5; k++) fprintf(stderr, " %d(%.3f)", v[(size_t)k].second, v[(size_t)k].first);
+        fprintf(stderr, "\n");
+    }
+    if (getenv("GEMMA4_FIRSTTOK")) {
+        // top-5 prefill logits for oracle comparison
+        std::vector<std::pair<float,int>> v;
+        for (int i = 0; i < (int)logits.size(); i++) v.push_back({logits[(size_t)i], i});
+        std::partial_sort(v.begin(), v.begin()+5, v.end(), std::greater<>());
+        fprintf(stderr, "FIRSTTOK:");
+        for (int k = 0; k < 5; k++) fprintf(stderr, " %d(%.3f)", v[(size_t)k].second, v[(size_t)k].first);
+        fprintf(stderr, "\n");
+    }
     int next = vqa::sample_logits(logits, gp, rng_state);
     int n_dec = 0;
     std::vector<int> step(1);
@@ -1381,7 +1409,7 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
     if (!encode_media(media, mm)) return false;
 
     std::vector<int> ids;
-    if (!getenv("GEMMA4_NOBOS")) ids.push_back(id_bos);
+    if (!getenv("GEMMA4_PARITY_NOBOS")) ids.push_back(id_bos);
     if (const char * ri = getenv("GEMMA4_RAWIDS")) {
         // parity path: feed exact token ids (comma separated, BOS NOT added)
         std::vector<int> ids2;
@@ -1416,25 +1444,10 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
     // "<turn|>" is a single merged vocab piece (id 106) in the oracle's
     // encoding; the piece encoder splits it into <,turn,|> - splice 106 in
     // manually
-    auto enc_turn = [&](const std::string & t) {
-        std::vector<int> out;
-        size_t i = 0;
-        while (true) {
-            auto p = t.find("<turn|>", i);
-            if (p == std::string::npos) break;
-            auto pre = tok_.encode(t.substr(i, p - i));
-            out.insert(out.end(), pre.begin(), pre.end());
-            out.push_back(id_eot);
-            i = p + 7;
-        }
-        auto rest = tok_.encode(t.substr(i));
-        out.insert(out.end(), rest.begin(), rest.end());
-        return out;
-    };
     {
         const char * sys = getenv("GEMMA4_SYS");
         std::string sblock = sys ? std::string(sys) : std::string();
-        std::vector<int> enc = enc_turn(
+        std::vector<int> enc = tok_.encode(
             "<|turn>system\n" + sblock + (sys ? "<turn|>\n" : "<|think|>\n<turn|>\n"));
         ids.insert(ids.end(), enc.begin(), enc.end());
     }
@@ -1444,28 +1457,15 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
     int hf_frame = 0;
     const std::vector<double> * hf_timestamps = &media.timestamps;
-    if (!mm.empty()) {
-        // media blocks sit between the turn opener and the user text: each
-        // chunk = <|image|>/<|audio|> opener + soft placeholder rows +
-        // closing marker; markers decode non-causally with their chunk
-        // buffer must cover every media row incl. per-block marker tokens and the
-        // trailing prompt: multi-block (video) overflows the old +8 margin
-        mm.noncausal.resize((size_t)ids.size() + mm.soft_pos.size() +
-                            16 * mm.blocks.size() + 64, 0);
-        mm.chunk_end.resize(mm.noncausal.size(), 0);
-        int row = 0;
-        // GEMMA4_BARE: official-format media layout - bare <|image|>/<|audio|>
-        // placeholder rows only, no <|image>/<image|> wrapper markers
-        const bool bare = getenv("GEMMA4_BARE") != nullptr;
-        for (const auto & blk : mm.blocks) {
+    std::vector<const MediaSplice::Block *> audio_blocks;
+    bool audio_first = false;
+    int row = 0;
+        // emit one media block; official layout (Gemma4UnifiedProcessor):
+        // image/video blocks sit BEFORE the user text, audio blocks AFTER it
+        auto emit_block = [&](const MediaSplice::Block & blk) {
             const int start = (int)ids.size();
             int bo_len = 1;
-            // markers go in as ORDINARY PIECES ("<|image>" -> <,|,image,>),
-            // exactly as the llama.cpp oracle encodes them (parse_special
-            // off): the raw added ids (255999/258882/...) are never seen in
-            // training prompts and the model treats them as garbage (goes
-            // blind, emits <|think|> and ends the turn)
-            if (!bare && blk.bo == id_video) {
+            if (blk.bo == id_video) {
                 // HF per-frame layout (replace_video_token):
                 //   "[ ]mm:ss " <|image>(real id) <|video|>*70 <image|>(real id)
                 // markers are REAL added ids (HF parses template specials),
@@ -1480,19 +1480,16 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
                 ids.insert(ids.end(), t.begin(), t.end());
                 ids.push_back(id_boi);
                 bo_len = (int)t.size() + 1;
-            } else if (!bare) {
-                std::vector<int> m = tok_.encode(blk.bo == id_boi ? "<|image>" : "<|audio>");
-                ids.insert(ids.end(), m.begin(), m.end());
-                bo_len = (int)m.size();
+            } else {
+                // real added ids (<|image>=255999 / <|audio>=256000)
+                ids.push_back(blk.bo);
+                bo_len = 1;
             }
             for (int i = 0; i < blk.n_rows; i++) ids.push_back(blk.placeholder);
-            if (!bare && blk.eo == id_eoi && blk.bo == id_video) {
-                ids.push_back(id_eoi);   // real added id in the HF layout
-            } else if (!bare && blk.eo != -1) {
-                std::vector<int> m = tok_.encode(blk.eo == id_eoi ? "<image|>" : "<audio|>");
-                ids.insert(ids.end(), m.begin(), m.end());
+            if (blk.eo != -1) {
+                ids.push_back(blk.eo);   // real added id (<image|>/<audio|>)
             }
-            const int soft0 = start + (bare ? 0 : bo_len);
+            const int soft0 = start + bo_len;
             const int end = soft0 + blk.n_rows - 1;   // last soft row
             // bidirectional SWA applies to VISION chunks only: mtmd_decode_
             // use_non_causal() returns true for projector gemma4uv but falls
@@ -1505,12 +1502,32 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
             }
             for (int r = 0; r < blk.n_rows; r++)
                 mm.soft_pos[(size_t)(row++)] = soft0 + r;
-        }
+        };
+    if (!mm.empty()) {
+        // media blocks sit between the turn opener and the user text: each
+        // chunk = <|image|>/<|audio|> opener + soft placeholder rows +
+        // closing marker; markers decode non-causally with their chunk
+        // buffer must cover every media row incl. per-block marker tokens and the
+        // trailing prompt: multi-block (video) overflows the old +8 margin
+        mm.noncausal.resize((size_t)ids.size() + mm.soft_pos.size() +
+                            16 * mm.blocks.size() + 64, 0);
+        mm.chunk_end.resize(mm.noncausal.size(), 0);
+
+        audio_first = getenv("GEMMA4_ABLATION_AUDIO_FIRST") != nullptr;
+        for (const auto & blk : mm.blocks)
+            if (blk.bo != id_boa || audio_first) emit_block(blk);
+        if (!audio_first)
+            for (const auto & blk : mm.blocks)
+                if (blk.bo == id_boa) audio_blocks.push_back(&blk);
     }
     {
-        // official template closes the user turn and opens a bare model turn
-        // (thinking on: the model emits its own thought channel first)
-        std::vector<int> enc = enc_turn(prompt + "<turn|>\n<|turn>model\n");
+        // user text, then audio blocks (official: audio follows the text),
+        // then close the turn and open a bare model turn
+        std::vector<int> enc = tok_.encode(prompt);
+        ids.insert(ids.end(), enc.begin(), enc.end());
+        if (!audio_first)
+            for (const auto * blk : audio_blocks) emit_block(*blk);
+        enc = tok_.encode("<turn|>\n<|turn>model\n");
         ids.insert(ids.end(), enc.begin(), enc.end());
     }
     if (getenv("GEMMA4_DUMP_IDS")) {
