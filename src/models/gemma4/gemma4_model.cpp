@@ -1187,8 +1187,7 @@ bool Gemma4::preprocess_video_hf(const uint8_t * rgb, int w0, int h0,
 
 // run the unified projections over the media and collect the splice blocks
 bool Gemma4::encode_media(const vqa::MediaInput & media, MediaSplice & mm) {
-    if (!media.empty() && media.kind == vqa::MediaKind::Video &&
-        getenv("GEMMA4_VIDEO_HF")) {
+    if (!media.empty() && media.kind == vqa::MediaKind::Video) {
         // HF official video framing, a port of Gemma4UnifiedVideoProcessor
         // (verified against transformers 5.21.0.dev0, see docs/dev-notes):
         // per frame - resize floor-to-48 under a 70*9 teacher-patch area cap
@@ -1219,26 +1218,23 @@ bool Gemma4::encode_media(const vqa::MediaInput & media, MediaSplice & mm) {
             mm.blocks.push_back({ id_video, id_eoi, id_video, n });
             mm.soft_pos.resize(mm.soft_pos.size() + (size_t)n);
         }
-    } else if (!media.empty()) {
-        // default video framing = generic llama.cpp mtmd path: every frame is
-        // its own <|image> ... <image|> chunk (upstream never uses <|video|>)
-        for (size_t fi = 0; fi < media.frames.size(); fi++) {
-            std::vector<float> patches, soft;
-            std::vector<int> px, py;
-            int gw, gh;
-            if (!preprocess_image(media.frames[fi].rgb.data(), media.width, media.height,
-                                  patches, px, py, gw, gh)) return false;
-            const int np = gw * gh;
-            if (!run_vision(patches, px, py, np, soft)) return false;
-            int bo = id_boi, eo = id_eoi, ph = id_image;
-            if (getenv("GEMMA4_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
-            if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
-            mm.blocks.push_back({ bo, eo, ph, np });
-            mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
-            mm.soft_pos.resize(mm.soft_pos.size() + (size_t)np);
-            fprintf(stderr, "gemma4: frame %zu/%zu %dx%d -> %dx%d patches (%d soft tokens)\n",
-                    fi + 1, media.frames.size(), media.width, media.height, gw, gh, np);
-        }
+    }
+    if (!media.empty() && media.kind != vqa::MediaKind::Video) {
+        std::vector<float> patches, soft;
+        std::vector<int> px, py;
+        int gw, gh;
+        if (!preprocess_image(media.frames[0].rgb.data(), media.width, media.height,
+                              patches, px, py, gw, gh)) return false;
+        const int np = gw * gh;
+        if (!run_vision(patches, px, py, np, soft)) return false;
+        int bo = id_boi, eo = id_eoi, ph = id_image;
+        if (getenv("GEMMA4_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
+        if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
+        mm.blocks.push_back({ bo, eo, ph, np });
+        mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
+        mm.soft_pos.resize(mm.soft_pos.size() + (size_t)np);
+        fprintf(stderr, "gemma4: image %dx%d -> %dx%d patches (%d soft tokens)\n",
+                media.width, media.height, gw, gh, np);
     }
     if (media.has_audio()) {
         // raw 16 kHz mono frames; the engine's load_audio already resamples

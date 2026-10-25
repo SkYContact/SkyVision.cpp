@@ -114,7 +114,7 @@ const SpecRow kSpecs[] = {
       "768-d Matryoshka vectors, truncate to 512/256/128/64 (--embed-dim)" },
     { "gemma4", "", "image video audio text", "ask",
       false, false, false, false, "models/gemma-4-12B", "",
-      "encoder-free: linear vision (48px patches, <=280 soft tokens) + raw-waveform audio (640 samples/token); video = per-frame image chunks" },
+      "encoder-free: linear vision (48px patches, <=280 soft tokens) + raw-waveform audio (640 samples/token); video = HF official framing (70-token budget, per-frame mm:ss blocks)" },
     { "siglip", "", "image", "classify embed",
       false, true, false, false, "models/siglip-base", "",
       "classifier needs a classification-head checkpoint (e.g. NSFW); the base release embeds only" },

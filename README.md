@@ -66,7 +66,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Gemma 4（12B 统一版）** | `gemma4` | 图像 + 音频 + 文本 | Google Gemma4 统一多模态：**encoder-free**——没有视觉/音频塔，图像 patch（48×48×3=6912 维 im2col → LN1 → patch_dense → LN2 → [1120,2,3840] x/y 位置表相加 → pos_norm → RMSNorm → 3840×3840 投影）与音频（原始 16 kHz 波形每 640 样本一帧补零 → RMSNorm → [3840,640] 投影）直接 splice 进文本流。文本主干 48 层 dense：**SWA(窗1024, 16×256, 8KV×256, rope 1e4) 与 full(16×512, 1KV×512, theta 1e6 proportional + partial rotary 0.25) 5:1 交错**、k_eq_v、三明治 post-norm、logit softcap 30、tied embeddings（×sqrt(3840) 只乘 token 路径）、vocab 262144。混合形状 KV（KvCacheMixed 逐层维度），视觉 token 双向注意力（SWA 层块内双向、full 层保持因果）。分词坑：聊天模板与媒体标记全部按**普通 piece** 编码（`<|turn>`/`<|image>` 碎片化，`<turn\|>` 反而是单 token 106），特殊 added id 绝不能直接喂；思考模板 `<|turn>system
 <|think>
 <turn\|>
-` 开局，输出剥离 `<|channel>thought` 块。CUDA fattn 需 KV 视图与 mask 宽度按 FATTN_KQ_STRIDE(256) 对齐（mask 补列 -inf 惰性）。f16 24 GB / q6_K 9.8 GB（12GB 卡 decode 36 tok/s）。转换 `convert/convert_gemma4.py`（f16/q8_0/q6_K/q4_0），对拍裁判=llama.cpp 上游 mtmd-cli
+` 开局，输出剥离 `<|channel>thought` 块。CUDA fattn 需 KV 视图与 mask 宽度按 FATTN_KQ_STRIDE(256) 对齐（mask 补列 -inf 惰性）。f16 24 GB / q6_K 9.8 GB（12GB 卡 decode 36 tok/s）。转换 `convert/convert_gemma4.py`（f16/q8_0/q6_K/q4_0），对拍裁判=llama.cpp 上游 mtmd-cli（文本/图像）+ 官方 Gemma4UnifiedProcessor 5.21.0.dev0（视频逐位）
 
 ## 当前状态
 
