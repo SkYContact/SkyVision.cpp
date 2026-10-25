@@ -1110,26 +1110,27 @@ bool Gemma4::run_audio(const std::vector<float> & frames, int ntok,
 // run the unified projections over the media and collect the splice blocks
 bool Gemma4::encode_media(const vqa::MediaInput & media, MediaSplice & mm) {
     if (!media.empty()) {
-        if ((int)media.frames.size() != 1) {
-            fprintf(stderr, "gemma4: exactly one still frame supported (got %zu)\n",
-                    media.frames.size());
-            return false;
+        // video rides the generic llama.cpp mtmd path: every frame is its own
+        // <|image> ... <image|> chunk (the <|video|> id exists but upstream
+        // does not use it; the HF video processor's 70-token budget likewise
+        // has no oracle here)
+        for (size_t fi = 0; fi < media.frames.size(); fi++) {
+            std::vector<float> patches, soft;
+            std::vector<int> px, py;
+            int gw, gh;
+            if (!preprocess_image(media.frames[fi].rgb.data(), media.width, media.height,
+                                  patches, px, py, gw, gh)) return false;
+            const int np = gw * gh;
+            if (!run_vision(patches, px, py, np, soft)) return false;
+            int bo = id_boi, eo = id_eoi, ph = id_image;
+            if (getenv("GEMMA4_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
+            if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
+            mm.blocks.push_back({ bo, eo, ph, np });
+            mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
+            mm.soft_pos.resize(mm.soft_pos.size() + (size_t)np);
+            fprintf(stderr, "gemma4: frame %zu/%zu %dx%d -> %dx%d patches (%d soft tokens)\n",
+                    fi + 1, media.frames.size(), media.width, media.height, gw, gh, np);
         }
-        std::vector<float> patches, soft;
-        std::vector<int> px, py;
-        int gw, gh;
-        if (!preprocess_image(media.frames[0].rgb.data(), media.width, media.height,
-                              patches, px, py, gw, gh)) return false;
-        const int np = gw * gh;
-        if (!run_vision(patches, px, py, np, soft)) return false;
-        int bo = id_boi, eo = id_eoi, ph = id_image;
-        if (getenv("GEMMA4_IMG_AS_AUDIO")) { bo = id_boa; eo = id_eoa; ph = id_audio; }
-        if (getenv("GEMMA4_ZERO_SOFT")) std::fill(soft.begin(), soft.end(), 0.0f);
-        mm.blocks.push_back({ bo, eo, ph, np });
-        mm.soft.insert(mm.soft.end(), soft.begin(), soft.end());
-        mm.soft_pos.resize((size_t)np);
-        fprintf(stderr, "gemma4: image %dx%d -> %dx%d patches (%d soft tokens)\n",
-                media.width, media.height, gw, gh, np);
     }
     if (media.has_audio()) {
         // raw 16 kHz mono frames; the engine's load_audio already resamples
@@ -1268,14 +1269,8 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
                         "tensors (text-only model file)\n");
         return false;
     }
-    if (media.kind == vqa::MediaKind::Video) {
-        // <|video|> id 258884 exists, but the unified video framing (soft
-        // budget per frame, marker layout) is unverified - defer rather than
-        // guess. TODO(gemma4-parity): port the video path from the HF
-        // processor once a reference is available
-        fprintf(stderr, "gemma4: video input not wired yet (use still images / audio)\n");
-        return false;
-    }
+    // video = per-frame image chunks (llama.cpp mtmd generic path), handled in
+    // encode_media; no <|video|> framing upstream.
     // Gemma4 turn template: ChatML form (matches the llama.cpp oracle's
     // actual prompt ids, see format_history_turn above).
     MediaSplice mm;
@@ -1347,7 +1342,10 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
         // media blocks sit between the turn opener and the user text: each
         // chunk = <|image|>/<|audio|> opener + soft placeholder rows +
         // closing marker; markers decode non-causally with their chunk
-        mm.noncausal.resize((size_t)ids.size() + mm.soft_pos.size() + 8, 0);
+        // buffer must cover every media row incl. per-block marker tokens and the
+        // trailing prompt: multi-block (video) overflows the old +8 margin
+        mm.noncausal.resize((size_t)ids.size() + mm.soft_pos.size() +
+                            16 * mm.blocks.size() + 64, 0);
         mm.chunk_end.resize(mm.noncausal.size(), 0);
         int row = 0;
         // GEMMA4_BARE: official-format media layout - bare <|image|>/<|audio|>
