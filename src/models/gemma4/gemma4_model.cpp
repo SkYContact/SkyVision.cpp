@@ -1344,7 +1344,41 @@ bool Gemma4::generate(const std::vector<int> & ids, const vqa::GenParams & gp,
             }
             if (!run_text(g, one, logits, mm1.empty() ? nullptr : &mm1)) return false;
         }
-    } else if (!run_text(g, ids, logits, mm)) return false;
+    } else if (!getenv("GEMMA4_PREFILL_WHOLE")) {
+        // chunked prefill: one 512-token ubatch at a time. Peak activations
+        // scale with the chunk, not the prompt - a whole 1500-token audio
+        // prefill used to blow past the ~350 MB left after weights+KV on a
+        // 12 GB card and silently page through the VMM (5x slowdown).
+        const int CH = 512;
+        for (int i0 = 0; i0 < (int)ids.size(); i0 += CH) {
+            const int i1 = std::min((int)ids.size(), i0 + CH);
+            std::vector<int> chunk(ids.begin() + i0, ids.begin() + i1);
+            MediaSplice mc;
+            if (mm) {
+                for (size_t k = 0; k < mm->soft_pos.size(); k++) {
+                    const int pos = mm->soft_pos[k];
+                    if (pos >= i0 && pos < i1) {
+                        mc.soft_pos.push_back(pos - i0);
+                        mc.soft.insert(mc.soft.end(),
+                                       mm->soft.begin() + (size_t)k * n_embd,
+                                       mm->soft.begin() + (size_t)(k + 1) * n_embd);
+                    }
+                }
+                mc.noncausal.assign(chunk.size(), 0);
+                mc.chunk_end.assign(chunk.size(), 0);
+                for (int t = i0; t < i1; t++) {
+                    if (t < (int)mm->noncausal.size() && mm->noncausal[(size_t)t]) {
+                        mc.noncausal[(size_t)(t - i0)] = 1;
+                        // future rows of the same media chunk are not in the
+                        // cache yet - clamp visibility to this ubatch's tail
+                        mc.chunk_end[(size_t)(t - i0)] =
+                            std::min(mm->chunk_end[(size_t)t], i1 - 1) - i0;
+                    }
+                }
+            }
+            if (!run_text(g, chunk, logits, mm ? &mc : nullptr)) return false;
+        }
+    } else if (!run_text(g, ids, logits, mm)) return false;   // GEMMA4_PREFILL_WHOLE
     auto t1 = std::chrono::steady_clock::now();
 
     out_text.clear();
