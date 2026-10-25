@@ -1100,6 +1100,10 @@ bool Gemma4::run_audio(const std::vector<float> & frames, int ntok,
     }
     soft.resize((size_t)n_embd * ntok);
     ggml_backend_tensor_get(a_soft_out, soft.data(), 0, sizeof(float) * soft.size());
+    if (const char * dp = getenv("GEMMA4_DUMP_SOFT")) {
+        FILE * f = fopen(dp, "wb");
+        if (f) { fwrite(soft.data(), sizeof(float), soft.size(), f); fclose(f); }
+    }
     return true;
 }
 
@@ -1369,8 +1373,13 @@ bool Gemma4::ask(const vqa::MediaInput & media, const std::string & prompt,
             }
             const int soft0 = start + (bare ? 0 : bo_len);
             const int end = soft0 + blk.n_rows - 1;   // last soft row
+            // bidirectional SWA applies to VISION chunks only: mtmd_decode_
+            // use_non_causal() returns true for projector gemma4uv but falls
+            // through to default (false) for the audio projector gemma4ua -
+            // audio rows decode causally like text
+            const bool bidir = blk.bo != id_boa;
             for (int r = start; r <= end; r++) {
-                mm.noncausal[(size_t)r] = 1;
+                mm.noncausal[(size_t)r] = bidir ? 1 : 0;
                 mm.chunk_end[(size_t)r] = end;
             }
             for (int r = 0; r < blk.n_rows; r++)
