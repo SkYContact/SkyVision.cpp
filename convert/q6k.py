@@ -197,8 +197,18 @@ def quantize_q6_k(arr):
     """arr: float32, last dim multiple of 256 -> packed uint8 (gguf-py byte convention)."""
     a = np.ascontiguousarray(arr, dtype=np.float32)
     assert a.shape[-1] % QK_K == 0, f"last dim {a.shape[-1]} not multiple of {QK_K}"
+    rows = a.reshape(-1, QK_K)
     if _HAS_CUDA:
-        out = _quantize_q6_k_torch(torch.from_numpy(a.reshape(-1, QK_K)).cuda())
+        # chunk: the torch path materializes ~20x the input as temporaries,
+        # whole-tensor launches OOM on 12GB cards (embed table = 3.9M rows)
+        CH = 65536
+        outs = []
+        for i in range(0, rows.shape[0], CH):
+            chunk = torch.from_numpy(rows[i:i + CH]).cuda()
+            outs.append(_quantize_q6_k_torch(chunk))
+            del chunk
+            torch.cuda.empty_cache()
+        out = np.concatenate(outs, axis=0)
     else:
-        out = _quantize_q6_k_numpy(a.reshape(-1, QK_K))
+        out = _quantize_q6_k_numpy(rows)
     return out.reshape(*a.shape[:-1], -1)

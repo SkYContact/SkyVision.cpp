@@ -123,6 +123,10 @@ const ArchEntry kArchs[] = {
     // towers fused as soft tokens; embedding output via Model::embed
     { { "embgemma2", nullptr }, create_embedgemma2,
       TokenizerMode::GemmaSP, "models/embeddinggemma-2", 262144, false, false, "" },
+    // Gemma 4 12B (Gemma4Unified): mixed SWA/dense text trunk, text-only for
+    // now - the vision/audio towers + soft-token fusion land in a later round
+    { { "gemma4", nullptr }, create_gemma4,
+      TokenizerMode::GemmaSP, "models/gemma-4-12B", 262144, false, false, "" },
     // SigLIP image tower: pooled embedding (get_image_features) / classifier
     { { "siglip", nullptr }, create_siglip,
       TokenizerMode::Qwen2Regex, "models/siglip-base", 0, false, true, "" },

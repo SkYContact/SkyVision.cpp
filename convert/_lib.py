@@ -119,10 +119,15 @@ def quantizer_available(qtype: gguf.GGMLQuantizationType) -> bool:
 
 def quantize(arr_f32: np.ndarray, qtype: gguf.GGMLQuantizationType) -> np.ndarray:
     """Quantize a 2D float32 array, failing with a readable message."""
+    arr32 = np.ascontiguousarray(arr_f32, dtype=np.float32)
+    if qtype == gguf.GGMLQuantizationType.Q6_K and not quantizer_available(qtype):
+        # gguf-py implements Q6_K decode only; use the ported ggml quantizer
+        import q6k
+        return q6k.quantize_q6_k(arr32)
     if not quantizer_available(qtype):
         fail(f"gguf-py in this environment cannot *quantize* {qtype.name} "
              f"(it implements decode only); pick another --outtype")
-    return quants.quantize(np.ascontiguousarray(arr_f32, dtype=np.float32), qtype)
+    return quants.quantize(arr32, qtype)
 
 
 def add_quantized(gw: gguf.GGUFWriter, name: str, blocks: np.ndarray,

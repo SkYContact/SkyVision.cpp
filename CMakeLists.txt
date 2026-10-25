@@ -237,6 +237,11 @@ set(MAGE_VL_SRC
 set(EMBG2_SRC
     src/models/embedgemma2/embedgemma2_model.cpp)
 
+#   src/models/gemma4/       Gemma 4 12B backend (mixed SWA/dense Gemma4Unified
+#                            trunk; text-first, towers land next)
+set(GEMMA4_SRC
+    src/models/gemma4/gemma4_model.cpp)
+
 #   src/models/siglip/       SigLIP image tower (pooled embedding / classifier base)
 set(SIGLIP_SRC
     src/models/siglip/siglip_model.cpp)
@@ -268,6 +273,7 @@ add_executable(vqa-cli
     ${MAGE_VL_SRC}
     ${QWEN25OMNI_SRC}
     ${EMBG2_SRC}
+    ${GEMMA4_SRC}
     ${SIGLIP_SRC}
     ${KEYE_VL_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
