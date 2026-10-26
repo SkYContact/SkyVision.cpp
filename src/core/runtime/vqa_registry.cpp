@@ -135,6 +135,10 @@ const ArchEntry kArchs[] = {
     // default - the 19 GB Q4 checkpoint does not fit a 12 GB GPU)
     { { "keye-vl2", "keye_vl2", nullptr }, create_keye_vl,
       TokenizerMode::Qwen2Regex, "models/keye-vl2", 151936, false, false, "" },
+    // Qwen3-Omni-30B-A3B thinker: Qwen3 full-attention trunk + routed MoE
+    // (vision/audio towers staged; text-only for now)
+    { { "qwen3omni", "qwen3_omni", nullptr }, create_qwen3omni,
+      TokenizerMode::Qwen2Regex, "models/qwen3-omni", 152064, false, false, "" },
     // DeepSeek Janus-Pro (1B/7B, understanding path): timm SigLIP tower +
     // MLP aligner + llama trunk; the generation side (VQ tokenizer) is not
     // part of this engine

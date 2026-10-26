@@ -56,6 +56,8 @@ struct GenParams {
     // speech output (qwen2.5-omni talker): write 24 kHz wav here when set.
     // Backends without a talker ignore it.
     const char * speak_wav = nullptr;
+    std::string speaker;          // talker voice name (qwen3-omni: chelsie/ethan/aiden)
+    int max_codes = 400;          // talker codec-frame cap (anti-runaway on long text)
 };
 
 // Candidate scoring: a "System One" video model does not decode an answer, it

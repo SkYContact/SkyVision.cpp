@@ -25,5 +25,6 @@ Model * create_gemma4();
 Model * create_siglip();
 Model * create_janus();
 Model * create_keye_vl();
+Model * create_qwen3omni();
 
 }  // namespace vqa

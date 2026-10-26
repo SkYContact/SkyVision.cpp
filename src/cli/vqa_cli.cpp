@@ -34,6 +34,17 @@
 
 namespace {
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
+static const bool _no_assert_dialog = []{
+#ifdef _WIN32
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_DEBUG);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_DEBUG);
+#endif
+    return true;
+}();
+
 void usage() {
     fprintf(stderr,
         "usage: vqa-cli --model <gguf> [--tokenizer <path|dir>]\n"
@@ -99,8 +110,10 @@ int main(int argc, char ** argv) {
     std::string model_path, tokenizer_arg, image_path, frames_dir, video_path, audio_path, speak_wav, ask_text, mode, arch_override, batch_path,
                 dump_dir, vision_path, region_path, score_path, embed_text, embed_file,
                 embed_preset = "none";
+    std::string speaker;
     bool embed_given = false;
-    int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;   // 0 = backend default
+    int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;
+    int max_codes = 400;   // 0 = backend default
     int ep_dim = 0;
     float temp = 0.0f, top_p = 1.0f, fps = 0.0f, threshold = 0.0f;
     int max_frames = 32;
@@ -125,6 +138,8 @@ int main(int argc, char ** argv) {
         else if (a == "--video") video_path = next("--video");
         else if (a == "--audio") audio_path = next("--audio");
         else if (a == "--speak") speak_wav = next("--speak");
+        else if (a == "--max-codes") max_codes = atoi(next("--max-codes"));
+        else if (a == "--speaker") speaker = next("--speaker");
         else if (a == "--max-frames") max_frames = atoi(next("--max-frames"));
         else if (a == "--serve") { serve_port = atoi(next("--serve")); if (serve_port <= 0) serve_port = 8899; }
         else if (a == "--host") serve_host = next("--host");
@@ -248,6 +263,8 @@ int main(int argc, char ** argv) {
 
     vqa::GenParams gp;
     if (!speak_wav.empty()) gp.speak_wav = speak_wav.c_str();
+    if (!speaker.empty()) gp.speaker = speaker;
+    if (max_codes != 400) gp.max_codes = max_codes;
     gp.max_tokens = max_tokens;
     gp.temperature = temp;
     gp.top_k = top_k;

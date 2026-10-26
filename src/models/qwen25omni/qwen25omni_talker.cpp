@@ -9,6 +9,7 @@
 //              eos / text-pad embeddings once the reply runs out.
 // The projector to_proj maps the 2048-wide track sum into the 896-wide trunk;
 // codec_head turns the trunk output into logits over the 8448-entry codebook.
+#include "core/blocks/omni_speech.hpp"
 #include "qwen25omni_talker.hpp"
 
 #include "core/engine/attention.hpp"
@@ -172,42 +173,12 @@ bool TalkerLM::build_prefill(int T, int S) {
 }
 
 // temp/top-k/top-p sampling with repetition penalty, codec_bos suppressed
+// temp/top-k/top-p sampling with repetition penalty, codec_bos suppressed;
+// thin wrapper over the shared vqa::omni::CodecSampler block
 int TalkerLM::sample_codec(std::vector<float> & lg, uint64_t & rng) {
-    for (int t : strm_hist) {
-        if (t < 0 || t >= n_vocab) continue;
-        float & v = lg[(size_t)t];
-        v = v > 0 ? v / s_rep : v * s_rep;
-    }
-    lg[(size_t)id_codec_start] = -INFINITY;
-    std::vector<std::pair<float, int>> cand((size_t)n_vocab);
-    for (int i = 0; i < n_vocab; i++) cand[(size_t)i] = { lg[(size_t)i], i };
-    std::sort(cand.begin(), cand.end(),
-              [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
-                  return a.first > b.first;
-              });
-    int keep = s_topk > 0 ? std::min(n_vocab, s_topk) : n_vocab;
-    const float inv_t = 1.0f / std::max(s_temp, 1e-4f);
-    std::vector<float> p((size_t)keep);
-    float mx = cand[0].first, sum = 0.0f;
-    for (int i = 0; i < keep; i++) {
-        p[(size_t)i] = expf((cand[(size_t)i].first - mx) * inv_t);
-        sum += p[(size_t)i];
-    }
-    for (int i = 0; i < keep; i++) p[(size_t)i] /= sum;
-    if (s_topp < 1.0f) {
-        float acc = 0.0f;
-        int n = 0;
-        while (n < keep && acc < s_topp) { acc += p[(size_t)n]; n++; }
-        keep = std::max(1, n);
-    }
-    rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
-    const float r = (float)(((rng * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0));
-    float acc = 0.0f;
-    for (int i = 0; i < keep; i++) {
-        acc += p[(size_t)i];
-        if (r <= acc) return cand[(size_t)i].second;
-    }
-    return cand[(size_t)keep - 1].second;
+    vqa::omni::CodecSampler s(n_vocab, s_temp, s_topk, s_topp, s_rep);
+    s.suppress_ids = { id_codec_start };
+    return s.sample(lg, &strm_hist, rng);
 }
 
 bool TalkerLM::stream_begin(const std::vector<int> & prompt_toks,

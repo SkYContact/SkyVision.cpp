@@ -25,6 +25,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"   // the compat finalize_sinks overload needs cpu_init
 
 #include <cstring>
 

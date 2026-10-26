@@ -17,6 +17,19 @@
 namespace vqa {
 namespace gguf {
 
+// metadata keys with a given prefix -> {(suffix, u32 value)} for enum-ish
+// blocks (e.g. per-speaker ids); non-UINT32 entries are skipped.
+inline std::vector<std::pair<std::string, int>> u32_by_prefix(struct gguf_context * g, const char * prefix) {
+    std::vector<std::pair<std::string, int>> out;
+    const size_t n = strlen(prefix);
+    for (int64_t i = 0; i < gguf_get_n_kv(g); i++) {
+        const char * k = gguf_get_key(g, i);
+        if (strncmp(k, prefix, n) == 0 && gguf_get_kv_type(g, i) == GGUF_TYPE_UINT32)
+            out.push_back(std::make_pair(std::string(k + n), (int)gguf_get_val_u32(g, i)));
+    }
+    return out;
+}
+
 // Scalar float metadata; `def` when the key is absent (or of another type).
 inline float f32(struct gguf_context * g, const char * key, float def) {
     const int64_t id = gguf_find_key(g, key);

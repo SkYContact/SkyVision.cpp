@@ -251,6 +251,13 @@ set(SIGLIP_SRC
 set(KEYE_VL_SRC
     src/models/keye_vl/keye_vl_model.cpp)
 
+#   src/models/qwen3omni/   Qwen3-Omni-30B-A3B thinker (Qwen3 full-attn MoE
+#                           trunk; vision/audio towers staged)
+set(QWEN3OMNI_SRC
+    src/models/qwen3omni/qwen3omni_model.cpp
+    src/models/qwen3omni/qwen3omni_audio.cpp
+    src/models/qwen3omni/qwen3omni_talker.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -275,7 +282,8 @@ add_executable(vqa-cli
     ${EMBG2_SRC}
     ${GEMMA4_SRC}
     ${SIGLIP_SRC}
-    ${KEYE_VL_SRC})
+    ${KEYE_VL_SRC}
+    ${QWEN3OMNI_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 # expert_cache.cpp (CUDA async prefetch) includes cuda_runtime.h and calls the
 # CUDA runtime directly, so vqa-cli needs the toolkit headers/libs too
@@ -284,7 +292,7 @@ if (TARGET ggml-cuda)
     target_include_directories(vqa-cli PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(vqa-cli PRIVATE CUDA::cudart)
 endif()
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC})
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl)
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(vqa-cli PRIVATE jpeg-static)
@@ -329,3 +337,21 @@ endif()
 add_executable(vram-probe tools/vram_probe.cpp src/core/runtime/vram_guard.cpp)
 target_link_libraries(vram-probe PRIVATE ggml ggml-cpu)
 target_include_directories(vram-probe PRIVATE ${GGML_INC} ${SRC_INC})
+
+add_executable(qwen3omni-pw-test tools/qwen3omni_pw_test.cpp
+    src/models/qwen3omni/qwen3omni_talker.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(qwen3omni-pw-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3omni)
+target_link_libraries(qwen3omni-pw-test PRIVATE ggml ggml-cpu)
+
+add_executable(qwen3omni-pred-test tools/qwen3omni_pred_test.cpp
+    src/models/qwen3omni/qwen3omni_talker.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(qwen3omni-pred-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3omni)
+target_link_libraries(qwen3omni-pred-test PRIVATE ggml ggml-cpu)
+
+add_executable(qwen3omni-c2w-test tools/qwen3omni_c2w_test.cpp
+    src/models/qwen3omni/qwen3omni_talker.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(qwen3omni-c2w-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3omni)
+target_link_libraries(qwen3omni-c2w-test PRIVATE ggml ggml-cpu)

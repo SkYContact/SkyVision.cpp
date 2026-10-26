@@ -38,8 +38,10 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | `mage_vl` | — | 图像 + 视频 + 文本 | ask gate | ✅ | — |
 | `qwen25omni` | `qwen2_5_omni` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
 | `embgemma2` | — | 图像 + 视频 + 音频 + 文本 | embed | — | — |
+| `gemma4` | — | 图像 + 视频 + 音频 + 文本 | ask | — | — |
 | `siglip` | — | 图像 | classify embed | — | 纯视觉 |
 | `keye-vl2` | `keye_vl2` | 图像 + 视频 + 文本 | ask | — | — |
+| `qwen3omni` | `qwen3_omni` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
 | `janus` | `janus_pro` | 图像 + 文本 | ask | — | — |
 <!-- /AUTO-GENERATED capability matrix -->
 
@@ -58,6 +60,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **MiniCPM-V 4.7（1B）** | `minicpmv47` | 图像 + 视频 | openbmb 端侧 VLM，**文本主干就是 Qwen3.5**（`text_config.model_type = qwen3_5_text`，24 层 3:1 gated-delta/全注意力、IMROPE 11/11/10、q\|gate 交织、untied lm_head），因此直接跑在 `qwen3_5` 后端的 minicpm 模式下，不重复一份文本图。新增部分只有：**SigLIP canvas 视觉塔**（27 层、d=1152、patch14、GELU-tanh、无 rope——learned 70×70 位置表按最近桶取值，整塔即共享 `vqa::vit::block`）+ **16× 两级合并**（第 6 层后插入窗口注意力 merger：2×2 窗口内注意力 + 4×d 展平后 LN/Linear/GELU/Linear，再 2×2 投影 MLP 到文本宽度）+ **canvas M-RoPE**（视觉 token 铺 2-D 画布，`<image>`/`</image>` 钉在画布光晕/远端角，文本计数从 `max(h,w)+1` 续；图像块后面那个模板换行也钉在 canvas 原点，官方行为）。`slice_mode` 走官方切片规则（长边 >448 起切，最多 9 块 `<slice>` 明细 + 缩略图，每块独立过一次塔），视频按帧推进同一套 canvas。转换 `convert/convert_minicpmv47.py`。开关：`MINICPM_DOWNSAMPLE=4x`（4x 保 token）、`MINICPM_NO_SLICES=1`、`MINICPM_SCALE_RES=<n>`（缩略图长边，默认 448）。预置权重：`hf download SkyContact/MiniCPM-V-4.7-1B-GGUF`（含 tokenizer，魔搭同名 `modelscope download --model SkyContact/MiniCPM-V-4.7-1B-GGUF`） |
 | **Qwen2.5-VL（3B）** | `qwen2vl` | 图像（视频待接） | Qwen2 文本主干（36 层 GQA 16:2、qkv 带 bias、section MRoPE 16/24/24、SwiGLU）+ Qwen2.5 ViT（32 层、patch14、temporal2、2×2 merge、**窗口注意力**：每 8 层一次全局）+ merger。动态分辨率走 `smart_resize`（28 的倍数），预处理是 **CLIP mean/std**、bicubic 缩放、patch 按 **2×2 分组序**打包 |
 | **Qwen2.5-Omni（3B）** | `qwen25omni` | 图像 + 音频输入，文本 + 语音输出 | 全功能 thinker-talker：Qwen2.5 文本主干（untied lm_head）+ Qwen2.5-VL 视觉塔（与 `qwen2vl` 同款窗口注意力图）+ Whisper 系音频塔（128-bin log-mel、**n_window=100 分块卷积+分块注意力**、25 token/s）→ **Talker**（24 层双轨 LM：文本轨吃 thinker 隐状态，输出 25Hz codec token）→ **Token2Wav**（flow-matching DiT，RK4×10 步 + CFG + sway 采样；BigVGAN v2 抗锯齿激活，纯 C++ 宿主实现）。音频输入走 `--audio`（ffmpeg 解码 16k mono）。参考实现：llama.cpp PR #13784（thinker）+ HF transformers 5.20 官方源码（全部语义基准），mel/音频塔与官方逐位对齐 |
+| **Qwen3-Omni（30B-A3B-Instruct）** | `qwen3omni` | 图像 + 音频输入，文本 + 语音输出 | **首个 ggml 实现**（llama.cpp 无此架构）：thinker=标准 Qwen3 全注意力 + MoE 文本主干（48 层、128 专家激活 8、interleaved MRoPE 24/20/20 逐轴整支 128 维）+ Qwen3-VL 视觉塔（deepstack 三抽头，与 `qwen3vl` 共享 `qwen3vl_tower` 积木）+ Qwen3-ASR 同族音频塔（128 mel、chunk 500、窗 800）→ **Talker**（20 层 MoE + sigmoid 门控共享专家；用户段只喂 role==user token；step 输入=16 个嵌入行求和）→ **code predictor**（5 层 dense，15 组独立嵌入表/头——**头未 tie，checkpoint 独立权重**，与 codec_head 同理）→ **code2wav**（8 层窗注意力 transformer + 上采样 ConvNeXt + snake/transconv 解码器，**整条声码器是单张 ggml 图**：F32 im2col+mul_mat 卷积、conv_transpose_1d、sin/sqr snake，比宿主循环快 50-100×）。语音出 `--speak`（24 kHz，`--speaker chelsie|ethan|aiden` 选音色、`--max-codes` 限帧）；三模态理解与语音输出全部对 HF transformers 5.20 逐段对拍（corr 0.996-0.9999，ASR 逐字验收）。
 | **Janus-Pro-1B** | `janus`（`janus_pro`） | 图像 |  DeepSeek 解耦式理解/生成 VLM 的**理解侧**（VQ 生成解码器不属于本引擎）：timm 风味 SigLIP-large-384 视觉塔（24 层、d=1024、patch16、fused qkv+全 bias、**GELU(erf)**、无 cls token、select_layer=-1 全层 + 终端 LN）+ 2 层 MLP aligner（1024→2048 GELU(erf) →2048）+ 纯 llama 1.5B 文本主干（24 层、16:16 头、theta 1e4、untied 102400 vocab）。预处理官方口径：bicubic 保比缩到长边 384 → expand2square 填充 (127,127,127) → /255 归一化；一图 576 个 `<image_placeholder>` token，deepseek sft 模板（`<\|User\|>:` 开头，问题后换行接 576 个占位符，再空行后以 `<\|Assistant\|>:` 收尾）。分词器新增 `DeepSeekBpe` 模式（isolated Split 序：拉丁/标点各带一个前导空格、CJK 大块连写、数字逐位——与 HF 官方逐 id 一致）。f16 3.9 GB / q8_0 ≈ 2.1 GB；对拍：与 fp32 官方栈 logits corr 0.9999、输出逐字一致。转换 `convert/convert_janus.py`。预置权重：`modelscope download --model SkyContact/Janus-Pro-1B-GGUF`（f16/q8_0/q4_0 + tokenizer，HF 同名 `hf download SkyContact/Janus-Pro-1B-GGUF`） |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 | **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
@@ -375,6 +378,7 @@ CI 的推送构建默认**不带权重**（`MODEL_REPO=`）：BuildKit 的 `--mo
 | `convert_videomae.py` | `videomae-<outtype>.gguf`（VideoMAE 视频塔，单文件，`--outtype f16\|q8_0\|q4_0`；分类头与 `id2label` 一起写进 GGUF） |
 | `convert_vjepa2.py` | `vjepa2-<outtype>.gguf`（V-JEPA 2 编码器 + 可选 attentive pooler/分类器/predictor，单文件，`--outtype f16\|f32\|q8_0\|q4_0`，f16 约 653MB；`--no-predictor` / `--no-pooler` 裁头；q/k 行按 RoPE 布局重排） |
 | `convert_qwen2vl.py` | `qwen2vl-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
+| `convert_qwen3omni.py` + `convert_qwen3omni_talker.py` | `qwen3omni-30b-thinker-<outtype>.gguf` + `qwen3omni-talker-<outtype>.gguf`（thinker 与 talker 分两文件，qwen25omni 先例；音频/视觉塔永久 F16，`--quant-audio` 已按精度策略撤除）
 | `convert_qwen25omni.py` | `qwen25omni-<outtype>.gguf`（thinker）+ `qwen25omni-talker-<outtype>.gguf`（talker+token2wav），`--outtype f16\|q8_0\|q4_0`、`--vision-f32`、`--no-talker` |
 | `convert_janus.py` | `janus-pro-1b-<outtype>.gguf`（timm SigLIP 塔 + aligner + llama 主干，理解侧单文件，`--outtype f16\|q8_0\|q4_0`；生成侧 VQ 解码器不导出） |
 | `convert_smolvlm.py` | `smolvlm-<outtype>.gguf`（单文件，`--outtype f16\|q8_0\|q4_0`，默认 f16） |
@@ -675,6 +679,24 @@ token2wav 在 CPU bf16 下有 dtype 问题，参考输出待补），音量偏�
 GPU 上所有"宿主直读权重"的位置（mel 滤波器、BigVGAN/ECAPA/spk）都必须走
 `ggml_backend_tensor_get`——GPU 上 `t->data` 是空指针，`tensor_to_f32` 直读必崩。
 
+### Qwen3-Omni
+
+```bash
+python convert/convert_qwen3omni.py --src models/qwen3-omni/hf --outtype q6_k
+python convert/convert_qwen3omni_talker.py --src models/qwen3-omni/hf --outtype q8_0
+vqa-cli --model qwen3omni-30b-thinker-q6_k.gguf --tokenizer models/qwen3-omni/hf \
+        --image photo.jpg --audio clip.wav --ask "What do you see and hear?" \
+        --speak reply.wav --speaker ethan --max-codes 400
+```
+
+thinker 侧三模态与官方逐段对拍（图像 1200 patch→300 token、音频 400 mel→52 token、文本 1 层 parity
+corr 0.9997+）。talker 侧全部协议坑都在 `qwen3omni_talker.hpp` 头注释里：双轨轨迹（embedding + 第 24 层
+隐层）→ ResizeMLP 投影 → 预填九行（3 文本 + 4×tts_pad + bos + 首生成 token，错位加 6 个 codec 特殊嵌入）；
+**codec_head 与 predictor 的 15 个头都不 tie**（checkpoint 两侧都在且数值不同，HF tie_weights 明确不
+tie——当初按"embedding wins"强 tie 导致引擎与 oracle 双双输出无意义音节，是该后端最后一处也是最大一处
+协议坑）。声码器为单张 ggml 图（`code2wav_graph`），`QOMNI_TRAJ_DUMP` 可导出轨迹供
+`parity/qwen3omni/hf_speak_oracle.py` 做 HF 全链 A/B。CPU（Q6_K）参考速度：decode 6+ tok/s、
+`--speak` 全程（30 帧）约 15-25 s，其中声码器仅约 3 s。
 ### EmbeddingGemma-2（四模态嵌入）
 
 ```bash

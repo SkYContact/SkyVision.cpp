@@ -12,6 +12,7 @@
 //     are plain running positions, exactly like text.
 // Talker (speech output) loads from the qwen25omni-talker-*.gguf sibling when
 // present; until it is wired the backend answers with text only.
+#include "core/blocks/omni_speech.hpp"
 #include "qwen25omni_model.hpp"
 #include "qwen25omni_talker.hpp"
 
@@ -1286,30 +1287,11 @@ bool Qwen25Omni::finish_speech(std::vector<int> & codec, const char * wav_path,
     fprintf(stderr, "timing: talker %.2f s | t2w %.2f s (%d codes)\n",
             talker_seconds,
             std::chrono::duration<double>(t_t2w1 - t_t2w0).count(), (int)codec.size());
-    // write a 24 kHz mono s16 wav
-    FILE * f = fopen(wav_path, "wb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", wav_path); return false; }
-    const uint32_t rate = 24000, n = (uint32_t)pcm.size();
-    const uint16_t ch = 1, bits = 16;
-    const uint32_t bytes = n * 2;
-    fwrite("RIFF", 1, 4, f);
-    uint32_t v32 = 36 + bytes; fwrite(&v32, 4, 1, f);
-    fwrite("WAVEfmt ", 1, 8, f);
-    v32 = 16; fwrite(&v32, 4, 1, f);
-    uint16_t v16 = 1; fwrite(&v16, 2, 1, f);
-    fwrite(&ch, 2, 1, f); fwrite(&rate, 4, 1, f);
-    v32 = rate * 2; fwrite(&v32, 4, 1, f);
-    v16 = 2; fwrite(&v16, 2, 1, f);
-    fwrite(&bits, 2, 1, f);
-    fwrite("data", 1, 4, f);
-    fwrite(&bytes, 4, 1, f);
-    for (uint32_t i = 0; i < n; i++) {
-        float s = std::min(1.0f, std::max(-1.0f, pcm[i]));
-        int16_t q = (int16_t)lrintf(s * 32767.0f);
-        fwrite(&q, 2, 1, f);
+    // write a 24 kHz mono s16 wav (shared omni block)
+    if (!vqa::omni::write_wav_24k(wav_path, pcm)) {
+        fprintf(stderr, "cannot open %s\nn", wav_path); return false;
     }
-    fclose(f);
-    fprintf(stderr, "speech: %s (%.2f s @ 24 kHz)\n", wav_path, n / 24000.0);
+    fprintf(stderr, "speech: %s (%.2f s @ 24 kHz)\n", wav_path, pcm.size() / 24000.0);
     return true;
 }
 

@@ -124,6 +124,11 @@ const SpecRow kSpecs[] = {
       "video = official default path (per-frame tower passes + <|frame|><hh:mm:ss> markers, "
       "official mRoPE get_rope_index parity; the packing_position_embedding table is dead "
       "code on the official video path). Opt-in slow/fast dual-stream frame_types not implemented" },
+    { "qwen3omni", "qwen3_omni", "image audio text", "ask",
+      false, false, false, true, "models/qwen3-omni", "",
+      "first ggml implementation of the Qwen3-Omni thinker-talker; speech output via --speak "
+      "(talker+code2wav sibling gguf; --speaker chelsie|ethan|aiden, --max-codes cap). "
+      "Vocoder runs as one ggml graph (im2col / conv_transpose_1d), 50-100x the host loop it replaced" },
     { "janus", "janus_pro", "image text", "ask",
       false, false, false, false, "models/Janus-Pro-1B", "",
       "understanding path only; the generation VQ decoder is not part of this engine" },
