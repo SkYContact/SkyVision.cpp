@@ -206,11 +206,18 @@ private:
     // so a fresh ggml_context per step would never replay).
     TextGraph dec_g;
     int dec_g_bucket = -1;
-    bool reuse_vision = true;                     // last page's features + first logits
-    uint64_t vis_hash = 0;
-    std::vector<float> vis_feats_cache;
-    std::vector<float> first_logits_cache;
-    int vis_n_cache = 0, vis_prefix_cache = 0;
+    // Repeat-page cache. The vision tower is the expensive half (17 s on CPU), so
+    // features are kept for the last two pages; the first-step logits and the
+    // prefix length are only valid for the page that currently OWNS the KV cache.
+    struct PageCache {
+        uint64_t hash = 0;
+        std::vector<float> feats;
+        int n_vis = 0;
+        std::vector<float> first_logits;   // valid only while kv_owner matches
+        int prefix = 0;
+        bool kv_owner = false;
+    };
+    std::vector<PageCache> pages;         // at most 2
 
     uint64_t rng_state = 0x243F6A8885A308D3ull;
 };
@@ -789,24 +796,32 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
     // prefix pass depend only on the image and the fixed prompt, so reuse both -
     // including the first-step logits, since the KV cache is already filled.
     const uint64_t h = hash_page(media, text);
-    const bool hit = reuse_vision && h != 0 && h == vis_hash && !vis_feats_cache.empty() &&
-                     !first_logits_cache.empty();
+    PageCache * cached = nullptr;
+    for (auto & e : pages) if (e.hash == h && !e.feats.empty()) cached = &e;
+    const bool kv_hit = cached && cached->kv_owner && !cached->first_logits.empty();
     std::vector<float> feats;
     int n_vis = 0;
     std::vector<float> logits;
     std::vector<int> pos;
     int T = 0;
-    if (hit) {
-        n_vis = vis_n_cache;
-        T = vis_prefix_cache;
-        logits = first_logits_cache;
+    if (kv_hit) {
+        n_vis = cached->n_vis;
+        T = cached->prefix;
+        logits = cached->first_logits;
+        feats = cached->feats;
         fprintf(stderr, "nemotron_parse: page unchanged - reusing %d visual tokens and the "
                         "prefix KV (%d tokens)\n", n_vis, T);
+    } else if (cached) {
+        feats = cached->feats;             // tower skipped, prefix must be re-run
+        n_vis = cached->n_vis;
+        fprintf(stderr, "nemotron_parse: cached page - skipping the vision tower (%d tokens)\n",
+                n_vis);
     } else {
         if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
         if (!encode_image(media, feats, &n_vis)) return false;
         if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
     }
+    const bool hit = kv_hit;
 
     const int T_tok = (int)toks.size();
     if (!hit) T = n_vis + T_tok;
@@ -837,13 +852,21 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         fprintf(stderr, "[perf] nemotron_parse prefill: %.0f ms for %d tokens (%d visual)\n",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count(),
                 T, n_vis);
-        // remember this page: features + first-step logits (the prefix KV stays live)
-        vis_hash = h;
-        vis_feats_cache = feats;
-        first_logits_cache = logits;
-        vis_n_cache = n_vis;
-        vis_prefix_cache = T;
     }
+    // this page now owns the KV cache (so it may reuse its first-step logits);
+    // everybody else keeps the features and loses the logits
+    for (auto & e : pages) e.kv_owner = false;
+    if (!cached) {
+        if (pages.size() >= 2) pages.erase(pages.begin());
+        pages.emplace_back();
+        cached = &pages.back();
+        cached->hash = h;
+    }
+    if (cached->feats.empty()) cached->feats = feats;
+    cached->n_vis = n_vis;
+    cached->prefix = T;
+    cached->first_logits = logits;
+    cached->kv_owner = true;
     n_past = T;
 
     std::vector<int> out;
@@ -873,9 +896,11 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         // build+alloc cost disappears and ggml-cuda's CUDA graph cache can replay
         // (it keys on cgraph->nodes[0], so a fresh context per token never hits).
         // Unused rows are masked -inf by set_causal_mask, so widening S is exact.
-        int S = n_past + 1;
-        if (S <= 1024) { int b = 128; while (b < S) b <<= 1; S = b; }
-        else S = ((S + 1023) / 1024) * 1024;
+        // The bucket is backend-dependent on purpose: a wider window makes flash
+        // attention attend to dead keys, which on CPU costs more than the rebuild
+        // it saves (CPU attention is the bottleneck, GPU launch overhead is).
+        const int bucket = ggml_backend_is_cpu(backend) ? 128 : 1024;
+        int S = ((n_past + 1 + bucket - 1) / bucket) * bucket;
         if (S > n_ctx) S = n_ctx;
         if (dec_g_bucket != S) {
             if (dec_g.ctx) ggml_free(dec_g.ctx);

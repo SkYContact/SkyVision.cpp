@@ -775,15 +775,22 @@ JSON 里每个 block 是 `{"class","bbox":[x1,y1,x2,y2]（内容区归一化）,
 降下来能把视觉塔成本砍到 1/16——塔是 O(视觉 token²)）；`NEMOTRON_PARSE_PROFILE=1` 打印图规模与
 `compute / graph build` 拆分。`--max-tokens` 要给够（整页 2-8k，截断前会告警）。
 
+> 这些数是机器相对空闲时的。同一台机器上开着 UE 编辑器 + Live Coding 时实测会退化到
+> 视觉塔 0.9–1.0 s / GPU decode 2.6–2.9 ms/token / CPU decode 22–28 ms/token——比的是同一批
+> 测量里的相对变化，绝对值随负载漂。
+
 图层面做了三件事，都是量出来的：
 
-- **q/k/v 融合成一个投影**：转换器把三份权重拼成 `[n_qkv, n_embd]`，一层一次 matmul（GPU decode
-  的 mul_mat 从 61 降到 41，add 从 102 降到 82）。
+- **q/k/v 融合成一个投影**：转换器把三份权重拼成 `[n_qkv, n_embd]`，一层一次 matmul（decode 图
+  里 mul_mat 61 → 41、add 102 → 82；代价是 `set_rows`/FA 要求行连续，三个切片要各拷一次）。
+  同一批测量里 GPU decode 2.5 → 1.6 ms/token。
 - **decode 图按 KV 窗口分桶复用**：形状固定后不再每 token 重建（建图+分配 0.48 → 0.06–0.22
   ms/token），而且 `ggml-cuda` 的 CUDA graph 缓存**按 `cgraph->nodes[0]` 做键**——每步新建上下文
-  永远命中不了，现在能重放了。
-- **同一页重复提问走缓存**：视觉特征 + 首步 logits + 前缀 KV 都留着（key = 提示词 + 像素的 FNV-1a），
-  MCP 实测第二次调用 **12.5 s → 2.0 s**，输出逐字节相同。
+  永远命中不了，现在能重放了。桶宽按后端分：CPU 128（窗口放宽等于让 FA 去算死 key，CPU 上不划算）、
+  GPU 1024。
+- **同一页重复提问走缓存**：视觉特征（最近两页）+ 首步 logits + 前缀 KV 都留着（key = 提示词 +
+  像素的 FNV-1a；只有持有 KV 的那一页能复用 logits）。MCP 实测同页第二次调用 **12.5 s → 2.0 s**、
+  换页再换回来（A→B→A）只重跑 prefill、不重跑视觉塔，输出逐字节相同。
 
 **量化取舍（实测，跟直觉相反）**：`q8_0`（866 MB，视觉塔也能量化——Q8_0/Q4_0 的行块是 32 而不是
 256）在这台机器上**更慢**：GPU decode 2.5 → 4.5 ms/token、视觉塔 675 → 950 ms，CPU 视觉塔

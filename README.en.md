@@ -766,16 +766,25 @@ cuts the tower cost by ~16× (the default canvas is 2048×1664 and the tower is 
 tokens); `NEMOTRON_PARSE_PROFILE=1` prints the graph shape and the compute / graph-build split;
 `--max-tokens` needs room (a page is 2-8k tokens, and the backend warns before clipping).
 
+> Those numbers are from a quiet machine. With the Unreal editor + Live Coding running on the same
+> box they degrade to ~0.9–1.0 s of tower, 2.6–2.9 ms/token on GPU and 22–28 ms/token on CPU — the
+> comparisons below are relative, measured within one batch, while absolute numbers drift with load.
+
 Three graph-level changes, all measured:
 
 - **q/k/v fused into one projection**: the converter writes one `[n_qkv, n_embd]` matrix, so a layer
-  does one matmul instead of three (GPU decode: `mul_mat` 61 → 41, `add` 102 → 82).
+  does one matmul instead of three (`mul_mat` 61 → 41, `add` 102 → 82; the three slices get copied
+  once because `set_rows` and flash-attn want contiguous rows). GPU decode 2.5 → 1.6 ms/token within
+  the same batch of measurements.
 - **the decode graph is bucketed by KV window and rebuilt only when the bucket changes**: the
   per-token build+alloc drops from 0.48 to 0.06–0.22 ms, and — load-bearing — `ggml-cuda`'s CUDA
   graph cache is keyed on `cgraph->nodes[0]`, so a fresh ggml context per step could never replay.
-- **repeat queries on the same page hit a cache** (visual features + first-step logits + the prefix
-  KV, keyed by an FNV-1a of prompt and pixels): via MCP the second call went **12.5 s → 2.0 s** with
-  byte-identical output.
+  The bucket width follows the backend: 128 on CPU (a wider window makes FA attend to dead keys,
+  which is a bad trade where attention is the bottleneck) and 1024 on GPU.
+- **repeat queries hit a page cache**: visual features (last two pages) + first-step logits + the
+  prefix KV, keyed by an FNV-1a of prompt and pixels (only the page that owns the KV may reuse its
+  logits). Via MCP the second call on the same page went **12.5 s → 2.0 s**; A→B→A re-runs just the
+  prefix and skips the tower, byte-identical output.
 
 **Quantisation is a loss here (measured, counter-intuitive)**: `q8_0` (866 MB; the tower quantises
 too, since Q8_0/Q4_0 have 32-element rows, not 256) is **slower**: GPU decode 2.5 → 4.5 ms/token
