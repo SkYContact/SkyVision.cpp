@@ -800,7 +800,7 @@ std::string NemotronParse::render_answer(const std::string & raw, const std::str
     if (mode == "json" || mode == "blocks") {
         std::vector<Block> blocks;
         parse_blocks(raw, blocks);
-        return to_json(blocks, img_w, img_h);
+        return to_json(blocks, img_w, img_h, raw);
     }
     if (mode == "text" || mode == "plain") {
         std::vector<Block> blocks;

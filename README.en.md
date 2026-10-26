@@ -779,9 +779,12 @@ tokens and the backend warns before clipping). q8_0 weights are **slower** here 
 flash-attention bound and GPU decode is kernel-latency bound — neither benefits from weight
 bandwidth), so only use them to save space.
 
-**Known simplifications**: charts are treated as text (no upstream panel rendering / caption
-relocation / native subtitles); the JSON does not echo `raw_out`; one page per call (loop in the
-caller for multi-page documents). Weights are under
+Chart blocks render the way upstream does: the markdown pipe table inside `<chart …>` becomes a
+`<table>` and the `title:` line becomes its `<caption>`; a single-line Caption sitting directly above a
+chart is folded into that title under the upstream rules (horizontal overlap ≥80%, vertical gap
+≤0.03, nearest and unambiguous). What is missing is upstream's `merge.py` stage (block and
+table-neighbour merging, multi-column re-ordering) — the reading order stays the model's. One page per
+call (loop in the caller for multi-page documents). Weights are under
 [OpenMDW 1.1](https://huggingface.co/nvidia/Nemotron-3.5-Parse) and are **not distributed here**.
 
 ## Why a standalone engine?

@@ -11,12 +11,19 @@
 // just `value * original_size`. Block order IS the reading order - nothing here
 // re-sorts by geometry.
 //
-// Deliberate simplifications against the upstream package (all presentation-only,
-// none change the block/bbox contract):
-//   * no chart panel rendering / caption relocation / native subtitles
+// Covered, matching upstream: block parsing + exact dedupe, `<tbc>` cleanup,
+// Title/Section-header markdown, LaTeX `tabular` -> HTML, chart bodies (pipe
+// table -> HTML with the `title:` line as its <caption>, engine/chart_caption.py),
+// caption relocation (engine/caption_relocation.py) and `raw_out` in the JSON.
+//
+// Deliberate simplifications (all presentation-only, none change the block/bbox
+// contract):
+//   * no upstream `merge.py` stage: no block/line merging, no table-neighbour
+//     merging and no multi-column re-ordering - reading order stays the model's
 //   * header promotion uses the shape heuristic only (upstream also wants the
 //     first row to be mostly bold, which LaTeX tabular markup rarely carries)
-//   * `raw_out` is not echoed back inside the JSON
+//   * chart panels/multi-series rendering is not re-implemented; the body's DSL
+//     lines (`axis[...]`, `bind:`) are kept as upstream keeps them
 #pragma once
 
 #include <algorithm>
@@ -24,7 +31,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nemotron_parse {
@@ -352,6 +361,161 @@ inline bool latex_table_to_html(const std::string & src, std::string & html) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Chart bodies. A Chart block answers with a small DSL plus a pipe table:
+//
+//   <chart type="bar">
+//   title: Revenue by region in 2026
+//   axis[y]: millions USD
+//   bind: millions USD ;  ; y
+//
+//   | Region | millions USD |
+//   | --- | --- |
+//   | North | 35 |
+//   </chart>
+//
+// Upstream (engine/chart_caption.py) renders the pipe table as HTML and moves the
+// `title:` line into its `<caption>`, removing the line from the body; everything
+// else (the tags, `axis[...]`, `bind:`) is left as-is, so that is what happens
+// here. The table is only converted when it is a plain pipe table: no escaped
+// pipes, no backticks, at least three rows, equal widths, a separator row.
+
+inline bool split_lines(const std::string & s, std::vector<std::string> & out) {
+    out.clear();
+    size_t p = 0;
+    while (p <= s.size()) {
+        const size_t e = s.find('\n', p);
+        if (e == std::string::npos) {
+            out.push_back(s.substr(p));
+            break;
+        }
+        out.push_back(s.substr(p, e - p));
+        p = e + 1;
+    }
+    return !out.empty();
+}
+
+inline bool is_table_row(const std::string & line) {
+    const std::string t = trim(line);
+    return t.size() >= 2 && t.front() == '|' && t.back() == '|';
+}
+
+inline bool is_separator_row(const std::string & line) {
+    if (!is_table_row(line)) return false;
+    const std::string t = trim(line);
+    bool seen = false;
+    for (size_t i = 1; i + 1 < t.size(); i++) {
+        const char c = t[i];
+        if (c == '|' || c == '-' || c == ':' || c == ' ' || c == '\t') {
+            if (c == '-') seen = true;
+            continue;
+        }
+        return false;
+    }
+    return seen;
+}
+
+inline std::vector<std::string> table_cells(const std::string & line) {
+    std::vector<std::string> cells;
+    const std::string t = trim(line);
+    size_t start = 1;                       // skip the leading '|'
+    for (size_t i = 1; i < t.size(); i++) {
+        if (t[i] == '|') {
+            cells.push_back(trim(t.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    return cells;
+}
+
+inline std::string html_escape_attr(const std::string & s) { return html_escape(s); }
+
+// pipe table -> <table>, with `caption` as its <caption> when non-empty
+inline bool pipe_table_to_html(const std::vector<std::string> & rows, const std::string & caption,
+                               std::string & html) {
+    if (rows.size() < 3) return false;
+    std::vector<std::vector<std::string>> cells;
+    for (const auto & r : rows) {
+        if (r.find("\\|") != std::string::npos || r.find('`') != std::string::npos) return false;
+        cells.push_back(table_cells(r));
+    }
+    const size_t cols = cells[0].size();
+    if (cols == 0) return false;
+    for (size_t i = 1; i < cells.size(); i++)
+        if (cells[i].size() != cols) return false;
+    if (!is_separator_row(rows[1])) return false;
+    for (size_t c = 0; c < cols; c++) {
+        std::string sep = cells[1][c];
+        sep.erase(std::remove_if(sep.begin(), sep.end(),
+                                 [](char ch) { return ch == ' ' || ch == '\t'; }), sep.end());
+        if (sep.empty()) return false;
+        for (char ch : sep)
+            if (ch != '-' && ch != ':') return false;
+    }
+    std::string o = "<table>";
+    if (!caption.empty())
+        o += "<caption>" + html_escape_attr(caption) + "</caption>";
+    o += "<thead><tr>";
+    for (size_t c = 0; c < cols; c++)
+        o += "<th scope=\"col\">" + html_escape_attr(cells[0][c]) + "</th>";
+    o += "</tr></thead><tbody>";
+    for (size_t r = 2; r < cells.size(); r++) {
+        o += "<tr>";
+        for (size_t c = 0; c < cols; c++)
+            o += "<td>" + html_escape_attr(cells[r][c]) + "</td>";
+        o += "</tr>";
+    }
+    o += "</tbody></table>";
+    html = o;
+    return true;
+}
+
+// One `<chart ...> ... </chart>` run: pull `title:` out, render its pipe table,
+// drop the title line. Returns the transformed body and how many tables changed.
+inline std::string render_chart(const std::string & body) {
+    const size_t open = body.find("<chart");
+    if (open == std::string::npos) return body;
+    const size_t gt = body.find('>', open);
+    if (gt == std::string::npos) return body;
+    const size_t close = body.find("</chart>", gt);
+    if (close == std::string::npos) return body;
+    const std::string inner = body.substr(gt + 1, close - gt - 1);
+
+    std::vector<std::string> lines;
+    split_lines(inner, lines);
+    std::string title;
+    for (const auto & l : lines) {
+        const std::string t = trim(l);
+        if (t.compare(0, 6, "title:") == 0) { title = trim(t.substr(6)); break; }
+    }
+
+    // locate the first plain pipe table
+    bool converted = false;
+    for (size_t i = 0; i + 2 < lines.size(); i++) {
+        if (!is_table_row(lines[i]) || !is_separator_row(lines[i + 1])) continue;
+        size_t end = i + 2;
+        while (end < lines.size() && is_table_row(lines[end])) end++;
+        const std::vector<std::string> rows(lines.begin() + (long)i, lines.begin() + (long)end);
+        std::string html;
+        if (!pipe_table_to_html(rows, title, html)) continue;
+        lines.erase(lines.begin() + (long)i, lines.begin() + (long)end);
+        lines.insert(lines.begin() + (long)i, html);
+        converted = true;
+        break;
+    }
+    if (!converted) return body;              // no table converted: leave the chart alone
+    // the title now lives in the table's <caption>
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (trim(lines[i]).compare(0, 6, "title:") == 0) {
+            lines.erase(lines.begin() + (long)i);
+            break;
+        }
+    }
+    std::string out;
+    for (const auto & l : lines) out += l + "\n";
+    return body.substr(0, gt + 1) + out + body.substr(close);
+}
+
 }  // namespace markup_detail
 
 // The model occasionally drops the leading `<x_..><y_..>` of its very first
@@ -407,8 +571,9 @@ inline void parse_blocks(const std::string & raw_in, std::vector<Block> & blocks
     }
 }
 
-// One block's rendered content: `<tbc>` dropped, LaTeX tables turned into HTML.
-// Upstream keeps the literal body in `text` and the converted one in `content`.
+// One block's rendered content: `<tbc>` dropped, LaTeX tables and chart pipe
+// tables turned into HTML. Upstream keeps the literal body in `text` and the
+// converted one in `content`.
 inline std::string block_content(const Block & b) {
     std::string t = b.text;
     t = markup_detail::replace_all(t, "<tbc>", "");
@@ -426,12 +591,144 @@ inline std::string block_content(const Block & b) {
                 t = html;
         }
     }
+    if (t.find("<chart") != std::string::npos) t = markup_detail::render_chart(t);
     return t;
+}
+
+// ---------------------------------------------------------------------------
+// Caption relocation (upstream engine/caption_relocation.py).
+//
+// A *plain* one-line Caption that sits immediately ABOVE an adjacent Chart, with
+// >=80% horizontal overlap and a vertical gap in [0, 0.03] (normalised page
+// units), is folded into that chart's `title:` and the Caption block disappears.
+// Notes below the object stay where they are. Ties (two equally close candidates)
+// are dropped rather than guessed. Everything is verified at the end: the text
+// must actually survive inside a rendered `<caption>`.
+namespace markup_detail {
+
+// A caption qualifies only if it is plain single-line text: no emphasis/code
+// markers, no `_italic_`, no HTML tag, no LaTeX command, no link tail.
+inline bool plain_caption(const std::string & src, std::string & out) {
+    std::string t = replace_all(src, "<tbc>", "");
+    t = trim(t);
+    if (t.empty() || t.find('\n') != std::string::npos) return false;
+    for (const char * m : { "**", "__", "~~", "`", "_" })
+        if (t.find(m) != std::string::npos) return false;   // conservative on `_`
+    for (size_t i = 0; i + 1 < t.size(); i++) {
+        if (t[i] == '<') {
+            const char c = t[i + 1];
+            if (isalpha((unsigned char)c) || c == '/' || c == '!') return false;
+        }
+        if (t[i] == '\\') {
+            const char c = t[i + 1];
+            if (isalpha((unsigned char)c) || c == '&' || c == '%' || c == '_') return false;
+        }
+    }
+    if (t.find("](") != std::string::npos) return false;
+    out = t;
+    return true;
+}
+
+// Inject `label` as the chart's title: append to an existing `title:` line, else
+// insert one right after the opening `<chart ...>` tag.
+inline std::string chart_with_title(const std::string & body, const std::string & label) {
+    std::vector<std::string> lines;
+    split_lines(body, lines);
+    for (auto & l : lines) {
+        const std::string t = trim(l);
+        if (t.compare(0, 6, "title:") == 0) {
+            std::string cur = trim(t.substr(6));
+            if (cur.find(label) != std::string::npos) return body;   // already there
+            const size_t at = l.find("title:");
+            l = l.substr(0, at) + "title: " + cur + " — " + label;
+            std::string out;
+            for (const auto & x : lines) out += x + "\n";
+            return out;
+        }
+    }
+    // no title line: insert after the opening tag
+    const size_t open = body.find("<chart");
+    const size_t gt = open == std::string::npos ? std::string::npos : body.find('>', open);
+    if (gt == std::string::npos) return body;
+    return body.substr(0, gt + 1) + "\ntitle: " + label + body.substr(gt + 1);
+}
+
+inline bool contains_caption(const std::string & rendered, const std::string & label) {
+    size_t p = 0;
+    while ((p = rendered.find("<caption>", p)) != std::string::npos) {
+        const size_t e = rendered.find("</caption>", p);
+        if (e == std::string::npos) return false;
+        if (rendered.substr(p, e - p).find(label) != std::string::npos) return true;
+        p = e + 1;
+    }
+    return false;
+}
+
+}  // namespace markup_detail
+
+// Rewrites `blocks` in place: relocated Caption blocks are erased, their text
+// merged into the target Chart block's body.
+inline void relocate_captions(std::vector<Block> & blocks) {
+    using namespace markup_detail;
+    // pass 1: which chart could take which caption, with its vertical gap
+    std::map<size_t, std::vector<std::pair<double, size_t>>> eligible;   // chart -> (gap, caption)
+    for (size_t i = 0; i < blocks.size(); i++) {
+        const Block & c = blocks[i];
+        if (c.cls != "Caption") continue;
+        std::string label;
+        if (!plain_caption(c.text, label)) continue;
+        std::vector<std::pair<double, size_t>> cands;
+        for (int d = -1; d <= 1; d += 2) {           // adjacent blocks only
+            const long j = (long)i + d;
+            if (j < 0 || j >= (long)blocks.size()) continue;
+            const Block & t = blocks[(size_t)j];
+            if (t.cls != "Chart") continue;
+            if (c.y2 > t.y1) continue;               // must sit fully above the chart
+            const double w = std::min(c.x2 - c.x1, t.x2 - t.x1);
+            const double overlap = std::max(0.0, std::min(c.x2, t.x2) - std::max(c.x1, t.x1));
+            const double gap = std::max(t.y1 - c.y2, c.y1 - t.y2);
+            if (w <= 0.0 || overlap / w < 0.8) continue;
+            if (gap < 0.0 || gap > 0.03) continue;
+            cands.push_back({ gap, (size_t)j });
+        }
+        if (cands.empty()) continue;
+        std::sort(cands.begin(), cands.end());
+        // two charts equally close: ambiguous, leave the caption alone
+        if (cands.size() > 1 && std::fabs(cands[0].first - cands[1].first) < 1e-9) continue;
+        eligible[cands[0].second].push_back({ cands[0].first, i });
+    }
+
+    // pass 2: one caption per chart, nearest wins, ties dropped, then verify that
+    // the text really lands in a rendered <caption>
+    std::vector<size_t> erase;
+    for (auto & kv : eligible) {
+        std::vector<std::pair<double, size_t>> caps = kv.second;
+        std::sort(caps.begin(), caps.end());
+        if (caps.size() > 1 && std::fabs(caps[0].first - caps[1].first) < 1e-9) continue;
+        const size_t ci = caps[0].second;
+        Block & chart = blocks[kv.first];
+        std::string label;
+        if (!plain_caption(blocks[ci].text, label)) continue;
+        if (chart.text.find("<chart") == std::string::npos) continue;
+        const std::string derived = chart_with_title(chart.text, label);
+        if (derived == chart.text) continue;
+        Block probe;
+        probe.cls = chart.cls;
+        probe.text = derived;
+        if (!contains_caption(block_content(probe), label)) continue;   // did not survive
+        chart.text = derived;
+        erase.push_back(ci);
+    }
+    std::sort(erase.begin(), erase.end());
+    erase.erase(std::unique(erase.begin(), erase.end()), erase.end());
+    for (size_t i = erase.size(); i-- > 0;) blocks.erase(blocks.begin() + (long)erase[i]);
 }
 
 // Upstream mmd_to_markdown: Title -> `#`, Section-header -> `##`, everything else
 // verbatim; blocks joined with a blank line and nothing re-sorted.
-inline std::string to_markdown(const std::vector<Block> & blocks) {
+inline std::string to_markdown(const std::vector<Block> & blocks_in) {
+    std::vector<Block> blocks = blocks_in;
+    relocate_captions(blocks);
     std::string out;
     for (const auto & b : blocks) {
         std::string t = block_content(b);
@@ -444,7 +741,9 @@ inline std::string to_markdown(const std::vector<Block> & blocks) {
     return out;
 }
 
-inline std::string to_plain(const std::vector<Block> & blocks) {
+inline std::string to_plain(const std::vector<Block> & blocks_in) {
+    std::vector<Block> blocks = blocks_in;
+    relocate_captions(blocks);
     std::string out;
     for (const auto & b : blocks) {
         const std::string t = block_content(b);
@@ -455,8 +754,12 @@ inline std::string to_plain(const std::vector<Block> & blocks) {
     return out;
 }
 
-// postprocess_document()-shaped JSON: normalized bbox + pixel bbox per block.
-inline std::string to_json(const std::vector<Block> & blocks, int img_w, int img_h) {
+// postprocess_document()-shaped JSON: normalized bbox + pixel bbox per block,
+// plus the untouched model output in `raw_out` (as upstream does).
+inline std::string to_json(const std::vector<Block> & blocks_in, int img_w, int img_h,
+                           const std::string & raw_out = std::string()) {
+    std::vector<Block> blocks = blocks_in;
+    relocate_captions(blocks);
     auto num = [](double v) {
         char b[40];
         snprintf(b, sizeof(b), "%.6g", v);
@@ -467,6 +770,8 @@ inline std::string to_json(const std::vector<Block> & blocks, int img_w, int img
         o += ",\"image_size\":[" + std::to_string(img_w) + "," + std::to_string(img_h) + "]";
     }
     o += ",\"markdown\":\"" + markup_detail::json_escape(to_markdown(blocks)) + "\"";
+    if (!raw_out.empty())
+        o += ",\"raw_out\":\"" + markup_detail::json_escape(raw_out) + "\"";
     o += ",\"blocks\":[";
     bool first = true;
     for (const auto & b : blocks) {
