@@ -134,9 +134,8 @@ const SpecRow kSpecs[] = {
       "understanding path only; the generation VQ decoder is not part of this engine" },
     { "nemotron_parse", "nemotron-parse", "image text", "ask",
       false, false, false, false, "models/Nemotron-3.5-Parse", "",
-      "document parsing: --mode raw (default) gives the model's control-token markup, "
-      "markdown/text/json render it (LaTeX tables -> HTML, blocks carry bboxes); one "
-      "page per call and --max-tokens needs to be large (a page is 2-8k)" },
+      "document parsing: --mode raw|markdown|json|text renders the control-token "
+      "answer; one page per call, needs a large --max-tokens" },
 };
 
 ArchSpec row_to_spec(const SpecRow & r) {

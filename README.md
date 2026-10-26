@@ -63,7 +63,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Qwen2.5-Omni（3B）** | `qwen25omni` | 图像 + 音频输入，文本 + 语音输出 | 全功能 thinker-talker：Qwen2.5 文本主干（untied lm_head）+ Qwen2.5-VL 视觉塔（与 `qwen2vl` 同款窗口注意力图）+ Whisper 系音频塔（128-bin log-mel、**n_window=100 分块卷积+分块注意力**、25 token/s）→ **Talker**（24 层双轨 LM：文本轨吃 thinker 隐状态，输出 25Hz codec token）→ **Token2Wav**（flow-matching DiT，RK4×10 步 + CFG + sway 采样；BigVGAN v2 抗锯齿激活，纯 C++ 宿主实现）。音频输入走 `--audio`（ffmpeg 解码 16k mono）。参考实现：llama.cpp PR #13784（thinker）+ HF transformers 5.20 官方源码（全部语义基准），mel/音频塔与官方逐位对齐 |
 | **Qwen3-Omni（30B-A3B-Instruct）** | `qwen3omni` | 图像 + 音频输入，文本 + 语音输出 | **首个 ggml 实现**（llama.cpp 无此架构）：thinker=标准 Qwen3 全注意力 + MoE 文本主干（48 层、128 专家激活 8、interleaved MRoPE 24/20/20 逐轴整支 128 维）+ Qwen3-VL 视觉塔（deepstack 三抽头，与 `qwen3vl` 共享 `qwen3vl_tower` 积木）+ Qwen3-ASR 同族音频塔（128 mel、chunk 500、窗 800）→ **Talker**（20 层 MoE + sigmoid 门控共享专家；用户段只喂 role==user token；step 输入=16 个嵌入行求和）→ **code predictor**（5 层 dense，15 组独立嵌入表/头——**头未 tie，checkpoint 独立权重**，与 codec_head 同理）→ **code2wav**（8 层窗注意力 transformer + 上采样 ConvNeXt + snake/transconv 解码器，**整条声码器是单张 ggml 图**：F32 im2col+mul_mat 卷积、conv_transpose_1d、sin/sqr snake，比宿主循环快 50-100×）。语音出 `--speak`（24 kHz，`--speaker chelsie|ethan|aiden` 选音色、`--max-codes` 限帧）；三模态理解与语音输出全部对 HF transformers 5.20 逐段对拍（corr 0.996-0.9999，ASR 逐字验收）。
 | **Janus-Pro-1B** | `janus`（`janus_pro`） | 图像 |  DeepSeek 解耦式理解/生成 VLM 的**理解侧**（VQ 生成解码器不属于本引擎）：timm 风味 SigLIP-large-384 视觉塔（24 层、d=1024、patch16、fused qkv+全 bias、**GELU(erf)**、无 cls token、select_layer=-1 全层 + 终端 LN）+ 2 层 MLP aligner（1024→2048 GELU(erf) →2048）+ 纯 llama 1.5B 文本主干（24 层、16:16 头、theta 1e4、untied 102400 vocab）。预处理官方口径：bicubic 保比缩到长边 384 → expand2square 填充 (127,127,127) → /255 归一化；一图 576 个 `<image_placeholder>` token，deepseek sft 模板（`<\|User\|>:` 开头，问题后换行接 576 个占位符，再空行后以 `<\|Assistant\|>:` 收尾）。分词器新增 `DeepSeekBpe` 模式（isolated Split 序：拉丁/标点各带一个前导空格、CJK 大块连写、数字逐位——与 HF 官方逐 id 一致）。f16 3.9 GB / q8_0 ≈ 2.1 GB；对拍：与 fp32 官方栈 logits corr 0.9999、输出逐字一致。转换 `convert/convert_janus.py`。预置权重：`modelscope download --model SkyContact/Janus-Pro-1B-GGUF`（f16/q8_0/q4_0 + tokenizer，HF 同名 `hf download SkyContact/Janus-Pro-1B-GGUF`） |
-| **Nemotron-3.5-Parse（0.63B）** | `nemotron_parse`（`nemotron-parse`） | 图像（文档页） | NVIDIA 的文档解析模型：**C-RADIOv4-SO400M 视觉塔**（27 层 ViT、d=1152、patch16、**10 个 class token**、内容归一化的 NaViT 2D 位置插值、无 rope、GELU(erf)、**没有末端 norm**）+ **卷积 neck**（1×1 Conv1d 1152→1024 → LN → 网格重排后**宽度 ×4 合并**的 Conv2d → LN；前两个 class token 拼成 2304 → `Linear` → LN 作为**最后一个 summary token**）+ **10 层 mBART 式 prefix 解码器**（d=1024、16 Q/8 KV、pre-LN、GELU、`√d` 嵌入缩放、tied lm_head、**完全没有位置编码也没有 rope**——次序只由因果掩码给，视觉特征就是 KV 前缀）。输出是**带版面类别与归一化框的控制 token 流**（`<x_0.0586><y_0.0539>Quarterly Report 2026<x_0.1621><y_0.0633><class_Text>`），markdown/JSON 由调用方再拼。预处理照官方 processor：保比缩进 2048×1664 画布 → 宽补到 64 倍/高补到 16 倍（左上白底）→ 16² patch（CLIP mean/std）。`--max-tokens` 要给够（整页常见 2-8k，用满前会告警），`NEMOTRON_PARSE_MAX_EDGE=1024` 能压 CPU 成本（视觉塔开销随视觉 token 数平方增长）。对拍：内容归一化位置场与 torch **逐元素一致**（2.7e-7）、patch 嵌入 2.8e-3（f16 权重噪声）、首 token logits top8 **8/8**、48 步贪心输出与官方 **逐 token 相同**。`--mode markdown` / `json` / `text` 把标记渲染成 markdown（`Title`→`#`、`Section-header`→`##`、LaTeX `tabular`→HTML 表，表头按「首行非数字占多数」提升为 `<th>`）或 `postprocess_document` 形状的 JSON（每个 block 带归一化 bbox、像素 bbox、content 与 warnings）。转换 `convert/convert_nemotron_parse.py`，参考 dump `scripts/ref_nemotron_parse.py`，MCP 工具 `parse_document` |
+| **Nemotron-3.5-Parse（0.63B）** | `nemotron_parse`（`nemotron-parse`） | 图像（文档页） | NVIDIA 文档解析模型：**C-RADIOv4-SO400M 视觉塔**（27 层、patch16、d=1152、10 个 class token 排在最前、学出来的 128×128 位置表按内容区插值、无 rope、GELU(erf)、塔末无 norm）+ 卷积 **neck**（1×1 Conv1d → LN → 宽度 4 合 1 的 Conv2d → LN；前两个 class token 投影成 1 个 summary token 追加在末尾）+ **10 层 mBART 式前缀解码器**（d=1024、16/8 GQA、pre-LN、`√d` 嵌入缩放、tied lm_head、**没有任何位置编码**，视觉特征即 KV 前缀）。输出是带版面类别与归一化框的**控制 token 流**，`--mode markdown/json` 渲染成 markdown（LaTeX `tabular`→HTML 表）或带 bbox 的 blocks。对拍：位置场 2.7e-7、整页 159 步贪心与官方逐 token 相同。转换 `convert/convert_nemotron_parse.py`，MCP 工具 `parse_document` |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 | **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
 | **Keye-VL-2.0（30B-A3B）** | `keye-vl2` | 图像 + 视频 | 快手 Keye-VL-2.0-30B-A3B：Qwen3 式 **MoE 文本主干**（48 层、128 路由专家激活 8、norm-topk softmax 路由、mRoPE 16/24/24 theta 1e7、per-head qk-norm）+ 每层 **DSA lightning indexer 稀疏注意力**（16 头×64 维、Walsh-Hadamard 旋转 MQA indexer、top-2048 KV 稀疏掩码、独立 indexer K 缓存）+ SigLIP-so400m 系视觉塔（27 层 patch14、ViT 内 2D mRoPE、729 学习式位置表双线性插值、post-LN、2×2 merge + GELU 投影）。视频=官方默认逐帧路径（mRoPE 官方 get_rope_index 逐位对齐；官方 packing 表在该路径为死代码；opt-in fast 双流未实现）+ `<|frame|><hh:mm:ss>` 时间戳标记；图像 mRoPE 为 (t=base, y=base+row, x=base+col) 布局；image_pad 按 id 注入不走文本往返（Qwen 分词器会吞掉该 piece）。**官方 GGUF 直接用**（`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` + 同仓 tokenizer.json；mmproj 姊妹文件自动发现）。19GB 检查点放不进 12GB 显卡时有三种放置：默认自动回退纯 CPU（decode ~28 tok/s）；`VQA_SPLIT=1` 稠密权重上 GPU + 专家留内存（`ggml_backend_sched` 按权重归属分流）；`KEYE_EXPERTCACHE=1` **专家粒度 GPU 驻留缓存**（ExpertCache：LRU + 异步预取 + slot 表 `mul_mat_id` 批处理，命中 CUDA 后端 mul_mat_id+GLU 融合，12GB 卡 decode ~19 tok/s） |
@@ -109,7 +109,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
 | EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
 | V-JEPA 2 特征 / 分类 / 掩码预测 | ✅ ViT-L（326M + predictor 25M，f16 653MB）：64 帧 → 短边 292（双线性）→ 裁 256 → **8192 token 全时空注意力 ×24 层** → 1024 维特征；SSv2 微调版（16 帧）再走 **3 层 attentive pooler + 174 类线性头**，`--mode 5` 直出标签；`--mode predict` 跑 12 层 masked-latent predictor。**对拍已验证**（transformers 5.x）：同输入下 24 层全长 cos **1.000000**（max 0.065）；端到端（各自预处理）pooled cos **0.9994**、SSv2 top-1 标签一致（0.916 vs 0.921，概率最大差 4.5e-3）、predictor cos **0.998**。CPU 单 clip（8192 token）约 25 s，SSv2（2048 token）约 5 s |
-| Nemotron-3.5-Parse 文档解析 | ✅ 端到端 + 官方 torch 参考逐级对拍（`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：内容归一化位置场 **2.7e-7**、patch 嵌入 2.8e-3（f16 权重噪声）、ViT/neck 均值误差 5e-3、首 token logits top8 **8/8**、**整页 159 步贪心输出与官方逐 token 相同**（含最后那张 LaTeX 表转出来的 HTML 表）。踩到的坑记一笔：HF 的重复惩罚按 `input_ids.unique()` 施加，按出现次数施加会让重复的坐标 token 被罚两次、greedy 在长页面上从中间起分叉。全程无常驻下载：一个 1.3 GB GGUF + 官方 `tokenizer.json`（新增了 added-token 感知的词表估算，否则 50k 基础词表 + 22k 坐标 token 会被当成陌生 tokenizer 拒掉）。CPU（19 线程）一页 ≈ 19 s（视觉 17.4 s + prefill 0.9 s + 158 token decode），CUDA（4070 SUPER）≈ 0.94 s（0.66 s + 0.018 s + 0.25 s），正文逐 block 一致 |
+| Nemotron-3.5-Parse 文档解析 | ✅ 端到端 + 官方 torch 参考逐级对拍（`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：位置场 **2.7e-7**、patch 嵌入 2.8e-3、首 token logits top8 **8/8**、**整页 159 步贪心输出与官方逐 token 相同**。CPU（19 线程）一页 ≈ 19 s（视觉 16.3 s + prefill 0.8 s + 158 token decode），CUDA（4070 SUPER）≈ 0.9 s（0.64 s + 0.019 s + 0.25 s）；CUDA 上 7/7 block 正文一致，坐标末位有 f16 舍入漂移 |
 
 ## 快速开始
 
@@ -182,6 +182,10 @@ hf download MCG-NJU/videomae-base-finetuned-kinetics --local-dir models/videomae
 
 # V-JEPA 2：ViT-L 视频编码器（64 帧 256²，只出特征）
 hf download facebook/vjepa2-vitl-fpc64-256 --local-dir models/vjepa2-vitl-fpc64-256
+
+# Nemotron-3.5-Parse：文档解析（整页 → 版面类别 + 归一化框）
+hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse
+python convert/convert_nemotron_parse.py
 ```
 
 转换器会自己找检查点：`--src <目录|文件>` → 该模型的 `$MOONDREAM_SRC` / `$VIDEOCHAT3_SRC`
@@ -736,99 +740,51 @@ python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embedding
 
 ### Nemotron-3.5-Parse（文档解析）
 
-0.63B 的文档解析模型，一个 1.3 GB 单文件 GGUF 就能把整页扫描件/截图/PDF 页变成
-**带版面类别与坐标的结构化结果**。它不是通用 VLM：拒绝闲聊，只有一套任务（也算它的好处——
-提示词就是 6 个控制 token，不会被用户问法带偏）。
+0.63B 的文档解析模型，一个 1.3 GB 单文件 GGUF 把整页扫描件/截图/PDF 页变成**带版面类别与坐标的
+结构化结果**。它只有一套任务、提示词固定（6 个控制 token），不接受自由问答；一次一页。
 
 ```bash
 pip install -r convert/requirements.txt
 hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse   # 权重 + tokenizer
-python convert/convert_nemotron_parse.py                                     # -> nemotron-parse-f16.gguf
+python convert/convert_nemotron_parse.py                      # → nemotron-parse-f16.gguf（1.3GB）
+python convert/convert_nemotron_parse.py --outtype q8_0       # → 866MB
 
-# 原始标记（默认）：<x_0.0586><y_0.0539>Quarterly Report 2026<x_0.1621><y_0.0633><class_Text>
 vqa-cli --model nemotron-parse-f16.gguf --tokenizer models/Nemotron-3.5-Parse \
-        --image page.png --ask parse --n-ctx 8192 --max-tokens 4000
-
-# 渲染成 markdown（LaTeX 表转 HTML）/ postprocess_document 形状的 JSON / 纯文本
-vqa-cli ... --mode markdown
-vqa-cli ... --mode json
+        --image page.png --ask parse --n-ctx 8192 --max-tokens 4000       # 原始标记
+vqa-cli ...  --mode markdown      # markdown，LaTeX 表格转成 HTML 表
+vqa-cli ...  --mode json          # blocks + 归一化/像素 bbox
 ```
 
-JSON 里每个 block 是 `{"class","bbox":[x1,y1,x2,y2]（内容区归一化）,"bbox_pixels","text","content"}`，
-顶层还有 `markdown` 与 `warnings`（表格没转成 HTML 时会点名）。MCP 侧对应 `parse_document`
-工具（`format=json|markdown|raw`）。
+结构（都是照官方检查点核过的）：
 
-**精度**（与官方 torch 栈逐级对拍，`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：
-内容归一化位置场**逐元素一致**（2.7e-7）、patch 嵌入 2.8e-3（f16 权重噪声）、ViT/neck 均值误差
-5e-3；**CPU 上整页 159 步贪心输出与官方逐 token 相同**；CUDA 上 7/7 个 block 的正文完全一致，
-差异只在坐标末位（f16 kernel 舍入 → 相邻坐标分箱），必要时个别 class token 会在近似平局上翻转
-（实测 `Section-header` → `Text`，正文不变）。
+- **视觉塔**是 C-RADIOv4-SO400M：27 层 ViT、patch16、d=1152，10 个 class token 排在最前，位置是学出来的
+  128×128 表按内容区插值（NaViT 变分辨率），**没有 rope**、GELU 用 erf 形式、塔末**没有 norm**
+- **neck**：1×1 Conv1d(1152→1024) → LN → 按列 4 合 1（折成 matmul）→ LN；前两个 class token 投影成
+  1 个 summary token 追加在末尾
+- **解码器**是 10 层 mBART 式前缀解码：d=1024、16/8 GQA、pre-LN、`√d` 嵌入缩放、tied lm_head，
+  **全程没有位置编码也没有 rope**——次序只由因果掩码给出，视觉特征就是 KV 前缀
+- 输出是**控制 token 流**：`<x_0.0586><y_0.0539>Quarterly Report 2026<x_0.1621><y_0.0633><class_Text>`，
+  坐标是内容区归一化值；表格以 LaTeX `tabular` 出现，由 `--mode markdown/json` 转换（`Title`→`#`、
+  `Section-header`→`##`、表头按「首行以文字为主」提升为 `<th>`）
 
-**性能**（1000×1300 的一页，默认画布 1313 visual token / 158 个输出 token）：
+对拍：`python scripts/ref_nemotron_parse.py --model models/Nemotron-3.5-Parse --image page.png --out ref_np`
+出官方栈的逐级 dump，引擎 `--dump-dir` 跑同一输入。位置场**逐元素一致**（2.7e-7）、patch 嵌入 2.8e-3
+（f16 权重噪声）、首 token logits top8 **8/8**，**整页 159 步贪心与官方逐 token 相同**。
+
+性能（1000×1300 一页，1313 visual token / 158 输出 token）：
 
 | | 视觉塔 | prefill | decode |
 |---|---|---|---|
-| CPU（19 线程） | 17.4 s | 0.89 s | 11.7 ms/token（85 tok/s） |
-| CUDA（RTX 4070 SUPER） | **0.66 s** | **0.018 s** | **1.6 ms/token（620 tok/s）** |
+| CPU（19 线程） | 16.3 s | 0.83 s | 11.0 ms/token（91 tok/s） |
+| CUDA（RTX 4070 SUPER） | **0.64 s** | **0.019 s** | **1.6 ms/token（620 tok/s）** |
 
-整页端到端 CPU ≈ 19 s、GPU ≈ 0.94 s。开关：`NEMOTRON_PARSE_MAX_EDGE=1024`（默认画布 2048×1664，
-降下来能把视觉塔成本砍到 1/16——塔是 O(视觉 token²)）；`NEMOTRON_PARSE_PROFILE=1` 打印图规模与
-`compute / graph build` 拆分。`--max-tokens` 要给够（整页 2-8k，截断前会告警）。
+整页端到端 CPU ≈ 19 s、GPU ≈ 0.9 s。视觉塔开销随视觉 token 数平方增长，`NEMOTRON_PARSE_MAX_EDGE=1024`
+能把长边降下来换速度；`--max-tokens` 要给够（整页 2–8k，截断前会告警）。q8_0 权重在这里**比 f16 慢**
+（CPU 视觉塔受 flash-attention 限制、GPU decode 受 kernel 延迟限制，都吃不到权重带宽），只建议用来省体积。
 
-> 这些数是机器相对空闲时的。同一台机器上开着 UE 编辑器 + Live Coding 时实测会退化到
-> 视觉塔 0.9–1.0 s / GPU decode 2.6–2.9 ms/token / CPU decode 22–28 ms/token——比的是同一批
-> 测量里的相对变化，绝对值随负载漂。
-
-图层面做了三件事，都是量出来的：
-
-- **q/k/v 融合成一个投影**：转换器把三份权重拼成 `[n_qkv, n_embd]`，一层一次 matmul（decode 图
-  里 mul_mat 61 → 41、add 102 → 82；代价是 `set_rows`/FA 要求行连续，三个切片要各拷一次）。
-  同一批测量里 GPU decode 2.5 → 1.6 ms/token。
-- **decode 图按 KV 窗口分桶复用**：形状固定后不再每 token 重建（建图+分配 0.48 → 0.06–0.22
-  ms/token），而且 `ggml-cuda` 的 CUDA graph 缓存**按 `cgraph->nodes[0]` 做键**——每步新建上下文
-  永远命中不了，现在能重放了。桶宽按后端分：CPU 128（窗口放宽等于让 FA 去算死 key，CPU 上不划算）、
-  GPU 1024。
-- **同一页重复提问走缓存**：视觉特征（最近两页）+ 首步 logits + 前缀 KV 都留着（key = 提示词 +
-  像素的 FNV-1a；只有持有 KV 的那一页能复用 logits）。MCP 实测同页第二次调用 **12.5 s → 2.0 s**、
-  换页再换回来（A→B→A）只重跑 prefill、不重跑视觉塔，输出逐字节相同。
-
-**量化取舍（实测，跟直觉相反）**：`q8_0`（866 MB，视觉塔也能量化——Q8_0/Q4_0 的行块是 32 而不是
-256）在这台机器上**更慢**：GPU decode 2.5 → 4.5 ms/token、视觉塔 675 → 950 ms，CPU 视觉塔
-17.6 → 15.8 s、decode 11.8 → 12.5 ms。原因不在带宽：CPU 视觉塔是 flash-attention 受限
-（1313 token × 27 层 ≈ 214 GFLOP，CPU FA 有效算力只有 ~15 GFLOP/s），GPU decode 是 kernel 延迟
-受限（380 MB 权重 / 2.5 ms ≈ 152 GB/s，而 4070 SUPER 上限 ~500 GB/s，T=1 的 GEMV 吃不满）。
-所以**默认 f16**；要省体积再用 q8_0（结构仍对：同页 7/7 block 类别与正文一致，只有坐标末位与个别
-block 尾部字符有漂移）。
-
-**已知简化**：图表只按文本处理（不做 upstream 的 panel 渲染/caption 上移/原生小标题）；
-JSON 不回带 `raw_out`；表头提升只看形状不看加粗；一次一页（多页由调用方循环）。
-
-## 引擎级优化（跨后端，与具体模型无关）
-
-跑 nemotron_parse 时挖出两项能直接给所有后端用的东西，都落在共享层：
-
-**1. 分桶复用的 decode 图（`src/core/engine/decode_graph.hpp`）**
-
-以前每个后端每生成一个 token 都要：新建 `ggml_context` → 重建整张图 → `gallocr_alloc_graph` → 算完丢掉。
-两条代价：建图+分配约 0.5 ms（CUDA 上约占每 token 25%），以及 **`ggml-cuda` 的 CUDA graph 缓存按
-`cgraph->nodes[0]` 做键**——每步换上下文，节点地址每步都变，capture 永远命中不了。
-`vqa::decode_bucket()` + `vqa::GraphSlot<T>` 把 KV 窗口按 128（CPU）/1024（GPU）分桶，图只在跨桶时重建。
-越界的 query 行会被 `set_causal_mask` 打成 -inf，所以**加宽窗口是数值精确的**，只是让 attention 多读不能
-贡献的 key —— CPU 上 attention 是瓶颈（桶要窄），GPU 上 kernel launch 是瓶颈（桶可以宽）。
-已接入 smolvlm / qwen2vl / janus / nemotron_parse（videochat3 / qwen3_5 / qwen25omni 本来就有各自的实现）。
-`VQA_DECODE_BUCKET=N` 覆盖桶宽做 A/B，`=1` 等价于旧的逐步窗口。
-
-**2. 加载期把归一化仿射折进 matmul（`weight_load.hpp` 的 `LnFoldPlan`）**
-
-`y = norm(x)·γ + β` 后接 `W y + b`，等价于 `(W·diag γ)·norm(x) + (b + W β)`，所以图里只跑 `norm`，
-省掉每层一次的逐通道乘（有 β 时再省一次加）。**关键是放在加载期**：现有 GGUF 完全不用改、不用重新转换、
-不用重新下载。折叠后张量类型不变（f16 还是 f16），bias 保持 f32；`llm_block` 加了 `norm_folded` 开关，
-`vit_block` 本来就有 `drop_ln_mul/drop_ln_add`。默认 **GPU 开、CPU 关**（CPU 上权重会离开 mmap 变成常驻
-内存，而收益只有 ~2%），`VQA_FOLD_LN=1/0` 可强制。
-
-实测：smolvlm 折叠前后输出**逐字节相同**；nemotron_parse 折叠后整页输出与官方 torch 参考仍**逐 token 相同**
-（text 图 321→281 节点、vision 图 696→588 节点；CPU prefill 553→529 ms、decode 10.8→10.4 ms，GPU 上在噪声
-范围内测不出差别——它的 elementwise 本来就不是瓶颈）。
+**已知简化**：图表只按文本处理（不做 upstream 的 panel 渲染/caption 上移/原生小标题）；JSON 不回带
+`raw_out`；一次一页（多页由调用方循环）。权重遵循
+[OpenMDW 1.1](https://huggingface.co/nvidia/Nemotron-3.5-Parse)，**不在本仓库分发**。
 
 ## 为什么做独立引擎？
 
@@ -925,16 +881,23 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
   `VIDEOMAE_MAX_LAYERS=N` 只跑前 N 层做逐层漂移对照（本机实测 12 层全长相对差 ~1e-3，
   约为 F16 权重噪声 + 线程归约顺序噪声）；V-JEPA 2 用 `--dump-dir` 导出
   `patches / v_patch_out / v_blk0_qkv / v_blk0_q_rope / v_blk0_attn / v_blk0_attn_out /
-  v_blk0_out / v_final / v_pooled`，`VJEPA2_MAX_LAYERS=N` 同理截断层数。
+  v_blk0_out / v_final / v_pooled`，`VJEPA2_MAX_LAYERS=N` 同理截断层数。Nemotron-Parse 用
+  `NEMOTRON_PARSE_DUMP_DIR=<dir>`（或 `--dump-dir`）导出 `v_patches / v_positions / v_patch_out /
+  v_final / v_neck / v_feats / t_emb / t_l0_out / t_final_norm / logits`，`NEMOTRON_PARSE_PROFILE=1`
+  打印图规模与 compute/建图拆分。
 - **共享层（`src/core`）**：后端之间不放重复实现，目录按职责分层，索引见
   [`src/core/README.md`](src/core/README.md)；include 一律从 `src/` 根写
   （`#include "core/engine/weight_load.hpp"`），所以再加子目录也不用改 include 路径：
   - `vqa.hpp` — 唯一放在根上的头：`vqa::Model` 接口与能力表，前端只认它
   - `engine/` — ggml 侧公共件：`backend.hpp`（CUDA 优先 + CPU 回退 + 线程数按**物理核**，
     SMT 对这类模型的 GEMV 是负收益）、`weight_load.hpp`（mmap 绑定、1D 张量转 host F32、
-    CPU 零拷贝 / GPU 上传的 buffer 归属）、`gguf_util.hpp`（元数据读取 / 张量转 F32）、
+    CPU 零拷贝 / GPU 上传的 buffer 归属，以及加载期的归一化折叠 `LnFoldPlan`——把
+    `norm(x)·γ+β` 折进后续 matmul，**现有 GGUF 无需重转**；device 后端默认开、CPU 默认关，
+    `VQA_FOLD_LN=1/0` 强制）、`gguf_util.hpp`（元数据读取 / 张量转 F32）、
     `ggml_dump.hpp`（对拍导出）、`attention.hpp`（KV cache + mask）、`stage_buf.hpp`（device 侧
-    跨图暂存）、`sampler.hpp`
+    跨图暂存）、`sampler.hpp`、`decode_graph.hpp`（decode 图按 KV 窗口分桶复用，只在跨桶时重建，
+    `VQA_DECODE_BUCKET=N` 覆盖桶宽；逐 token 重建既白烧 ~0.5 ms 也会让 `ggml-cuda` 的 CUDA graph
+    缓存失配——它按 `cgraph->nodes[0]` 做键）
   - `blocks/` — 可复用图体：`vit_block.hpp`（所有 ViT 塔共用的 block 体 + 通用成对旋转 RoPE，
     moondream / VideoChat3 / VideoMAE / ViViT / V-JEPA 2 都用它，差异走 hooks）、
     `llm_block.hpp`（Qwen 系因果解码层，VideoChat3 / SmolVLM / MOSS-VL 已入住，权重字段为空即跳过
