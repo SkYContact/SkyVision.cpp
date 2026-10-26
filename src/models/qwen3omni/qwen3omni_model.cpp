@@ -145,6 +145,7 @@ private:
     bool load_weights(const char * path);
     bool build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all = false,
                          bool for_talker = false);
+    bool load_talker();
     bool encode_vision(const vqa::MediaInput & media, std::vector<float> & feats,
                        int * n_tokens, int * grid, int token_budget);
     bool run_text(TextGraph & g, const std::vector<int> & toks,
@@ -234,6 +235,7 @@ private:
     qwen3omni::AudioTower at;
     qwen3omni::Talker talker;
     bool talker_on = false;
+    bool talker_deferred = false;   // ec mode: load on first --speak (VRAM)
     int id_audio_pad = 151675;
     int a_n_layer = 32, a_n_embd = 1280, a_n_head = 20, a_n_ff = 5120;
     int a_n_window = 50, a_n_window_infer = 800, a_ds_hidden = 480;
@@ -304,32 +306,11 @@ bool Qwen3Omni::load(const std::string & gguf_path, const std::string & tokenize
     id_eos = vqa::pick_token(tok_, "<|im_end|>", 151645);
     id_endoftext = vqa::pick_token(tok_, "<|endoftext|>", 151643);
 
-    // speech output: sibling talker GGUF (qwen25omni two-file precedent)
-    for (const char * suffix : {"-q8_0", "-q6_k", ""}) {
-        std::string p = model_dir_hint + "/qwen3omni-talker" +
-                        (suffix[0] ? std::string(suffix) : std::string()) + ".gguf";
-        FILE * fp = fopen(p.c_str(), "rb");
-        if (!fp) continue;
-        fclose(fp);
-        // talker on its own CUDA backend when the build has one: the 4.9GB
-        // speech stack fits any modern card even though the 27GB thinker
-        // stays on CPU. QOMNI_TALKER_CPU=1 forces the old shared placement.
-        ggml_backend_t tb = backend;
-        ggml_gallocr_t ta = allocr;
-#ifdef GGML_USE_CUDA
-        if (!getenv("QOMNI_TALKER_CPU")) {
-            ggml_backend_t cuda = ggml_backend_cuda_init(0);
-            if (cuda) {
-                fprintf(stderr, "qwen3omni: talker on its own %s\n", ggml_backend_name(cuda));
-                tb = cuda;
-                ta = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cuda));
-            }
-        }
-#endif
-        if (talker.load(p.c_str(), tb, ta)) talker_on = true;
-        talker.host = backend_cpu ? backend_cpu : backend;   // CPU partner for quantized-table reads
-        break;
-    }
+    // speech output: sibling talker GGUF (qwen25omni two-file precedent).
+    // ec mode defers the load to the first --speak: the talker would eat the
+    // VRAM the expert slots need (see load_talker)
+    if (ec_enabled) talker_deferred = true;
+    else load_talker();
 
     if (ec_enabled && !ec_init()) return false;
 
@@ -612,6 +593,42 @@ bool Qwen3Omni::load_weights(const char * path) {
     return tok_embd && out_norm && out_w;
 }
 
+bool Qwen3Omni::load_talker() {
+    for (const char * suffix : {"-q8_0", "-q6_k", ""}) {
+        std::string p = model_dir_hint + "/qwen3omni-talker" +
+                        (suffix[0] ? std::string(suffix) : std::string()) + ".gguf";
+        FILE * fp = fopen(p.c_str(), "rb");
+        if (!fp) continue;
+        fclose(fp);
+        // talker on its own CUDA backend when the build has one: the 4.9GB
+        // speech stack fits any modern card even though the 27GB thinker
+        // stays on CPU. QOMNI_TALKER_CPU=1 forces the old shared placement.
+        // Deferred (ec) load: the expert slots already hold the VRAM, so the
+        // talker goes to the CPU partner backend instead.
+        ggml_backend_t tb = backend;
+        ggml_gallocr_t ta = allocr;
+#ifdef GGML_USE_CUDA
+        const bool cpu_talker = talker_deferred && ec_ok;
+        if (!getenv("QOMNI_TALKER_CPU") && !cpu_talker) {
+            ggml_backend_t cuda = ggml_backend_cuda_init(0);
+            if (cuda) {
+                fprintf(stderr, "qwen3omni: talker on its own %s\n", ggml_backend_name(cuda));
+                tb = cuda;
+                ta = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cuda));
+            }
+        } else if (cpu_talker && backend_cpu) {
+            tb = backend_cpu;
+            ta = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_cpu));
+            fprintf(stderr, "qwen3omni: talker on CPU (expert slots hold the VRAM)\n");
+        }
+#endif
+        if (talker.load(p.c_str(), tb, ta)) talker_on = true;
+        talker.host = backend_cpu ? backend_cpu : backend;   // CPU partner for quantized-table reads
+        break;
+    }
+    return talker_on;
+}
+
 // ---------------------------------------------------------------- text
 bool Qwen3Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logits_all,
                                  bool for_talker) {
@@ -651,7 +668,10 @@ bool Qwen3Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, bool lo
         ggml_build_forward_expand(g.gf, g.emb_out);
     }
 
-    ggml_tensor * pos_rope = ggml_view_1d(c, g.mpos_in, 4 * T, 0);
+    // NOTE: pos_rope is mpos_in ITSELF, not an identity view - the split
+    // scheduler only assigns graph-input leafs a backend when they are a DIRECT
+    // src of a node (a view-wrapped input never gets one -> gallocr assert)
+    ggml_tensor * pos_rope = g.mpos_in;
     ggml_tensor * pos_slot = ggml_view_1d(c, g.mpos_in, T, (size_t)3 * T * sizeof(int));
 
     int max_layers = n_layer;
@@ -1026,6 +1046,10 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
         next = sample(logits, gp);
     }
     (void)n_dec;
+    if (gp.speak_wav && talker_deferred) {
+        talker_deferred = false;
+        load_talker();
+    }
     if (ec_enabled && ec_ok && ec_steps > 0) {
         vqa::ExpertCacheStats st;
         for (auto & c : ec_caches) {

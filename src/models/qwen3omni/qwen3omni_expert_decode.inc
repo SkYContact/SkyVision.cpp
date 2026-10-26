@@ -160,6 +160,17 @@ bool Qwen3Omni::ec_init() {
                     " step, expect swapping\n", total_slots, n_layer * n_expert_used);
         }
         ec_ok = true;
+        // the async staging pool defaults to min(4, hw/2) threads; the
+        // pageable->pinned memcpy is the swap bottleneck on this model
+        // (measured 4.1 tok/s @4 vs 10.2 tok/s @16 threads) - raise the
+        // default here unless the user set EC_STAGE_THREADS
+        if (!getenv("EC_STAGE_THREADS")) {
+#ifdef _WIN32
+            _putenv_s("EC_STAGE_THREADS", "16");
+#else
+            setenv("EC_STAGE_THREADS", "16", 0);
+#endif
+        }
         ec_async_ok = true;
         for (auto & c : ec_caches)
             if (!c.enable_async()) ec_async_ok = false;
