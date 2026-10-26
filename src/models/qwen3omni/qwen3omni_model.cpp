@@ -51,6 +51,10 @@
 #include "core/engine/stage_buf.hpp"
 #include "core/runtime/load_util.hpp"
 #include "core/engine/weight_load.hpp"
+#include "core/engine/sched.hpp"
+#include "core/engine/expert_cache.hpp"
+#include "core/engine/moe_compute.hpp"
+#include "core/engine/step_graph.hpp"
 #include "core/engine/op_profile.hpp"
 #include "core/blocks/qwen3vl_tower.hpp"
 #include "core/media/resample.hpp"
@@ -67,6 +71,28 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// internal (not in the frozen headers): the cgraph under construction during
+// vqa::StepGraph::build() - used by the graph-A builder in
+// qwen3omni_expert_decode.inc - and the residual-splitting forms of the
+// generic routed-FFN builders (defined in moe_compute.cpp)
+namespace vqa {
+ggml_cgraph * step_graph_builder_gf();
+namespace moe {
+ggml_tensor * build_expert_ffn_res(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * x,
+                                   ggml_tensor * res,
+                                   const std::vector<ggml_tensor *> & gate,
+                                   const std::vector<ggml_tensor *> & up,
+                                   const std::vector<ggml_tensor *> & down,
+                                   ggml_tensor * w, ggml_unary_op act);
+ggml_tensor * build_expert_ffn_table_res(ggml_context * ctx, ggml_cgraph * gf,
+                                         ggml_tensor * x, ggml_tensor * res,
+                                         ggml_tensor * gate_table, ggml_tensor * up_table,
+                                         ggml_tensor * down_table,
+                                         ggml_tensor * gate_up_ids, ggml_tensor * down_ids,
+                                         ggml_tensor * w, ggml_unary_op act);
+}
+}
 
 namespace qwen3omni {
 
@@ -132,6 +158,38 @@ private:
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     void dump(ggml_cgraph * gf, const char * name);
 
+    // QOMNI_EXPERTCACHE=1: expert-granularity GPU-resident dynamic decode
+    // (see qwen3omni_expert_decode.inc, same design as the keye integration).
+    // ec_enabled is the request, ec_ok the initialized state; decode falls
+    // back to the existing path whenever ec_ok is false.
+    bool ec_enabled = false, ec_ok = false;
+    std::vector<vqa::ExpertCache> ec_caches;   // one per quant-layout group
+    std::vector<int> ec_group;                 // layer -> group index
+    int ec_n_groups = 0;
+    double ec_ms_a = 0, ec_ms_b = 0, ec_ms_fin = 0, ec_ms_rb = 0, ec_ms_swap = 0;
+    int ec_steps = 0;
+    // fixed per-layer graph-A holders (StepGraph, built once, re-fed every
+    // step; S is block-aligned so shapes never change mid-block)
+    struct EcGraphA {
+        ggml_tensor *tok_in = nullptr, *hid_in = nullptr, *mpos_in = nullptr,
+                    *mask_in = nullptr;
+        ggml_tensor *w8_o = nullptr, *sel_o = nullptr, *m_o = nullptr, *x_o = nullptr;
+    };
+    struct EcGaUd { Qwen3Omni * m; int il; EcGraphA * io; };
+    std::vector<vqa::StepGraph> ec_ga;
+    std::vector<EcGraphA> ec_ga_io;
+    int ec_S = 0;
+    bool ec_ga_ready = false;
+    bool ec_async_ok = false;
+    std::vector<std::vector<int>> ec_prev_sel;
+    bool ec_init();
+    bool ec_build_graphs();
+    static ggml_tensor * ec_ga_builder(ggml_context * c, void * ud);
+    bool ec_decode_step(int cur_tok, const int * mpos4, int n_past,
+                        std::vector<float> & logits,
+                        std::vector<float> * emb_out = nullptr,
+                        std::vector<float> * h24_out = nullptr);
+
     vqa::Capabilities caps_;
     vqa::Tokenizer tok_;
 
@@ -149,6 +207,10 @@ private:
     std::string model_dir_hint;
 
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;  // split mode: runs the expert mul_mat_ids
+    bool split_mode = false;               // dense on GPU, experts in host mmap
+    ggml_backend_buffer_t host_wbuf = nullptr;   // host weight buffer (mmap wrap, split mode)
+    vqa::SplitSched split_sched;
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
     vqa::AlignedBuf host_f32_storage;
@@ -188,13 +250,24 @@ Qwen3Omni::~Qwen3Omni() {
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wctx) ggml_free(wctx);
     if (allocr) ggml_gallocr_free(allocr);
+    split_sched.free_sched();
+    if (host_wbuf) ggml_backend_buffer_free(host_wbuf);
+    if (backend_cpu) ggml_backend_free(backend_cpu);
     if (backend) ggml_backend_free(backend);
 }
 
 bool Qwen3Omni::init_backend() {
-    if (!getenv("QOMNI_GPU")) use_gpu = false;   // text stage: CPU is the target
+    // text stage: CPU is the default target. QOMNI_GPU=1 uploads to the GPU;
+    // QOMNI_EXPERTCACHE=1 additionally implies the Strata-style split (dense
+    // on the GPU, experts left in the host mmap for ExpertCache slots)
+    if (!getenv("QOMNI_GPU") && !ec_enabled) use_gpu = false;
     backend = vqa::init_backend(use_gpu, n_threads);
     if (!backend) return false;
+    if (!ggml_backend_is_cpu(backend)) {
+        // split partner: a CPU backend for the expert mul_mat_ids (prefill)
+        backend_cpu = vqa::init_backend(false, n_threads);
+        if (!backend_cpu) return false;
+    }
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return allocr != nullptr;
 }
@@ -207,6 +280,7 @@ bool Qwen3Omni::load(const std::string & gguf_path, const std::string & tokenize
         const size_t slash = gguf_path.find_last_of("/\\");
         model_dir_hint = (slash == std::string::npos) ? "." : gguf_path.substr(0, slash);
     }
+    ec_enabled = getenv("QOMNI_EXPERTCACHE") != nullptr;
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     if (!tok_.load(tokenizer_path.c_str(), vqa::TokenizerMode::Qwen2Regex)) return false;
@@ -253,9 +327,11 @@ bool Qwen3Omni::load(const std::string & gguf_path, const std::string & tokenize
         }
 #endif
         if (talker.load(p.c_str(), tb, ta)) talker_on = true;
-        talker.host = backend;   // CPU partner for quantized-table reads
+        talker.host = backend_cpu ? backend_cpu : backend;   // CPU partner for quantized-table reads
         break;
     }
+
+    if (ec_enabled && !ec_init()) return false;
 
     caps_ = {};
     caps_.image = !pos_table_host.empty();
@@ -322,13 +398,44 @@ bool Qwen3Omni::load_weights(const char * path) {
 
     // CPU backend: wrap the mmap'd weights in a from_ptr buffer (no copy, the
     // 32 GB Q8_0 stream pages in on demand). GPU: materialize into VRAM/limits
-    // are a later stage's problem.
+    // are a later stage's problem. QOMNI_EXPERTCACHE on a CUDA backend takes
+    // the Keye-style split instead: dense weights up, expert tensors kept in
+    // the host mmap (the cache slots mirror them into VRAM per step).
+    bool want_split = false;
+#ifdef GGML_USE_CUDA
+    if (backend_cpu && ec_enabled && !ggml_backend_is_cpu(backend)) {
+        size_t dev_total = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t))
+            if (!vqa::weights::moe_expert_pred(t->name)) dev_total += ggml_nbytes(t);
+        size_t free_vram = 0, total_vram = 0;
+        ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
+        // dense weights + KV (~0.9 GB) + talker (~4.9 GB on its own backend) +
+        // compute headroom
+        if (dev_total + (size_t)2.5e9 <= free_vram) want_split = true;
+        fprintf(stderr, "qomni split: dense %.2f GB, free VRAM %.2f GB -> %s\n",
+                dev_total / 1e9, free_vram / 1e9,
+                want_split ? "experts on CPU" : "no split (too little VRAM)");
+    }
+#endif
+    if (want_split) {
+        vqa::weights::SplitBound sb = vqa::weights::split_bind_to_backends(
+            wctx, backend, mm, vqa::weights::moe_expert_pred,
+            { { host_f32_storage.data(), host_f32_storage.size() } });
+        if (!sb.ok) return false;
+        wbuf = sb.dev_buf;
+        host_wbuf = sb.host_buf;
+        ggml_backend_buffer_set_usage(sb.dev_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(sb.host_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        split_mode = true;
+        if (!split_sched.init(backend, backend_cpu, 32768)) return false;
+    } else {
     vqa::weights::Bound bound = vqa::weights::bind_to_backend(
         wctx, backend, mm, { { host_f32_storage.data(), host_f32_storage.size() } });
     if (!bound.ok) return false;
     wbuf = bound.main_buf;
     ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     if (!ggml_backend_is_cpu(backend)) mm.release();
+    }
 
     auto gt = [&](const char * n) {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -693,7 +800,8 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
     if (for_talker) fprintf(stderr, "[dbg] run_text T=%d for_talker\n", T);
     if (!build_text_graph(g, T, S, n_img, false, for_talker)) return false;
     const auto tb1 = std::chrono::steady_clock::now();
-    if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
+    if (split_mode ? !split_sched.alloc(g.gf)
+                   : !ggml_gallocr_alloc_graph(allocr, g.gf)) {
         fprintf(stderr, "text graph allocation failed\n");
         ggml_free(g.ctx);
         g.ctx = nullptr;
@@ -716,7 +824,8 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
                                             T > 1 ? "prefill" : "decode",
                                             prof_step++, T > 1 ? 1000000 : 32);
     } else {
-        ok = ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS;
+        ok = split_mode ? split_sched.run(g.gf)
+                        : ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS;
     }
     if (!ok) {
         fprintf(stderr, "text compute failed\n");
@@ -898,7 +1007,15 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
         step_pos[2] = last_mpos[2] + 1;
         step_pos[3] = n_past;
         step_tok[0] = next;
-        if (!run_text(g, step_tok, nullptr, nullptr, step_pos, logits,
+        if (ec_enabled && ec_ok && !getenv("QOMNI_EC_OFF")) {
+            // dynamic expert-cache decode path (Strata-style tier 2);
+            // captures the talker trajectory (emb = L0 input row, h24 = the
+            // post-layer-23 hidden) the same way the for_talker graph does
+            if (!ec_decode_step(next, step_pos.data(), n_past, logits,
+                                gp.speak_wav ? &step_emb : nullptr,
+                                gp.speak_wav ? &step_h24 : nullptr)) break;
+            n_past += 1;   // run_text updates n_past itself; ec_decode_step does not
+        } else if (!run_text(g, step_tok, nullptr, nullptr, step_pos, logits,
                       gp.speak_wav ? &step_emb : nullptr,
                       gp.speak_wav ? &step_h24 : nullptr)) break;
         if (gp.speak_wav) {
@@ -909,6 +1026,28 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
         next = sample(logits, gp);
     }
     (void)n_dec;
+    if (ec_enabled && ec_ok && ec_steps > 0) {
+        vqa::ExpertCacheStats st;
+        for (auto & c : ec_caches) {
+            const vqa::ExpertCacheStats s = c.stats();
+            st.hits += s.hits; st.misses += s.misses; st.evictions += s.evictions;
+            st.swap_bytes += s.swap_bytes; st.resident += s.resident; st.n_slots += s.n_slots;
+        }
+        const uint64_t acc = st.hits + st.misses;
+        int in_flight = 0;
+        for (auto & c : ec_caches) in_flight += c.in_flight();
+        fprintf(stderr, "qomni ec: %d decode steps, %.1f ms/step (A %.2f + B %.2f"
+                " + swap-wait %.2f + readback %.2f), %.1f tok/s | cache:"
+                " %llu hits / %llu misses (%.1f%% hit), %llu evictions,"
+                " %.2f GB swapped, %d/%d slots resident, in_flight %d (async %s)\n",
+                ec_steps, ec_ms_fin / ec_steps, ec_ms_a / ec_steps, ec_ms_b / ec_steps,
+                ec_ms_swap / ec_steps, ec_ms_rb / ec_steps,
+                ec_steps * 1000.0 / ec_ms_fin,
+                (unsigned long long)st.hits, (unsigned long long)st.misses,
+                acc ? 100.0 * (double)st.hits / (double)acc : 0.0,
+                (unsigned long long)st.evictions, st.swap_bytes / 1e9,
+                st.resident, st.n_slots, in_flight, ec_async_ok ? "on" : "off/v1");
+    }
     if (gp.speak_wav) {
         if (getenv("QOMNI_TRAJ_DUMP")) {
             const std::string dir = getenv("QOMNI_TRAJ_DUMP");
@@ -1078,6 +1217,8 @@ bool Qwen3Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     return generate(ids, (n_img + n_aud) > 0 ? &feats : nullptr,
                     (n_img + n_aud) > 0 ? &img_pos : nullptr, mpos, gp, out_text);
 }
+
+#include "qwen3omni_expert_decode.inc"
 
 }  // namespace qwen3omni
 
