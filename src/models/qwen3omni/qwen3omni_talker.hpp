@@ -132,6 +132,7 @@ public:
 
     // runtime (backend/allocr borrowed from the thinker model)
     ggml_backend_t backend = nullptr;
+    ggml_backend_t host = nullptr;     // CPU partner for reading quantized thinker tables on GPU builds
     ggml_gallocr_t allocr = nullptr;
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;

@@ -253,6 +253,7 @@ bool Qwen3Omni::load(const std::string & gguf_path, const std::string & tokenize
         }
 #endif
         if (talker.load(p.c_str(), tb, ta)) talker_on = true;
+        talker.host = backend;   // CPU partner for quantized-table reads
         break;
     }
 

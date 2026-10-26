@@ -134,9 +134,7 @@ bool Talker::load(const char * path, ggml_backend_t backend_, ggml_gallocr_t all
     for (auto & kv : vqa::gguf::u32_by_prefix(gu, "qwen3omni.speaker."))
         speaker_ids[kv.first] = kv.second;
 
-    fprintf(stderr, "tl: weights read meta ok\n");
     vqa::weights::bind_from_mmap(gu, wctx, *mm);
-    fprintf(stderr, "tl: bind_from_mmap ok\n");
     gguf_free(gu);
     static vqa::AlignedBuf host_f32_storage;  // function-static: outlives load()
     host_f32 = &host_f32_storage;
@@ -144,7 +142,6 @@ bool Talker::load(const char * path, ggml_backend_t backend_, ggml_gallocr_t all
     // bind FIRST: every host-side weight read below needs tensors in buffers
     vqa::weights::Bound bound = vqa::weights::bind_to_backend(wctx, backend, *mm, {});
     if (!bound.ok) return false;
-    fprintf(stderr, "tl: weights bound ok\n");
     wbuf = bound.main_buf;
     ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -210,7 +207,6 @@ bool Talker::load(const char * path, ggml_backend_t backend_, ggml_gallocr_t all
         if (!L.norm || !L.q || !L.gate) return false;
     }
 
-    fprintf(stderr, "tl: trunk bound\n");
     c2w_emb = gt("c2w.code_embedding.weight");
     c2w_norm = gt("c2w.blk.0.attn_norm.weight");  // placeholder probe below
     c2l.resize((size_t)c2w_n_layer);
@@ -333,8 +329,6 @@ struct TkRuntime {
 };
 
 bool TkRuntime::build(Talker * t, int T, int S) {
-    int n_layer_build = t->n_layer;
-    if (getenv("QOMNI_TK_LAYERS")) n_layer_build = atoi(getenv("QOMNI_TK_LAYERS"));
     tk = t;
     g.emb_in = nullptr; g.mpos_in = nullptr; g.mask_in = nullptr;
     g.logits = nullptr; g.hidden_out = nullptr;
@@ -353,7 +347,7 @@ bool TkRuntime::build(Talker * t, int T, int S) {
     ggml_tensor * pos_rope = ggml_view_1d(c, g.mpos_in, 4 * T, 0);
     ggml_tensor * pos_slot = ggml_view_1d(c, g.mpos_in, T, (size_t)3 * T * sizeof(int));
 
-    for (int il = 0; il < n_layer_build; il++) {
+    for (int il = 0; il < t->n_layer; il++) {
         TkLayer & L = t->tl[il];
         ggml_tensor * l = ggml_rms_norm(c, x, t->rms_eps);
         l = ggml_mul(c, l, L.norm);
@@ -951,29 +945,25 @@ static void resize_mlp(Talker * t, ggml_tensor * fc1_w, ggml_tensor * fc1_b,
 
 // read rows of an embedding table of ANY dtype (quantized thinker tables
 // included) via a one-shot get_rows graph on the tensor's backend
-static void rows_any(ggml_backend_t backend, ggml_tensor * t, const int * ids, int n, float * out) {
+static void rows_any(ggml_backend_t backend, ggml_tensor * t, const int * ids, int n, float * out, ggml_backend_t host = nullptr) {
     struct ggml_init_params ip = { 1ull << 20, NULL, true };
     ggml_context * c = ggml_init(ip);
     ggml_tensor * id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
     ggml_tensor * src = t;
-    // CPU get_rows only reads F32/F16 rows (hence the dequant cast), but the
-   // CUDA copy kernel behind cast() rejects quantized -> F32; CUDA's native
-    // get_rows handles quantized tables directly
-    const bool cuda_backend =
-#ifdef GGML_USE_CUDA
-        ggml_backend_is_cuda(backend);
-#else
-        false;
-#endif
-    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && !cuda_backend)
+    // quantized-table reads (thinker embed Q6_K) run on the CPU partner:
+    // CUDA get_rows lacks Q6_K and the tensor lives in a host buffer anyway
+    ggml_backend_t be = backend;
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+        be = host ? host : backend;
         src = ggml_cast(c, t, GGML_TYPE_F32);
+    }
     ggml_tensor * r = ggml_get_rows(c, src, id_t);
     ggml_cgraph * gf = ggml_new_graph(c);
     ggml_build_forward_expand(gf, r);
-    ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
     ggml_gallocr_alloc_graph(al, gf);
     ggml_backend_tensor_set(id_t, ids, 0, sizeof(int) * n);
-    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_graph_compute(be, gf);
     ggml_backend_tensor_get(r, out, 0, sizeof(float) * (size_t)n * (size_t)t->ne[0]);
     ggml_gallocr_free(al);
     ggml_free(c);
@@ -1063,7 +1053,7 @@ bool synthesize(Talker * t, const SynthIn & in, std::vector<float> & wav) {
     std::vector<float> tts_special(3 * TD);
     {
         const int tts_ids[3] = {t->id_tts_bos, t->id_tts_eos, t->id_tts_pad};
-        rows_any(t->backend, in.thinker_embd, tts_ids, 3, tts_special.data());
+        rows_any(t->backend, in.thinker_embd, tts_ids, 3, tts_special.data(), t->host);
     }
     std::vector<float> tts_proj(3 * D);
     resize_mlp(t, t->tp_fc1_w, t->tp_fc1_b, t->tp_fc2_w, t->tp_fc2_b,
@@ -1125,7 +1115,6 @@ bool synthesize(Talker * t, const SynthIn & in, std::vector<float> & wav) {
         FILE * pf = fopen(pd, "wb");
         if (pf) { fwrite(pre.data(), 4, pre.size(), pf); fclose(pf); }
     }
-    if (getenv("QOMNI_TKSTOP")) { fprintf(stderr, "[syn] tkstop before prefill\n"); wav.clear(); return true; }
     TkRuntime tk;
     if (!tk.kv.alloc(t->backend, t->n_layer, t->n_kv_head, t->head_dim, 8192)) return false;
     if (!tk.build(t, Tpre, Tpre)) return false;
