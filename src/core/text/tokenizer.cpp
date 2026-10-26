@@ -455,7 +455,10 @@ std::string Tokenizer::decode(const std::vector<int> & ids) const {
     std::string out;
     for (int t : ids) {
         if (t < 0 || t >= (int)id_to_piece.size()) continue;
-        if (t < (int)is_added.size() && is_added[t]) continue;   // specials are not text
+        if (t < (int)is_added.size() && is_added[t]) {
+            if (decode_added) out += id_to_piece[t];   // e.g. Nemotron-Parse's <x_0.5>
+            continue;                                  // otherwise: specials are not text
+        }
         const std::string & piece = id_to_piece[t];
         if (gemma_sp) {
             // <0xNN> byte-fallback tokens and U+2581 metaspace

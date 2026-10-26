@@ -48,6 +48,10 @@ struct Tokenizer {
     bool gpt2_pretok = false;   // Gpt2Regex: \s? prefix on words, no trailing CR/LF glue
     bool gemma_sp = false;      // GemmaSP: metaspace + byte fallback, codepoint BPE
     bool deepseek_pretok = false;   // DeepSeekBpe: isolated Split pre-tokenizer
+    // decode(): emit added-token content instead of dropping it. Chat backends
+    // register <|im_start|>-style control tokens as "not text", but a document
+    // parser generates its answer AS added tokens (<x_0.5>, <class_Text>, ...).
+    bool decode_added = false;
 
     bool load(const char * tokenizer_json, TokenizerMode mode = TokenizerMode::PlainGpt2);
 

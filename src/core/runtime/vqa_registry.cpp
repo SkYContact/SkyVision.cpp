@@ -144,6 +144,11 @@ const ArchEntry kArchs[] = {
     // part of this engine
     { { "janus", "janus_pro", nullptr }, create_janus,
       TokenizerMode::DeepSeekBpe, "models/Janus-Pro-1B", 102400, false, false, "" },
+    // NVIDIA Nemotron-3.5-Parse: C-RADIOv4-SO400M tower + conv neck + 10 layer
+    // mBART prefix decoder. GPT-2 byte-level BPE base vocab (50k) plus 22.5k
+    // added coordinate/class tokens, which the decode path must keep verbatim.
+    { { "nemotron_parse", "nemotron-parse", nullptr }, create_nemotron_parse,
+      TokenizerMode::Gpt2Regex, "models/Nemotron-3.5-Parse", 72512, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

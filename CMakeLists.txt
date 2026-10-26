@@ -258,6 +258,12 @@ set(QWEN3OMNI_SRC
     src/models/qwen3omni/qwen3omni_audio.cpp
     src/models/qwen3omni/qwen3omni_talker.cpp)
 
+#   src/models/nemotron_parse/  NVIDIA Nemotron-3.5-Parse (C-RADIOv4-SO400M
+#                           tower + conv neck + 10 layer mBART prefix decoder;
+#                           document markup output)
+set(NEMOTRON_PARSE_SRC
+    src/models/nemotron_parse/nemotron_parse_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -283,7 +289,8 @@ add_executable(vqa-cli
     ${GEMMA4_SRC}
     ${SIGLIP_SRC}
     ${KEYE_VL_SRC}
-    ${QWEN3OMNI_SRC})
+    ${QWEN3OMNI_SRC}
+    ${NEMOTRON_PARSE_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 # expert_cache.cpp (CUDA async prefetch) includes cuda_runtime.h and calls the
 # CUDA runtime directly, so vqa-cli needs the toolkit headers/libs too
@@ -292,7 +299,7 @@ if (TARGET ggml-cuda)
     target_include_directories(vqa-cli PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(vqa-cli PRIVATE CUDA::cudart)
 endif()
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl)
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse)
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(vqa-cli PRIVATE jpeg-static)

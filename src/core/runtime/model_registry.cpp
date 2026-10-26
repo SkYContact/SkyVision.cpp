@@ -138,7 +138,11 @@ bool gguf_arch_of(const std::string & path, std::string & arch, std::string & ft
 
 // Vocab size of a tokenizer.json, approximated by counting "key": entries
 // between "vocab" and "merges" (the file is one flat object per section, so the
-// count tracks the real vocab closely enough to tell the families apart).
+// count tracks the real vocab closely enough to tell the families apart), PLUS
+// the added_tokens array: a model like nemotron_parse carries 22k added tokens
+// (coordinates/classes) against a 50k base vocab, so the base count alone lands
+// 30% below the GGUF's vocab_size and the checkpoint's own tokenizer gets
+// rejected as a "stranger".
 size_t tokenizer_vocab(const std::string & path) {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) return 0;
@@ -147,11 +151,30 @@ size_t tokenizer_vocab(const std::string & path) {
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
     fclose(f);
+    size_t total = 0;
     const size_t vp = js.find("\"vocab\"");
     if (vp == std::string::npos) return 0;
     size_t me = js.find("\"merges\"", vp);
     if (me == std::string::npos) me = js.size();
-    return (size_t)std::count(js.begin() + (long)vp, js.begin() + (long)me, ':');
+    total += (size_t)std::count(js.begin() + (long)vp, js.begin() + (long)me, ':');
+
+    // added_tokens: a top-level array of {"id":n,"content":...,...} objects
+    const size_t ap = js.find("\"added_tokens\"");
+    if (ap != std::string::npos) {
+        const size_t br = js.find('[', ap);
+        if (br != std::string::npos) {
+            int depth = 0;
+            size_t end = js.size();
+            for (size_t i = br; i < js.size(); i++) {
+                if (js[i] == '[') depth++;
+                else if (js[i] == ']' && --depth == 0) { end = i + 1; break; }
+            }
+            const std::string idkey = "\"id\":";
+            for (size_t p = br; (p = js.find(idkey, p)) != std::string::npos && p < end; p += idkey.size())
+                total++;
+        }
+    }
+    return total;
 }
 
 }  // namespace

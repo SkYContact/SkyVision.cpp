@@ -100,12 +100,12 @@ jobs:
           specs = json.load(open('specs.json'))
           assert isinstance(specs, list) and specs, 'specs must be a non-empty JSON list'
           archs = [s['arch'] for s in specs]
-          # expected set as of aeff6ca (qwen3omni adds the 20th arch; keep
-          # this set in sync with vqa_spec.cpp)
+          # expected set as of the nemotron_parse row (21st arch; keep this set
+          # in sync with vqa_spec.cpp)
           expected = {
               'embgemma2', 'gemma4', 'janus', 'keye-vl2', 'mage_vl', 'marlin',
-              'minicpmv47', 'moondream3', 'moss_vl', 'qwen25omni', 'qwen2vl',
-              'qwen3_5', 'qwen3omni', 'qwen3vl', 'siglip', 'smolvlm',
+              'minicpmv47', 'moondream3', 'moss_vl', 'nemotron_parse', 'qwen25omni',
+              'qwen2vl', 'qwen3_5', 'qwen3omni', 'qwen3vl', 'siglip', 'smolvlm',
               'videochat3', 'videojev', 'videomae', 'vjepa2',
           }
           got = set(archs)

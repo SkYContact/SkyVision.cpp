@@ -12,8 +12,9 @@
 // line would desynchronise the client.
 //
 // Tools mirror what vqa::Model can do - the same surface the Web UI drives:
-// list_models / load_model / describe_image / ask_image / detect_objects /
-// point_objects / gaze_point / analyze_video / classify_video.
+// list_models / load_model / describe_image / ask_image / parse_document /
+// detect_objects / point_objects / gaze_point / analyze_video / classify_video
+// / classify_image / embed_image.
 #include "core/vqa.hpp"
 
 #include "core/text/json.hpp"
@@ -242,10 +243,11 @@ vqa::Model * ensure_model(const vqa::ModelEntry & e, const vqa::json::Value & a,
 }
 
 std::string run_ask(vqa::Model * m, const vqa::MediaInput & media, const std::string & prompt,
-                    const std::string & mode, const vqa::json::Value & a, std::string & err) {
+                    const std::string & mode, const vqa::json::Value & a, std::string & err,
+                    int default_max_tokens = 256) {
     vqa::GenParams gp;
-    gp.max_tokens = a.integer("max_tokens", 256);
-    if (gp.max_tokens <= 0) gp.max_tokens = 256;
+    gp.max_tokens = a.integer("max_tokens", default_max_tokens);
+    if (gp.max_tokens <= 0) gp.max_tokens = default_max_tokens;
     gp.temperature = (float)a.num("temperature", 0.0);
     gp.top_k = a.integer("top_k", 0);
     gp.top_p = (float)a.num("top_p", 1.0);
@@ -461,6 +463,31 @@ bool tool_ask_image(const vqa::json::Value & a, std::string & out, std::string &
     if (!m) return false;
     if (!m->caps().image) { err = "backend '" + e->arch + "' does not take image input"; return false; }
     out = run_ask(m, media, question, a.str("mode"), a, err);   // mode: "" | ask-think | caption ...
+    return err.empty();
+}
+
+bool tool_parse_document(const vqa::json::Value & a, std::string & out, std::string & err) {
+    std::string image;
+    if (!need_str(a, "image", image, err)) return false;
+    const std::string format = a.str("format", "json");
+    if (format != "json" && format != "markdown" && format != "raw") {
+        err = "format must be one of json / markdown / raw";
+        return false;
+    }
+    const vqa::ModelEntry * e = resolve_entry(a.str("model"), err);
+    if (!e) return false;
+    if (e->arch != "nemotron_parse") {
+        err = "'" + e->arch + "' is not a document parser - parse_document needs a "
+              "nemotron_parse model (use ask_image for free-form pictures)";
+        return false;
+    }
+    vqa::MediaInput media;
+    if (!load_image_param(image, media, err)) return false;
+    vqa::Model * m = ensure_model(*e, a, err);
+    if (!m) return false;
+    // a whole page of markup is thousands of tokens; the generic 256 default
+    // would truncate after the first couple of lines
+    out = run_ask(m, media, a.str("prompt"), format, a, err, 4096);
     return err.empty();
 }
 
@@ -712,6 +739,7 @@ const ToolDef kTools[] = {
     { "load_model", tool_load_model },
     { "describe_image", tool_describe_image },
     { "ask_image", tool_ask_image },
+    { "parse_document", tool_parse_document },
     { "detect_objects", tool_detect_objects },
     { "point_objects", tool_point_objects },
     { "gaze_point", tool_gaze_point },
@@ -778,6 +806,21 @@ const char * TOOLS_JSON = R"MCPJSON([
         "model": { "type": "string", "description": "Model id or .gguf path." }
       },
       "required": ["image", "question"]
+    }
+  },
+  {
+    "name": "parse_document",
+    "description": "Parse a document page (scan, screenshot, PDF page) into structured blocks: layout class, normalised bbox, pixel bbox and text, plus a Markdown rendering where LaTeX tables become HTML tables. Reading order is the model's own. Needs a nemotron_parse model, one page per call; raise max_tokens for dense pages (a full page can take 8000).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "image": { "type": "string", "description": "Local image path, or inline data:image/...;base64,<data> / base64:<data>." },
+        "format": { "type": "string", "enum": ["json", "markdown", "raw"], "description": "json (default) = markdown + blocks with bboxes; markdown = just the rendered text; raw = the model's own control-token stream." },
+        "max_tokens": { "type": "integer", "description": "Generation budget (default 4096; a dense page may need 8000)." },
+        "prompt": { "type": "string", "description": "Optional override: a prompt containing <predict...> control tokens selects another output combination." },
+        "model": { "type": "string", "description": "Model id or .gguf path." }
+      },
+      "required": ["image"]
     }
   },
   {
@@ -962,9 +1005,10 @@ void handle_initialize(const vqa::json::Value & id, const vqa::json::Value & par
     result.set("instructions", vqa::json::Value::make_string(
         "SkyVision.cpp serves local GGUF vision-language models. Call list_models once to see what "
         "is runnable, then describe_image / ask_image for pictures (detect_objects, point_objects, "
-        "gaze_point need a moondream3 model with its region head) and analyze_video / classify_video "
-        "for clips. The first call that needs weights loads them (seconds to a minute); pass "
-        "model=<id> only when more than one model is available. Coordinates are normalised to 0..1."));
+        "gaze_point need a moondream3 model with its region head), parse_document for scans and "
+        "PDF pages (nemotron_parse) and analyze_video / classify_video for clips. The first call "
+        "that needs weights loads them (seconds to a minute); pass model=<id> only when more than "
+        "one model is available. Coordinates are normalised to 0..1."));
     reply_result(id, vqa::json::dump(result));
 }
 
