@@ -774,6 +774,14 @@ JSON 里每个 block 是 `{"class","bbox":[x1,y1,x2,y2]（内容区归一化）,
 降下来能把视觉塔成本砍到 1/16——塔是 O(视觉 token²)）；`NEMOTRON_PARSE_PROFILE=1` 打印图规模与
 `compute / graph build` 拆分。`--max-tokens` 要给够（整页 2-8k，截断前会告警）。
 
+**量化取舍（实测，跟直觉相反）**：`q8_0`（866 MB，视觉塔也能量化——Q8_0/Q4_0 的行块是 32 而不是
+256）在这台机器上**更慢**：GPU decode 2.5 → 4.5 ms/token、视觉塔 675 → 950 ms，CPU 视觉塔
+17.6 → 15.8 s、decode 11.8 → 12.5 ms。原因不在带宽：CPU 视觉塔是 flash-attention 受限
+（1313 token × 27 层 ≈ 214 GFLOP，CPU FA 有效算力只有 ~15 GFLOP/s），GPU decode 是 kernel 延迟
+受限（380 MB 权重 / 2.5 ms ≈ 152 GB/s，而 4070 SUPER 上限 ~500 GB/s，T=1 的 GEMV 吃不满）。
+所以**默认 f16**；要省体积再用 q8_0（结构仍对：同页 7/7 block 类别与正文一致，只有坐标末位与个别
+block 尾部字符有漂移）。
+
 **已知简化**：图表只按文本处理（不做 upstream 的 panel 渲染/caption 上移/原生小标题）；
 JSON 不回带 `raw_out`；表头提升只看形状不看加粗；一次一页（多页由调用方循环）。
 

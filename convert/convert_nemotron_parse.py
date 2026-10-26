@@ -216,14 +216,23 @@ def main():
     gw = gguf.GGUFWriter(out, "nemotron_parse")
     write_metadata(gw, cfg, args.outtype)
 
+    # ggml blocks: Q8_0 / Q4_0 quantise in 32-element rows (QK8_0 = QK4_0 = 32),
+    # only the K-quants need 256. The tower is 1152-wide, so a 256 rule would keep
+    # every vision matmul at f16 and leave the CPU prefill on the slow path.
+    row_mult = 256 if qtype in (gguf.GGMLQuantizationType.Q6_K,) else 32
+    stat = {"q": 0, "f16": 0, "f32": 0}
+
     def linear(name, hf_name, quant_ok=True):
         arr = weights.get(have(hf_name))
-        if qtype is not None and quant_ok and arr.ndim == 2 and arr.shape[1] % 256 == 0:
+        if qtype is not None and quant_ok and arr.ndim == 2 and arr.shape[1] % row_mult == 0:
             _lib.add_quantized(gw, name, _lib.quantize(arr, qtype), qtype)
+            stat["q"] += int(arr.size)
         elif args.outtype == "f32":
             gw.add_tensor(name, np.ascontiguousarray(arr, dtype=np.float32))
+            stat["f32"] += int(arr.size)
         else:
             _lib.add_f16(gw, name, arr)
+            stat["f16"] += int(arr.size)
 
     def f32(name, hf_name, shape=None):
         arr = np.ascontiguousarray(weights.get(have(hf_name)), dtype=np.float32)
@@ -342,6 +351,8 @@ def main():
     bad = {n: (written[n], want) for n, want in required.items() if tuple(written[n]) != want}
     if bad:
         fail(f"written GGUF has wrong tensor shapes: {bad}")
+    log(f"precision: {stat['q'] / 1e6:.1f}M params quantised, {stat['f16'] / 1e6:.1f}M f16, "
+        f"{stat['f32'] / 1e6:.1f}M f32")
     log(f"verified {len(written)} tensors, {os.path.getsize(out) / 1e6:.0f} MB -> {out}")
     return 0
 

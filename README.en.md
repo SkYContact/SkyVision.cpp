@@ -765,6 +765,15 @@ cuts the tower cost by ~16× (the default canvas is 2048×1664 and the tower is 
 tokens); `NEMOTRON_PARSE_PROFILE=1` prints the graph shape and the compute / graph-build split;
 `--max-tokens` needs room (a page is 2-8k tokens, and the backend warns before clipping).
 
+**Quantisation is a loss here (measured, counter-intuitive)**: `q8_0` (866 MB; the tower quantises
+too, since Q8_0/Q4_0 have 32-element rows, not 256) is **slower**: GPU decode 2.5 → 4.5 ms/token
+and tower 675 → 950 ms, CPU tower 17.6 → 15.8 s and decode 11.8 → 12.5 ms. Bandwidth is not the
+limit — the CPU tower is flash-attention bound (1313 tokens × 27 layers ≈ 214 GFLOP at ~15 GFLOP/s
+of effective CPU FA) and GPU decode is kernel-latency bound (380 MB of weights in 2.5 ms is only
+152 GB/s against the card's ~500 GB/s, because T=1 GEMV cannot fill it). So **f16 is the default**;
+q8_0 is only for saving space (the structure still holds — same 7/7 blocks, classes and body text,
+with drift in the last coordinates and in a few characters at block ends).
+
 **Known simplifications**: charts are treated as text (no upstream panel rendering / caption
 relocation / native subtitles); the JSON does not echo `raw_out`; header promotion looks at table
 shape only, not at bold text; one page per call (loop in the caller for multi-page documents).
