@@ -53,5 +53,22 @@ ggml_tensor * build_expert_ffn_table(ggml_context * ctx, ggml_cgraph * gf, ggml_
                                      ggml_tensor * w,
                                      ggml_unary_op act = GGML_UNARY_OP_SILU);
 
+// residual-splitting form of build_expert_ffn (same ops; out = res + SUM_k,
+// build_expert_ffn is the res = x special case) - defined in moe_compute.cpp
+ggml_tensor * build_expert_ffn_res(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * x,
+                                   ggml_tensor * res,
+                                   const std::vector<ggml_tensor *> & gate,
+                                   const std::vector<ggml_tensor *> & up,
+                                   const std::vector<ggml_tensor *> & down,
+                                   ggml_tensor * w, ggml_unary_op act);
+// v3 slot-table form (ExpertCache table layout): mul_mat_id over the cache's
+// 3D slot tables; residual-splitting like build_expert_ffn_res above
+ggml_tensor * build_expert_ffn_table_res(ggml_context * ctx, ggml_cgraph * gf,
+                                         ggml_tensor * x, ggml_tensor * res,
+                                         ggml_tensor * gate_table, ggml_tensor * up_table,
+                                         ggml_tensor * down_table,
+                                         ggml_tensor * gate_up_ids, ggml_tensor * down_ids,
+                                         ggml_tensor * w, ggml_unary_op act);
+
 }  // namespace moe
 }  // namespace vqa

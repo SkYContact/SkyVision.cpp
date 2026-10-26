@@ -41,6 +41,7 @@
 #endif
 #include "core/text/tokenizer.hpp"
 #include "core/engine/attention.hpp"
+#include "core/engine/moe_decode_driver.hpp"
 #include "core/blocks/omni_speech.hpp"
 #include "core/engine/sampler.hpp"
 #include "core/util/aligned_buf.hpp"
@@ -167,8 +168,9 @@ private:
     std::vector<vqa::ExpertCache> ec_caches;   // one per quant-layout group
     std::vector<int> ec_group;                 // layer -> group index
     int ec_n_groups = 0;
-    double ec_ms_a = 0, ec_ms_b = 0, ec_ms_fin = 0, ec_ms_rb = 0, ec_ms_swap = 0;
-    int ec_steps = 0;
+    vqa::moe_decode::State ec_st;              // driver-owned decode state
+    vqa::moe_decode::Hooks ec_hooks;           // filled once in ec_init
+    std::vector<float> * ec_traj_emb = nullptr, * ec_traj_h24 = nullptr;
     // fixed per-layer graph-A holders (StepGraph, built once, re-fed every
     // step; S is block-aligned so shapes never change mid-block)
     struct EcGraphA {
@@ -177,15 +179,17 @@ private:
         ggml_tensor *w8_o = nullptr, *sel_o = nullptr, *m_o = nullptr, *x_o = nullptr;
     };
     struct EcGaUd { Qwen3Omni * m; int il; EcGraphA * io; };
-    std::vector<vqa::StepGraph> ec_ga;
-    std::vector<EcGraphA> ec_ga_io;
-    int ec_S = 0;
-    bool ec_ga_ready = false;
-    bool ec_async_ok = false;
-    std::vector<std::vector<int>> ec_prev_sel;
+    std::vector<EcGraphA> ec_ga_io;            // model leaves per layer
     bool ec_init();
-    bool ec_build_graphs();
     static ggml_tensor * ec_ga_builder(ggml_context * c, void * ud);
+    static bool ec_build_a(void * m, int il, vqa::StepGraph & sg,
+                           vqa::moe_decode::AIO & io);
+    static bool ec_feed_a(void * m, int il, vqa::moe_decode::AIO & io,
+                          vqa::StepGraph & sg, const void * step_ctx,
+                          int cur_tok, int n_past, const float * hid);
+    static void ec_post_a(void * m, int il, const float * xmid, const float * mn,
+                          const int * sel, const float * w8);
+    static void ec_post_b(void * m, int il, const float * hid);
     bool ec_decode_step(int cur_tok, const int * mpos4, int n_past,
                         std::vector<float> & logits,
                         std::vector<float> * emb_out = nullptr,
@@ -1058,7 +1062,7 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
         load_talker();          // while talker_deferred is still set: the
         talker_deferred = false; // CPU-partner placement decision reads it
     }
-    if (ec_enabled && ec_ok && ec_steps > 0) {
+    if (ec_enabled && ec_ok && ec_st.steps > 0) {
         vqa::ExpertCacheStats st;
         for (auto & c : ec_caches) {
             const vqa::ExpertCacheStats s = c.stats();
@@ -1072,13 +1076,13 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
                 " + swap-wait %.2f + readback %.2f), %.1f tok/s | cache:"
                 " %llu hits / %llu misses (%.1f%% hit), %llu evictions,"
                 " %.2f GB swapped, %d/%d slots resident, in_flight %d (async %s)\n",
-                ec_steps, ec_ms_fin / ec_steps, ec_ms_a / ec_steps, ec_ms_b / ec_steps,
-                ec_ms_swap / ec_steps, ec_ms_rb / ec_steps,
-                ec_steps * 1000.0 / ec_ms_fin,
+                ec_st.steps, ec_st.ms_fin / ec_st.steps, ec_st.ms_a / ec_st.steps, ec_st.ms_b / ec_st.steps,
+                ec_st.ms_swap / ec_st.steps, ec_st.ms_rb / ec_st.steps,
+                (double)(ec_st.steps * 1000) / ec_st.ms_fin,
                 (unsigned long long)st.hits, (unsigned long long)st.misses,
                 acc ? 100.0 * (double)st.hits / (double)acc : 0.0,
                 (unsigned long long)st.evictions, st.swap_bytes / 1e9,
-                st.resident, st.n_slots, in_flight, ec_async_ok ? "on" : "off/v1");
+                st.resident, st.n_slots, in_flight, ec_hooks.async_ok ? "on" : "off/v1");
     }
     if (gp.speak_wav) {
         if (getenv("QOMNI_TRAJ_DUMP")) {
