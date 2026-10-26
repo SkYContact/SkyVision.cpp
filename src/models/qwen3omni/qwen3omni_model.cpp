@@ -843,10 +843,18 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
     // capture once and replay. The talker-capture graph (for_talker) has a
     // different shape, so it keys its own slot entry.
     const bool decode_step = (T == 1 && n_img == 0);
-    const int window_S = decode_step
+    // The slot is a single-backend pattern: under the Strata split placement
+    // (QOMNI_EXPERTCACHE implies it; QOMNI_EC_OFF then routes this very T=1
+    // decode through it, including the deferred talker's for_talker graphs)
+    // ggml-backend's split_graph() rewrites the caller graph's node->src to
+    // its per-split copy tensors, so a graph reused across steps is re-split
+    // in an already-rewritten state (see decode_graph.hpp). Split keeps the
+    // pre-slot per-step rebuild with the exact window.
+    const bool reuse_graph = decode_step && !split_mode;
+    const int window_S = reuse_graph
         ? vqa::decode_bucket(S, n_ctx, ggml_backend_is_cpu(backend)) : S;
     TextGraph * dg = &g;
-    if (decode_step) {
+    if (reuse_graph) {
         const int slot_key = window_S * 2 + (for_talker ? 1 : 0);
         if (!dec_slot.prepare(slot_key, [&](TextGraph & d) {
                 return build_text_graph(d, 1, window_S, 0, false, for_talker);
@@ -860,7 +868,7 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
     if (split_mode ? !split_sched.alloc(dg->gf)
                    : !ggml_gallocr_alloc_graph(allocr, dg->gf)) {
         fprintf(stderr, "text graph allocation failed\n");
-        if (decode_step) dec_slot.reset();
+        if (reuse_graph) dec_slot.reset();
         else { ggml_free(g.ctx); g.ctx = nullptr; }
         return false;
     }
@@ -886,7 +894,7 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
     }
     if (!ok) {
         fprintf(stderr, "text compute failed\n");
-        if (decode_step) dec_slot.reset();
+        if (reuse_graph) dec_slot.reset();
         else { ggml_free(g.ctx); g.ctx = nullptr; }
         return false;
     }
@@ -927,7 +935,7 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
                     b_ms / ns, a_ms / ns, c_ms / ns);
     }
     n_past = S;
-    if (!decode_step) { ggml_free(g.ctx); g.ctx = nullptr; }   // the decode slot persists
+    if (!reuse_graph) { ggml_free(g.ctx); g.ctx = nullptr; }   // the decode slot persists
     return true;
 }
 
