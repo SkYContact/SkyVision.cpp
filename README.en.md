@@ -96,7 +96,7 @@ Full per-backend details are in the hand-maintained table below:
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 | V-JEPA 2 features / classification / masked prediction | ✅ ViT-L (326M + a 25M predictor, 653 MB at f16): 64 frames → shortest edge 292 (bilinear) → crop 256 → **8192-token full space-time attention x 24 layers** → 1024-d feature; the SSv2 fine-tune (16 frames) adds a **3-layer attentive pooler + 174-way linear head** (`--mode 5` prints labels), and `--mode predict` runs the 12-layer masked-latent predictor. **Parity verified** against transformers 5.x: with the *same* patch input the 24-layer stream matches at cos **1.000000** (max 0.065); end to end (each with its own preprocessing) the pooled feature is cos **0.9994**, the SSv2 top-1 label agrees (0.916 vs 0.921, probabilities within 4.5e-3) and the predictor lands at cos **0.998**. ~25 s per 8192-token clip on CPU (19 cores), ~5 s for SSv2 |
-| Nemotron-3.5-Parse document parsing | ✅ end to end, stage-by-stage against the official torch stack (`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`): content-normalized position field **2.7e-7**, patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3, first-token logits top8 **8/8**, and all **159 greedy tokens of a full page are identical** to the official stack, down to the HTML table rendered from its LaTeX. One trap worth recording: HF applies the repetition penalty over `input_ids.unique()`, so applying it per occurrence double-penalises the repeated coordinate tokens and greedy decoding forks mid-page. One 1.3 GB GGUF plus the upstream `tokenizer.json` (the registry's vocab probe now counts added tokens, otherwise 50k base + 22k coordinate tokens looks like a stranger's tokenizer); one page costs ~20 s on CPU (17.6 s vision + 0.9 s prefill + 158 decoded tokens) versus ~1.1 s on CUDA (0.68 s + 0.019 s + 0.4 s), with identical per-block output |
+| Nemotron-3.5-Parse document parsing | ✅ end to end, stage-by-stage against the official torch stack (`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`): content-normalized position field **2.7e-7**, patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3, first-token logits top8 **8/8**, and all **159 greedy tokens of a full page are identical** to the official stack, down to the HTML table rendered from its LaTeX. One trap worth recording: HF applies the repetition penalty over `input_ids.unique()`, so applying it per occurrence double-penalises the repeated coordinate tokens and greedy decoding forks mid-page. One 1.3 GB GGUF plus the upstream `tokenizer.json` (the registry's vocab probe now counts added tokens, otherwise 50k base + 22k coordinate tokens looks like a stranger's tokenizer); one page costs ~19 s on CPU (17.4 s vision + 0.9 s prefill + 158 decoded tokens) versus ~0.94 s on CUDA (0.66 s + 0.018 s + 0.25 s), with identical per-block body text |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
 | SmolVLM-256M (Idefics3) | ✅ arch `smolvlm`, the smallest backend here: SigLIP-base tower (12L, patch 16, 512², learned positions, LayerNorm/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30L, no biases, GQA 9:3, rope 1e5). Idefics3 preprocessing: longest edge 2048 → pad to multiples of 512 → 512² tiles + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8. Logits corr 0.99991 and byte-identical answers |
 | EmbeddingGemma-2 (740M) | ✅ arch `embgemma2`, multimodal **embedding** (no text generation): Gemma3 text tower (24L d=512, GQA 4:1, interleaved SWA/full, per-layer PLE) + Gemma4 ViT (16L patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / chunk-12 local attention with Transformer-XL rel-shift bias; every linear is a ClippableLinear with finite clamps from the checkpoint). `--embed` emits 768-d vectors (Matryoshka truncation `--embed-dim`, official task prefixes `--embed-preset`, batch `--embed-file`). All four modalities vs the fp32 HF reference: text 0.9999999 / image 0.99999 / audio 0.99999 / video 0.9999998 |
@@ -749,21 +749,33 @@ converted to HTML). The MCP side is the `parse_document` tool (`format=json|mark
 **Parity** against the official torch stack, stage by stage (`scripts/ref_nemotron_parse.py` →
 `convert/compare_dumps.py`): the content-normalized position field is **element-exact** (2.7e-7),
 patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3; **on CPU all 159 greedy
-tokens of a full page are identical to the official stack**; on CUDA all 7 blocks match in class
-and text, with 5 characters differing — all in the last digit of a coordinate (f16 kernel
-rounding lands on the neighbouring coordinate bin).
+tokens of a full page are identical to the official stack**; on CUDA all 7 blocks carry identical
+body text, with differences only in coordinate last digits (f16 kernel rounding lands on the
+neighbouring bin) and, on a near-tie, an occasional class flip (measured: `Section-header` → `Text`
+with the body unchanged).
 
 **Performance** (a 1000×1300 page, default canvas: 1313 visual tokens, 158 output tokens):
 
 | | vision tower | prefill | decode |
 |---|---|---|---|
-| CPU (19 threads) | 17.6 s | 0.89 s | 11.8 ms/token (84 tok/s) |
-| CUDA (RTX 4070 SUPER) | **0.68 s** | **0.019 s** | **2.5 ms/token (404 tok/s)** |
+| CPU (19 threads) | 17.4 s | 0.89 s | 11.7 ms/token (85 tok/s) |
+| CUDA (RTX 4070 SUPER) | **0.66 s** | **0.018 s** | **1.6 ms/token (620 tok/s)** |
 
-End to end that is ~20 s per page on CPU and ~1.1 s on GPU. Knobs: `NEMOTRON_PARSE_MAX_EDGE=1024`
+End to end that is ~19 s per page on CPU and ~0.94 s on GPU. Knobs: `NEMOTRON_PARSE_MAX_EDGE=1024`
 cuts the tower cost by ~16× (the default canvas is 2048×1664 and the tower is quadratic in visual
 tokens); `NEMOTRON_PARSE_PROFILE=1` prints the graph shape and the compute / graph-build split;
 `--max-tokens` needs room (a page is 2-8k tokens, and the backend warns before clipping).
+
+Three graph-level changes, all measured:
+
+- **q/k/v fused into one projection**: the converter writes one `[n_qkv, n_embd]` matrix, so a layer
+  does one matmul instead of three (GPU decode: `mul_mat` 61 → 41, `add` 102 → 82).
+- **the decode graph is bucketed by KV window and rebuilt only when the bucket changes**: the
+  per-token build+alloc drops from 0.48 to 0.06–0.22 ms, and — load-bearing — `ggml-cuda`'s CUDA
+  graph cache is keyed on `cgraph->nodes[0]`, so a fresh ggml context per step could never replay.
+- **repeat queries on the same page hit a cache** (visual features + first-step logits + the prefix
+  KV, keyed by an FNV-1a of prompt and pixels): via MCP the second call went **12.5 s → 2.0 s** with
+  byte-identical output.
 
 **Quantisation is a loss here (measured, counter-intuitive)**: `q8_0` (866 MB; the tower quantises
 too, since Q8_0/Q4_0 have 32-element rows, not 256) is **slower**: GPU decode 2.5 → 4.5 ms/token

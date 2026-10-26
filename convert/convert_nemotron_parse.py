@@ -222,6 +222,18 @@ def main():
     row_mult = 256 if qtype in (gguf.GGMLQuantizationType.Q6_K,) else 32
     stat = {"q": 0, "f16": 0, "f32": 0}
 
+    def write_2d(name, arr):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if qtype is not None and arr.ndim == 2 and arr.shape[1] % row_mult == 0:
+            _lib.add_quantized(gw, name, _lib.quantize(arr, qtype), qtype)
+            stat["q"] += int(arr.size)
+        elif args.outtype == "f32":
+            gw.add_tensor(name, arr)
+            stat["f32"] += int(arr.size)
+        else:
+            _lib.add_f16(gw, name, arr)
+            stat["f16"] += int(arr.size)
+
     def linear(name, hf_name, quant_ok=True):
         arr = weights.get(have(hf_name))
         if qtype is not None and quant_ok and arr.ndim == 2 and arr.shape[1] % row_mult == 0:
@@ -306,12 +318,16 @@ def main():
         h, b = f"decoder.layers.{i}", f"t.blk.{i}"
         f32(f"{b}.ln1.weight", f"{h}.self_attn_layer_norm.weight")
         f32(f"{b}.ln1.bias", f"{h}.self_attn_layer_norm.bias")
-        linear(f"{b}.wq.weight", f"{h}.self_attn.q_proj.weight")
-        f32(f"{b}.bq", f"{h}.self_attn.q_proj.bias")
-        linear(f"{b}.wk.weight", f"{h}.self_attn.k_proj.weight")
-        f32(f"{b}.bk", f"{h}.self_attn.k_proj.bias")
-        linear(f"{b}.wv.weight", f"{h}.self_attn.v_proj.weight")
-        f32(f"{b}.bv", f"{h}.self_attn.v_proj.bias")
+        # q/k/v share one LN output, so one [n_qkv, n_embd] matmul does all three:
+        # the engine slices the result (greedy decode is launch-bound, and three
+        # small GEMVs per layer cost more than one wider one)
+        wq, wk, wv = (weights.get(have(f"{h}.self_attn.{p}_proj.weight"))
+                      for p in ("q", "k", "v"))
+        wqkv = np.concatenate([wq, wk, wv], axis=0)
+        bqkv = np.concatenate([weights.get(have(f"{h}.self_attn.{p}_proj.bias"))
+                               for p in ("q", "k", "v")], axis=0)
+        write_2d(f"{b}.wqkv.weight", wqkv)
+        gw.add_tensor(f"{b}.bqkv", np.ascontiguousarray(bqkv, dtype=np.float32))
         linear(f"{b}.wo.weight", f"{h}.self_attn.out_proj.weight")
         f32(f"{b}.bo", f"{h}.self_attn.out_proj.bias")
         f32(f"{b}.ln2.weight", f"{h}.final_layer_norm.weight")
@@ -344,6 +360,9 @@ def main():
         "t.norm.weight": (cfg["n_embd"],),
         f"v.blk.{cfg['v_layer'] - 1}.fc1.weight": (cfg["v_ff"], cfg["v_embd"]),
         f"t.blk.{cfg['n_layer'] - 1}.fc2.weight": (cfg["n_ff"], cfg["n_embd"]),
+        # fused q|k|v projection: n_head*hd + 2*n_kv_head*hd rows
+        f"t.blk.0.wqkv.weight": (cfg["n_embd"],
+                                 cfg["n_embd"] + 2 * cfg["n_kv_head"] * cfg["head_dim"]),
     }
     missing = [n for n in required if n not in written]
     if missing:

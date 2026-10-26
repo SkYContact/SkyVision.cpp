@@ -64,6 +64,21 @@ namespace nemotron_parse {
 static const char * kPrompt =
     "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>";
 
+// FNV-1a over the prompt and the page pixels: the repeat-page cache key.
+static uint64_t hash_page(const vqa::MediaInput & m, const std::string & prompt) {
+    if (m.empty()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void * p, size_t n) {
+        const uint8_t * b = (const uint8_t *)p;
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    mix(prompt.data(), prompt.size());
+    const int32_t wh[2] = { m.width, m.height };
+    mix(wh, sizeof(wh));
+    for (const auto & f : m.frames) mix(f.rgb.data(), f.rgb.size());
+    return h ? h : 1;
+}
+
 struct VisLayer {
     ggml_tensor *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr;
     ggml_tensor *wqkv = nullptr, *bqkv = nullptr;
@@ -74,9 +89,9 @@ struct VisLayer {
 
 struct DecLayer {
     ggml_tensor *ln1_w = nullptr, *ln1_b = nullptr;
-    ggml_tensor *wq = nullptr, *bq = nullptr;
-    ggml_tensor *wk = nullptr, *bk = nullptr;
-    ggml_tensor *wv = nullptr, *bv = nullptr;
+    // q|k|v fused into one projection ([n_qkv, n_embd]): one GEMV per layer
+    // instead of three, then sliced with views
+    ggml_tensor *wqkv = nullptr, *bqkv = nullptr;
     ggml_tensor *wo = nullptr, *bo = nullptr;
     ggml_tensor *ln2_w = nullptr, *ln2_b = nullptr;
     ggml_tensor *fc1_w = nullptr, *fc1_b = nullptr;
@@ -185,6 +200,18 @@ private:
     int n_past = 0;
     double ms_compute = 0.0;   // accumulated graph_compute time (build vs compute split)
 
+    // Build-once decode graph. The KV window is bucketed so the graph keeps a
+    // CONSTANT shape across steps: that kills the per-token build+alloc cost and
+    // is load-bearing for ggml-cuda's CUDA graph cache (keyed on cgraph->nodes[0],
+    // so a fresh ggml_context per step would never replay).
+    TextGraph dec_g;
+    int dec_g_bucket = -1;
+    bool reuse_vision = true;                     // last page's features + first logits
+    uint64_t vis_hash = 0;
+    std::vector<float> vis_feats_cache;
+    std::vector<float> first_logits_cache;
+    int vis_n_cache = 0, vis_prefix_cache = 0;
+
     uint64_t rng_state = 0x243F6A8885A308D3ull;
 };
 
@@ -192,6 +219,7 @@ private:
 
 NemotronParse::~NemotronParse() {
     kv.free();
+    if (dec_g.ctx) { ggml_free(dec_g.ctx); dec_g.ctx = nullptr; }
     if (vctx) ggml_free(vctx);
     if (allocr) ggml_gallocr_free(allocr);
     if (wbuf) ggml_backend_buffer_free(wbuf);
@@ -282,14 +310,12 @@ bool NemotronParse::load_weights(const char * path) {
         auto g = [&](const char * suf) { snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf); return gt(b); };
         DecLayer & L = dl[(size_t)i];
         L.ln1_w = g("ln1.weight"); L.ln1_b = g("ln1.bias");
-        L.wq = g("wq.weight"); L.bq = g("bq");
-        L.wk = g("wk.weight"); L.bk = g("bk");
-        L.wv = g("wv.weight"); L.bv = g("bv");
+        L.wqkv = g("wqkv.weight"); L.bqkv = g("bqkv");
         L.wo = g("wo.weight"); L.bo = g("bo");
         L.ln2_w = g("ln2.weight"); L.ln2_b = g("ln2.bias");
         L.fc1_w = g("fc1.weight"); L.fc1_b = g("fc1.bias");
         L.fc2_w = g("fc2.weight"); L.fc2_b = g("fc2.bias");
-        if (!L.ln1_w || !L.wq || !L.wk || !L.wv || !L.wo || !L.fc1_w || !L.fc2_w) return false;
+        if (!L.ln1_w || !L.wqkv || !L.wo || !L.fc1_w || !L.fc2_w) return false;
     }
 
     v_patch_w = gt("v.patch_embd.weight");
@@ -374,7 +400,9 @@ bool NemotronParse::build_vision_graph(int n_patch, int rows, int cols) {
     vqa::dump::dump_registry_clear();
     const int E = v_embd, P = v_patch, N = v_cls + n_patch;
 
-    struct ggml_init_params ip = { 512ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    // no_alloc: this context only holds node metadata (~700 tensors), so 32 MB is
+    // plenty - ggml_init mallocs the arena eagerly
+    struct ggml_init_params ip = { 32ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     vctx = ggml_init(ip);
     if (!vctx) return false;
     vgf = ggml_new_graph_custom(vctx, 32768, false);
@@ -568,12 +596,18 @@ ggml_tensor * NemotronParse::dec_layer(TextGraph & g, ggml_tensor * x, const Dec
     l = ggml_mul(c, l, L.ln1_w);
     l = ggml_add(c, l, L.ln1_b);
 
-    ggml_tensor * q = ggml_add(c, ggml_mul_mat(c, L.wq, l), L.bq);   // [D, T]
-    ggml_tensor * k = ggml_add(c, ggml_mul_mat(c, L.wk, l), L.bk);   // [NKV*HD, T]
-    ggml_tensor * v = ggml_add(c, ggml_mul_mat(c, L.wv, l), L.bv);
-
-    ggml_tensor * k2 = ggml_reshape_2d(c, k, NKV * HD, T);
-    ggml_tensor * v2 = ggml_reshape_2d(c, v, NKV * HD, T);
+    // one projection for q|k|v: [NH*HD + 2*NKV*HD, T], then slice
+    const int qd = NH * HD, kvd = NKV * HD;
+    ggml_tensor * qkv = ggml_add(c, ggml_mul_mat(c, L.wqkv, l), L.bqkv);
+    ggml_tensor * qs = ggml_view_2d(c, qkv, qd, T, qkv->nb[1], 0);
+    ggml_tensor * ks = ggml_view_2d(c, qkv, kvd, T, qkv->nb[1], (size_t)qd * qkv->nb[0]);
+    ggml_tensor * vs = ggml_view_2d(c, qkv, kvd, T, qkv->nb[1],
+                                    (size_t)(qd + kvd) * qkv->nb[0]);
+    // set_rows wants row-contiguous sources (and FA wants a contiguous q), so the
+    // slices are materialised - three cheap copies against three extra GEMVs
+    ggml_tensor * q = ggml_cont(c, qs);
+    ggml_tensor * k2 = ggml_cont(c, ks);
+    ggml_tensor * v2 = ggml_cont(c, vs);
     ggml_build_forward_expand(g.gf, ggml_set_rows(c, kv.k[(size_t)il], k2, g.pos_in));
     ggml_build_forward_expand(g.gf, ggml_set_rows(c, kv.v[(size_t)il], v2, g.pos_in));
 
@@ -605,7 +639,7 @@ ggml_tensor * NemotronParse::dec_layer(TextGraph & g, ggml_tensor * x, const Dec
 bool NemotronParse::build_text_graph(TextGraph & g, int T_tok, int n_vis, int S,
                                      bool logits_last) {
     if (!dump_dir.empty()) vqa::dump::dump_registry_clear();   // one graph per decode step
-    struct ggml_init_params ip = { 256ull * 1024 * 1024, NULL, /*no_alloc*/ true };
+    struct ggml_init_params ip = { 32ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
     if (!g.ctx) return false;
     g.gf = ggml_new_graph_custom(g.ctx, 32768, false);
@@ -741,12 +775,6 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         return false;
     }
 
-    std::vector<float> feats;
-    int n_vis = 0;
-    if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
-    if (!encode_image(media, feats, &n_vis)) return false;
-    if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
-
     // The model has exactly one task: the control-token prompt. A caller-supplied
     // prompt that spells those control tokens out is passed through verbatim, so
     // the CLI can ask for a different output combination manually.
@@ -757,8 +785,31 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         return false;
     }
 
+    // Same page asked twice (the MCP/Web UI pattern): the vision tower and the
+    // prefix pass depend only on the image and the fixed prompt, so reuse both -
+    // including the first-step logits, since the KV cache is already filled.
+    const uint64_t h = hash_page(media, text);
+    const bool hit = reuse_vision && h != 0 && h == vis_hash && !vis_feats_cache.empty() &&
+                     !first_logits_cache.empty();
+    std::vector<float> feats;
+    int n_vis = 0;
+    std::vector<float> logits;
+    std::vector<int> pos;
+    int T = 0;
+    if (hit) {
+        n_vis = vis_n_cache;
+        T = vis_prefix_cache;
+        logits = first_logits_cache;
+        fprintf(stderr, "nemotron_parse: page unchanged - reusing %d visual tokens and the "
+                        "prefix KV (%d tokens)\n", n_vis, T);
+    } else {
+        if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
+        if (!encode_image(media, feats, &n_vis)) return false;
+        if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
+    }
+
     const int T_tok = (int)toks.size();
-    const int T = n_vis + T_tok;
+    if (!hit) T = n_vis + T_tok;
     if (T > n_ctx) {
         fprintf(stderr, "prefix %d tokens exceed n_ctx %d (raise --n-ctx)\n", T, n_ctx);
         return false;
@@ -773,21 +824,27 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         }
     }
 
-    std::vector<int> pos((size_t)T);
-    for (int i = 0; i < T; i++) pos[(size_t)i] = i;
-
-    TextGraph g;
-    const auto tp0 = std::chrono::steady_clock::now();
-    if (!build_text_graph(g, T_tok, n_vis, T, true)) { ggml_free(g.ctx); return false; }
-    vqa::set_causal_mask(g.mask_in, 0, T);
-    std::vector<float> logits;
-    if (!run_text(g, toks, pos, feats.data(), n_vis, logits)) { ggml_free(g.ctx); return false; }
-    if (!dump_dir.empty()) dump(g.gf, "logits");
-    ggml_free(g.ctx);
+    if (!hit) {
+        pos.resize((size_t)T);
+        for (int i = 0; i < T; i++) pos[(size_t)i] = i;
+        TextGraph g;
+        const auto tp0 = std::chrono::steady_clock::now();
+        if (!build_text_graph(g, T_tok, n_vis, T, true)) { ggml_free(g.ctx); return false; }
+        vqa::set_causal_mask(g.mask_in, 0, T);
+        if (!run_text(g, toks, pos, feats.data(), n_vis, logits)) { ggml_free(g.ctx); return false; }
+        if (!dump_dir.empty()) dump(g.gf, "logits");
+        ggml_free(g.ctx);
+        fprintf(stderr, "[perf] nemotron_parse prefill: %.0f ms for %d tokens (%d visual)\n",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count(),
+                T, n_vis);
+        // remember this page: features + first-step logits (the prefix KV stays live)
+        vis_hash = h;
+        vis_feats_cache = feats;
+        first_logits_cache = logits;
+        vis_n_cache = n_vis;
+        vis_prefix_cache = T;
+    }
     n_past = T;
-    fprintf(stderr, "[perf] nemotron_parse prefill: %.0f ms for %d tokens (%d visual)\n",
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count(),
-            T, n_vis);
 
     std::vector<int> out;
     std::vector<uint8_t> seen_flag((size_t)n_vocab, 0);
@@ -812,15 +869,31 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
         emit(cur);
         mark(cur);
         generated++;
-        TextGraph d;
-        if (!build_text_graph(d, 1, 0, n_past + 1, true)) { ggml_free(d.ctx); return false; }
-        vqa::set_causal_mask(d.mask_in, n_past, 1);
+        // Bucket the KV window so the decode graph keeps a CONSTANT shape: the
+        // build+alloc cost disappears and ggml-cuda's CUDA graph cache can replay
+        // (it keys on cgraph->nodes[0], so a fresh context per token never hits).
+        // Unused rows are masked -inf by set_causal_mask, so widening S is exact.
+        int S = n_past + 1;
+        if (S <= 1024) { int b = 128; while (b < S) b <<= 1; S = b; }
+        else S = ((S + 1023) / 1024) * 1024;
+        if (S > n_ctx) S = n_ctx;
+        if (dec_g_bucket != S) {
+            if (dec_g.ctx) ggml_free(dec_g.ctx);
+            dec_g = TextGraph{};
+            dec_g_bucket = -1;
+            if (!build_text_graph(dec_g, 1, 0, S, true)) {
+                if (dec_g.ctx) ggml_free(dec_g.ctx);
+                dec_g.ctx = nullptr;
+                return false;
+            }
+            dec_g_bucket = S;
+        }
+        vqa::set_causal_mask(dec_g.mask_in, n_past, 1);
         std::vector<int> p1(1, n_past);
         std::vector<int> tok1(1, cur);
         std::vector<float> lg;
-        if (!run_text(d, tok1, p1, nullptr, 0, lg)) { ggml_free(d.ctx); return false; }
-        if (!dump_dir.empty()) dump(d.gf, "logits");   // last step wins: parity hook
-        ggml_free(d.ctx);
+        if (!run_text(dec_g, tok1, p1, nullptr, 0, lg)) return false;
+        if (!dump_dir.empty()) dump(dec_g.gf, "logits");   // last step wins: parity hook
         n_past++;
         apply_repetition_penalty(lg, seen, rep_penalty);
         cur = vqa::sample_logits(lg, gp, rng_state);
