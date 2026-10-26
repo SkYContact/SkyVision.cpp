@@ -782,10 +782,11 @@ vqa-cli ...  --mode json          # blocks + 归一化/像素 bbox
 能把长边降下来换速度；`--max-tokens` 要给够（整页 2–8k，截断前会告警）。q8_0 权重在这里**比 f16 慢**
 （CPU 视觉塔受 flash-attention 限制、GPU decode 受 kernel 延迟限制，都吃不到权重带宽），只建议用来省体积。
 
-图表块按官方口径渲染：`<chart …>` 里的 markdown 管道表转成 `<table>`，`title:` 变成它的 `<caption>`；
-紧跟图表上方的单行 Caption 会按官方规则（水平重叠 ≥80%、垂直间隙 ≤0.03、唯一最近）并入该图表的标题。
-缺的是官方 `merge.py` 那一层（块合并/表格邻接合并/多栏重排），阅读顺序就是模型给的顺序。一次一页（多页
-由调用方循环）。权重遵循 [OpenMDW 1.1](https://huggingface.co/nvidia/Nemotron-3.5-Parse)，**不在本仓库分发**。
+图表块按官方口径渲染：`<chart …>` 里的 markdown 管道表转成 `<table>`，`title:` 变成它的 `<caption>`、
+`subtitle:` 追加进同一个 caption；紧跟图表上方的单行 Caption 会按官方规则（水平重叠 ≥80%、垂直间隙
+≤0.03、唯一最近）并入该图表的标题；`List-item` 的行首符号归一成 `- `、文本角色里的软连字符会去掉。
+阅读顺序就是模型给的顺序（上游 `merge.py` 是另一件事——把 direct 预测和 detector/crop 预测两路合并，
+需要第二个模型）。一次一页（多页由调用方循环）。
 
 ## 为什么做独立引擎？
 

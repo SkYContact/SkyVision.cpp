@@ -12,18 +12,23 @@
 // re-sorts by geometry.
 //
 // Covered, matching upstream: block parsing + exact dedupe, `<tbc>` cleanup,
+// text typography (soft hyphens, List-item bullets - engine/text_cleanup.py),
 // Title/Section-header markdown, LaTeX `tabular` -> HTML, chart bodies (pipe
-// table -> HTML with the `title:` line as its <caption>, engine/chart_caption.py),
-// caption relocation (engine/caption_relocation.py) and `raw_out` in the JSON.
+// table -> HTML, `title:` -> <caption>, `subtitle:` appended to it -
+// engine/chart_caption.py + engine/chart_context.py), caption relocation
+// (engine/caption_relocation.py) and `raw_out` in the JSON.
 //
 // Deliberate simplifications (all presentation-only, none change the block/bbox
 // contract):
-//   * no upstream `merge.py` stage: no block/line merging, no table-neighbour
-//     merging and no multi-column re-ordering - reading order stays the model's
 //   * header promotion uses the shape heuristic only (upstream also wants the
 //     first row to be mostly bold, which LaTeX tabular markup rarely carries)
 //   * chart panels/multi-series rendering is not re-implemented; the body's DSL
 //     lines (`axis[...]`, `bind:`) are kept as upstream keeps them
+//   * upstream's `merge.py` is a different feature, not a postprocess stage: it
+//     merges a direct page prediction with a separate detector/crop prediction
+//     source (IoU+Jaccard dedupe, extras inserted in reading order). It needs a
+//     second model and JSONL plumbing; for a single prediction it keeps the
+//     model's order, which is what this renderer does.
 #pragma once
 
 #include <algorithm>
@@ -484,9 +489,28 @@ inline std::string render_chart(const std::string & body) {
     std::vector<std::string> lines;
     split_lines(inner, lines);
     std::string title;
+    std::vector<std::string> subtitles;
     for (const auto & l : lines) {
         const std::string t = trim(l);
-        if (t.compare(0, 6, "title:") == 0) { title = trim(t.substr(6)); break; }
+        if (title.empty() && t.compare(0, 6, "title:") == 0) {
+            title = trim(t.substr(6));
+            continue;
+        }
+        // engine/chart_context.py: explicit `subtitle:` values are preserved by
+        // appending them to the table caption (only when a caption exists)
+        if (t.compare(0, 9, "subtitle:") == 0) {
+            const std::string v = trim(t.substr(9));
+            if (!v.empty()) subtitles.push_back(v);
+        }
+    }
+    std::string caption = title;
+    if (!caption.empty() && !subtitles.empty()) {
+        std::string extra;
+        for (const auto & s : subtitles) {
+            if (caption.find(s) != std::string::npos || extra.find(s) != std::string::npos) continue;
+            extra += " — " + s;
+        }
+        caption += extra;
     }
 
     // locate the first plain pipe table
@@ -497,7 +521,7 @@ inline std::string render_chart(const std::string & body) {
         while (end < lines.size() && is_table_row(lines[end])) end++;
         const std::vector<std::string> rows(lines.begin() + (long)i, lines.begin() + (long)end);
         std::string html;
-        if (!pipe_table_to_html(rows, title, html)) continue;
+        if (!pipe_table_to_html(rows, caption, html)) continue;
         lines.erase(lines.begin() + (long)i, lines.begin() + (long)end);
         lines.insert(lines.begin() + (long)i, html);
         converted = true;
@@ -514,6 +538,81 @@ inline std::string render_chart(const std::string & body) {
     std::string out;
     for (const auto & l : lines) out += l + "\n";
     return body.substr(0, gt + 1) + out + body.substr(close);
+}
+
+}  // namespace markup_detail
+
+// ---------------------------------------------------------------------------
+// Text-only typography (upstream engine/text_cleanup.py).
+//
+//   * soft hyphens (U+00AD) between two word characters are dropped, for the
+//     text-like roles only, and never inside code/maths (backtick, `$`, `\(`,
+//     `\[`)
+//   * List-item bullets (`•◦▪●‣⁃–—`) at the start of the line become `- `, which
+//     is what makes upstream's lists render as Markdown lists
+namespace markup_detail {
+
+inline bool text_role(const std::string & cls) {
+    static const char * const kRoles[] = { "Text", "List-item", "Caption", "Section-header",
+                                           "Page-header", "Page-footer", "Footnote", "Title",
+                                           nullptr };
+    for (int i = 0; kRoles[i]; i++)
+        if (cls == kRoles[i]) return true;
+    return false;
+}
+
+inline bool word_byte(unsigned char c) {
+    if (c == '_') return false;
+    if (c >= 0x80) return true;                 // part of a multi-byte letter
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+// U+00AD is 0xC2 0xAD in UTF-8
+inline std::string drop_soft_hyphens(const std::string & t) {
+    std::string o;
+    o.reserve(t.size());
+    for (size_t i = 0; i < t.size();) {
+        if (i + 2 < t.size() && (unsigned char)t[i] == 0xC2 && (unsigned char)t[i + 1] == 0xAD &&
+            !o.empty() && word_byte((unsigned char)o.back()) &&
+            word_byte((unsigned char)t[i + 2])) {
+            i += 2;
+            continue;
+        }
+        o += t[i++];
+    }
+    return o;
+}
+
+// leading "<spaces><bullet><spaces>" -> "- "
+inline std::string normalize_bullet(const std::string & t) {
+    static const char * const kBulls[] = { "\xE2\x80\xA2", "\xE2\x97\xA6", "\xE2\x96\xAA",
+                                           "\xE2\x97\x8F", "\xE2\x80\xA3", "\xE2\x81\x83",
+                                           "\xE2\x80\x93", "\xE2\x80\x94", nullptr };
+    size_t p = 0;
+    while (p < t.size() && (t[p] == ' ' || t[p] == '\t')) p++;
+    for (int i = 0; kBulls[i]; i++) {
+        const size_t n = strlen(kBulls[i]);
+        if (t.compare(p, n, kBulls[i]) != 0) continue;
+        size_t q = p + n;
+        size_t spaces = 0;
+        while (q < t.size() && (t[q] == ' ' || t[q] == '\t')) {
+            q++;
+            spaces++;
+        }
+        if (!spaces) return t;                   // a bare bullet is not a bullet line
+        return "- " + t.substr(q);
+    }
+    return t;
+}
+
+inline std::string normalize_text(const std::string & cls, const std::string & text) {
+    std::string t = text;
+    const bool codeish = t.find('`') != std::string::npos || t.find('$') != std::string::npos ||
+                         t.find("\\(") != std::string::npos ||
+                         t.find("\\[") != std::string::npos;
+    if (text_role(cls) && !codeish) t = drop_soft_hyphens(t);
+    if (cls == "List-item") t = normalize_bullet(t);
+    return t;
 }
 
 }  // namespace markup_detail
@@ -557,6 +656,9 @@ inline void parse_blocks(const std::string & raw_in, std::vector<Block> & blocks
         }
         if (!found) break;
         b.text = raw.substr(body_start, j - body_start);
+        // an element with no text at all is a parsing artifact (upstream drops it
+        // in repair_empty_prefix); keep the block list clean for the JSON view too
+        if (trim(replace_all(b.text, "<tbc>", "")).empty()) { cursor = after; continue; }
         if (!dedupe) {
             blocks.push_back(std::move(b));
         } else {
@@ -580,6 +682,7 @@ inline std::string block_content(const Block & b) {
     t = markup_detail::replace_all(t, "\\<|unk|\\>", "");
     t = markup_detail::replace_all(t, "\\unknown", "");
     t = markup_detail::trim(t);
+    t = markup_detail::normalize_text(b.cls, t);
     if (b.cls == "Table" || b.cls == "Chart") {
         std::string html;
         if (markup_detail::latex_table_to_html(t, html)) {

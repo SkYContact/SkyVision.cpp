@@ -780,12 +780,13 @@ flash-attention bound and GPU decode is kernel-latency bound — neither benefit
 bandwidth), so only use them to save space.
 
 Chart blocks render the way upstream does: the markdown pipe table inside `<chart …>` becomes a
-`<table>` and the `title:` line becomes its `<caption>`; a single-line Caption sitting directly above a
-chart is folded into that title under the upstream rules (horizontal overlap ≥80%, vertical gap
-≤0.03, nearest and unambiguous). What is missing is upstream's `merge.py` stage (block and
-table-neighbour merging, multi-column re-ordering) — the reading order stays the model's. One page per
-call (loop in the caller for multi-page documents). Weights are under
-[OpenMDW 1.1](https://huggingface.co/nvidia/Nemotron-3.5-Parse) and are **not distributed here**.
+`<table>`, the `title:` line becomes its `<caption>` and `subtitle:` values are appended to it; a
+single-line Caption sitting directly above a chart is folded into that title under the upstream rules
+(horizontal overlap ≥80%, vertical gap ≤0.03, nearest and unambiguous); `List-item` bullets are
+normalised to `- ` and soft hyphens are dropped in text roles. The reading order is the model's
+(upstream's `merge.py` is a different feature — it merges a direct prediction with a separate
+detector/crop prediction and needs a second model). One page per call (loop in the caller for
+multi-page documents).
 
 ## Why a standalone engine?
 
