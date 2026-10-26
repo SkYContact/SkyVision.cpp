@@ -744,6 +744,8 @@ python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embedding
 结构化结果**。它只有一套任务、提示词固定（6 个控制 token），不接受自由问答；一次一页。
 
 ```bash
+# 预转好的：hf download SkyContact/Nemotron-3.5-Parse-GGUF --local-dir models/Nemotron-3.5-Parse-GGUF
+#            （含 tokenizer；魔搭同名 modelscope download --model SkyContact/Nemotron-3.5-Parse-GGUF）
 pip install -r convert/requirements.txt
 hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse   # 权重 + tokenizer
 python convert/convert_nemotron_parse.py                      # → nemotron-parse-f16.gguf（1.3GB）

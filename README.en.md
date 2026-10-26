@@ -735,6 +735,8 @@ A 0.63B document parser: one 1.3 GB GGUF turns a whole scanned page, screenshot 
 (six control tokens), so free-form questions are not supported; one page per call.
 
 ```bash
+# prebuilt: hf download SkyContact/Nemotron-3.5-Parse-GGUF --local-dir models/Nemotron-3.5-Parse-GGUF
+#           (tokenizer included; ModelScope mirror under the same name)
 pip install -r convert/requirements.txt
 hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse   # weights + tokenizer
 python convert/convert_nemotron_parse.py                     # → nemotron-parse-f16.gguf (1.3 GB)
