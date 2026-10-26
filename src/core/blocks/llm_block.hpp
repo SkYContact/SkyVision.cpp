@@ -41,6 +41,20 @@
 //         The "no rope" note here was wrong: SmolLM2 ropes (NEOX, theta 1e5), so
 //         it passes pos like VideoChat3. mask==nullptr still always means an
 //         explicit mask; no tenant relies on causal-by-construction yet.
+//   * qwen25omni: DONE - the thinker needed three opt-ins, all default-off so
+//         the earlier tenants' node streams are untouched: (1) LayerWeights
+//         bq/bk/bv (Qwen2-style attention biases, added straight after each
+//         q/k/v mul_mat); (2) LayerCtx::mrope_sec - rope goes through
+//         ggml_rope_multi (MROPE, sections 16/24/24) with the 4T [t,h,w]
+//         position input; (3) LayerCtx::rows - the thinker's KV slot index
+//         (slot_in) is NOT its rope position (image blocks advance the MRoPE
+//         index by max(grid_h, grid_w)), so set_rows takes rows when set. Its
+//         activations are F32 against an F16 cache, so block() casts the
+//         write-back to the cache dtype when they differ (the F16 tenants
+//         never see the cast node). The FA query head-swap keeps block()'s
+//         view_3d trick in place of the old cont(permute) copy - the view
+//         addresses the very same bytes per FA row, and the omni parity set
+//         (text/image/audio logits + greedy streams) stayed byte-identical.
 #pragma once
 
 #include "ggml.h"
@@ -59,6 +73,8 @@ namespace llm {
 struct LayerWeights {
     ggml_tensor *norm = nullptr;                       // attn_norm
     ggml_tensor *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
+    ggml_tensor *bq = nullptr, *bk = nullptr, *bv = nullptr;   // attention biases
+    // (Qwen2-style); null = skip, the add node simply does not exist
     ggml_tensor *qn = nullptr, *kn = nullptr;          // per-head q/k norm (Qwen3); null = skip
     // cross-attention layer (moss_vl): the hook path projects cq itself and
     // adds tanh(ga) * co(...); cqn is the cross query per-head norm. null on
@@ -74,8 +90,13 @@ struct LayerWeights {
 // CALLER's - this file never allocates or owns KV state
 struct LayerCtx {
     ggml_cgraph *gf = nullptr;         // for set_rows write-back expansion
-    ggml_tensor *pos = nullptr;        // position ids [T]; null = no rope (it also
-                                       // indexes the KV write-back, see block())
+    ggml_tensor *pos = nullptr;        // position ids [T] (MROPE tenants: the
+                                       // [4T] t/h/w stack rope_multi wants);
+                                       // null = no rope
+    ggml_tensor *rows = nullptr;       // KV write-back row indices; null = pos.
+                                       // Needed when the slot index is not the
+                                       // rope position (qwen25omni: image rows
+                                       // advance the MRoPE index by max(gh,gw))
     ggml_tensor *mask = nullptr;       // single-sequence F16 causal mask [S, T]
     ggml_tensor *k_cache = nullptr;    // this layer's cache [n_kv_head*head_dim, n_ctx]
     ggml_tensor *v_cache = nullptr;
@@ -84,10 +105,13 @@ struct LayerCtx {
     int n_ctx = 0;                     // rope freq_base context
     float rms_eps = 1e-6f;
     float rope_theta = 1000000.0f;
-    // The converter folded every RMSNorm scale into the following projection
-    // weights (W' = W diag(gamma), see convert/_lib.py fold_ln_affine), so the
-    // graph must NOT apply L.norm / L.ffn_norm again. Set from the GGUF metadata
-    // "<arch>.ln_affine_folded".
+    const int *mrope_sec = nullptr;    // 3 MROPE sections; non-null switches the
+                                       // rope to ggml_rope_multi (Qwen-VL/omni)
+    // Load-time normalization folding (weight_load.hpp §4b LnFoldPlan: the
+    // scale/bias of every RMSNorm was folded into the following projection
+    // weights, W' = W diag(gamma), b' = b + W beta), so the graph must NOT
+    // apply L.norm / L.ffn_norm again. Set from the GGUF metadata
+    // "<arch>.ln_affine_folded" or from a load-time fold.
     bool norm_folded = false;
     // batch path: per-group (col_start, col_count, kv_base, window) plus the
     // pre-created per-group masks (shared across layers; null -> single path)
@@ -154,8 +178,11 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
         }
     } else {
     ggml_tensor * q = ggml_mul_mat(ctx, L.q, l);
+    if (L.bq) q = ggml_add(ctx, q, L.bq);
     ggml_tensor * k = ggml_mul_mat(ctx, L.k, l);
+    if (L.bk) k = ggml_add(ctx, k, L.bk);
     ggml_tensor * v = ggml_mul_mat(ctx, L.v, l);
+    if (L.bv) v = ggml_add(ctx, v, L.bv);
     if (dbg) { ggml_set_name(q, "t_l0_q"); ggml_set_name(k, "t_l0_k"); }
 
     ggml_tensor * q3 = ggml_reshape_3d(ctx, q, HD, NH, T);
@@ -172,22 +199,38 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     }
     if (dbg && L.qn && L.kn) { ggml_set_name(q3, "t_l0_q_norm"); ggml_set_name(k3, "t_l0_k_norm"); }
 
-    // pos null = no rope at all; NOTE pos also indexes the KV write-back below,
-    // so a rope-less tenant must still pass row indices (or the cache fields
-    // must stay null with an out-of-block write-back)
+    // pos null = no rope at all; NOTE pos also indexes the KV write-back below
+    // (unless c.rows overrides it), so a rope-less tenant must still pass row
+    // indices (or the cache fields must stay null with an out-of-block
+    // write-back). mrope_sec switches the NEOX rope_ext for the multi-section
+    // rope (same hyperparams; pos is then the [4T] t/h/w stack).
     if (c.pos) {
-        q3 = ggml_rope_ext(ctx, q3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
-                           c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_ext(ctx, k3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
-                           c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        if (c.mrope_sec) {
+            int sec[4] = { c.mrope_sec[0], c.mrope_sec[1], c.mrope_sec[2], 0 };
+            q3 = ggml_rope_multi(ctx, q3, c.pos, nullptr, HD, sec, GGML_ROPE_TYPE_MROPE,
+                                 c.n_ctx, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k3 = ggml_rope_multi(ctx, k3, c.pos, nullptr, HD, sec, GGML_ROPE_TYPE_MROPE,
+                                 c.n_ctx, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            q3 = ggml_rope_ext(ctx, q3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
+                               c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k3 = ggml_rope_ext(ctx, k3, c.pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, c.n_ctx,
+                               c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
     }
     if (h.after_rope) h.after_rope(h.ud, il, q3, k3);
     if (dbg) { ggml_set_name(q3, "t_l0_q_rope"); ggml_set_name(k3, "t_l0_k_rope"); }
 
+    // the cache may be a narrower dtype than the activation stream (qwen25omni:
+    // F32 stream, F16 cache) - set_rows does not convert, so cast first; F16
+    // tenants pass both sides F16 and never see these nodes
     ggml_tensor * k2 = ggml_reshape_2d(ctx, k3, NKV * HD, T);
+    if (c.k_cache && k2->type != c.k_cache->type) k2 = ggml_cast(ctx, k2, c.k_cache->type);
     ggml_tensor * v2 = ggml_reshape_2d(ctx, v, NKV * HD, T);
-    ggml_build_forward_expand(c.gf, ggml_set_rows(ctx, c.k_cache, k2, c.pos));
-    ggml_build_forward_expand(c.gf, ggml_set_rows(ctx, c.v_cache, v2, c.pos));
+    if (c.v_cache && v2->type != c.v_cache->type) v2 = ggml_cast(ctx, v2, c.v_cache->type);
+    ggml_tensor * rows = c.rows ? c.rows : c.pos;
+    ggml_build_forward_expand(c.gf, ggml_set_rows(ctx, c.k_cache, k2, rows));
+    ggml_build_forward_expand(c.gf, ggml_set_rows(ctx, c.v_cache, v2, rows));
 
     // q3 is [HD, NH, T]; flash attention wants [HD, n_q, n_head], so swap the
     // two trailing strides. The KV cache is [NKV*HD, n_ctx]: one position is

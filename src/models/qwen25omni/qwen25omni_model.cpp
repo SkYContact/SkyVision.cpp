@@ -16,6 +16,7 @@
 #include "qwen25omni_model.hpp"
 #include "qwen25omni_talker.hpp"
 
+#include "core/blocks/llm_block.hpp"
 #include "core/engine/attention.hpp"
 #include "core/engine/backend.hpp"
 #include "ggml-alloc.h"
@@ -51,15 +52,6 @@ void dump_bins(const char * path, const int * hdr, int n_hdr, const float * data
 }
 }  // namespace
 
-
-struct TxtLayer {
-    ggml_tensor *norm = nullptr;
-    ggml_tensor *wq = nullptr, *bq = nullptr;
-    ggml_tensor *wk = nullptr, *bk = nullptr;
-    ggml_tensor *wv = nullptr, *bv = nullptr;
-    ggml_tensor *wo = nullptr;
-    ggml_tensor *ffn_norm = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
-};
 
 // one text graph: prefill (T tokens) or one decode step (T=1)
 struct TextGraph {
@@ -133,6 +125,7 @@ private:
     int n_ff = 11008, n_vocab = 151936;
     float rms_eps = 1e-6f, rope_theta = 1e6f;
     int mrope_section[3] = {16, 24, 24};
+    bool ln_folded = false;   // norm scales live in the weights (GGUF metadata or load-time fold)
 
     // vision
     int v_layer = 32, v_embd = 1280, v_head = 16, v_hd = 80, v_ff = 3420;
@@ -154,10 +147,12 @@ private:
     ggml_backend_buffer_t wbuf = nullptr;
     vqa::MMap mm;
     vqa::AlignedBuf host_f32;
+    vqa::AlignedBuf host_fold;                       // folded normalization weights
+    vqa::weights::LnFoldPlan fold;
     ggml_gallocr_t allocr = nullptr;
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr, *out_head = nullptr;
-    std::vector<TxtLayer> tl;
+    std::vector<vqa::llm::LayerWeights> tl;   // core/blocks/llm_block.hpp
 
     ggml_tensor *v_patch_sink = nullptr;   // guards the patch-embed dump read
     ggml_context * v_dump_ctx2 = nullptr, * v_dump_ctx3 = nullptr;   // layer-0 probes
@@ -248,6 +243,7 @@ bool Qwen25Omni::load_weights(const char * path) {
     n_ff      = vqa::gguf::u32(gu, "qwen25omni.feed_forward_length", n_ff);
     rms_eps   = vqa::gguf::f32(gu, "qwen25omni.attention.layer_norm_rms_epsilon", rms_eps);
     rope_theta = vqa::gguf::f32(gu, "qwen25omni.rope.freq_base", rope_theta);
+    ln_folded = vqa::gguf::boolean(gu, "qwen25omni.ln_affine_folded", false);
     {
         const std::vector<int> sec = vqa::gguf::arr_u32(gu, "qwen25omni.rope.mrope_section",
                                                         {16, 24, 24});
@@ -324,8 +320,36 @@ bool Qwen25Omni::load_weights(const char * path) {
 
     vqa::weights::promote_1d_to_f32(wctx, host_f32);
     {
+        // Fold every RMSNorm scale into the matmuls that consume it (see
+        // weight_load.hpp): the graph then runs rms_norm alone. Device backends
+        // get it by default (launch-bound), CPU only when asked (VQA_FOLD_LN=1),
+        // because there the weights stop being zero-copy mmap pages and the
+        // gain is just two memory passes.
+        if (!ln_folded) {
+            const bool want = vqa::weights::ln_fold_enabled(ggml_backend_is_cpu(backend));
+            if (want) {
+                auto g = [&](const char * n) { return ggml_get_tensor(wctx, n); };
+                for (int i = 0; i < n_layer; i++) {
+                    char b[64];
+                    auto lay = [&](const char * suf) {
+                        snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf);
+                        return g(b);
+                    };
+                    ggml_tensor * n1 = lay("attn_norm.weight");
+                    ggml_tensor * n2 = lay("ffn_norm.weight");
+                    fold.add(lay("wq.weight"), n1);
+                    fold.add(lay("wk.weight"), n1);
+                    fold.add(lay("wv.weight"), n1);
+                    fold.add(lay("w_gate.weight"), n2);
+                    fold.add(lay("w_up.weight"), n2);
+                }
+                fold.apply(host_fold);
+                ln_folded = !fold.empty();
+            }
+        }
         vqa::weights::Bound bound = vqa::weights::bind_to_backend(
-            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
+            wctx, backend, mm,
+            { { host_f32.data(), host_f32.size() }, { host_fold.data(), host_fold.size() } });
         if (!bound.ok) return false;
         wbuf = bound.main_buf;
         if (!ggml_backend_is_cpu(backend)) mm.release();
@@ -344,15 +368,15 @@ bool Qwen25Omni::load_weights(const char * path) {
     for (int i = 0; i < n_layer; i++) {
         char b[96];
         auto g = [&](const char * suf) { snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf); return gt(b); };
-        TxtLayer & L = tl[(size_t)i];
+        vqa::llm::LayerWeights & L = tl[(size_t)i];   // qn/kn stay null: no per-head norms
         L.norm = g("attn_norm.weight");
-        L.wq = g("wq.weight"); L.bq = g("bq");
-        L.wk = g("wk.weight"); L.bk = g("bk");
-        L.wv = g("wv.weight"); L.bv = g("bv");
-        L.wo = g("wo.weight");
+        L.q = g("wq.weight"); L.bq = g("bq");
+        L.k = g("wk.weight"); L.bk = g("bk");
+        L.v = g("wv.weight"); L.bv = g("bv");
+        L.o = g("wo.weight");
         L.ffn_norm = g("ffn_norm.weight");
         L.gate = g("w_gate.weight"); L.up = g("w_up.weight"); L.down = g("w_down.weight");
-        if (!L.norm || !L.wq || !L.wk || !L.wv || !L.wo || !L.ffn_norm || !L.gate || !L.up || !L.down)
+        if (!L.norm || !L.q || !L.k || !L.v || !L.o || !L.ffn_norm || !L.gate || !L.up || !L.down)
             return false;
     }
     tower_.w.patch_w = gt("v.patch_embed.weight");
@@ -814,55 +838,32 @@ bool Qwen25Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, int n_
         g.emb0_out = x;   // read back with zero rows patched host-side
     }
 
-    int sec[4] = { mrope_section[0], mrope_section[1], mrope_section[2], 0 };
+    // ---- decoder layer loop: shared vqa::llm::block (core/blocks/llm_block.hpp)
+    // The Qwen2 trunk moved verbatim: RMSNorm(+scale) -> WQ/WK/WV(+bias) ->
+    // section MRoPE (16/24/24) -> KV write-back (F16 cache; the F32 stream is
+    // cast on the way in) -> flash_attn_ext -> wo -> residual -> RMSNorm ->
+    // fused SwiGLU. No per-head q/k norms (qn/kn null). The KV row index is
+    // slot_in, NOT pos: image blocks advance the MRoPE running index by
+    // max(grid_h, grid_w), so lc.rows carries the slots and lc.pos stays
+    // rope-only.
+    vqa::llm::LayerCtx lc;
+    lc.gf = g.gf;
+    lc.pos = g.pos_in;          // [4T]: the t/h/w stack ggml_rope_multi consumes
+    lc.rows = g.slot_in;        // KV slot per token (i on prefill, n_past on decode)
+    lc.mask = g.mask_in;
+    lc.T = T; lc.S = S;
+    lc.n_head = NH; lc.n_kv_head = NKV; lc.head_dim = HD;
+    lc.n_ctx = n_ctx;
+    lc.rms_eps = rms_eps;
+    lc.rope_theta = rope_theta;
+    lc.mrope_sec = mrope_section;
+    lc.norm_folded = ln_folded; // load-time fold: rms_norm alone, scales live in
+                                // wq/wk/wv + w_gate/w_up (weight_load.hpp §4b)
+    vqa::llm::BlockHooks lh;    // dbg_layer0 keeps the t_l0_* probe names stamped
     for (int il = 0; il < n_layer; il++) {
-        TxtLayer & L = tl[(size_t)il];
-        ggml_tensor * l = ggml_rms_norm(g.ctx, x, rms_eps);
-        l = ggml_mul(g.ctx, l, L.norm);
-
-        ggml_tensor * q = ggml_mul_mat(g.ctx, L.wq, l);
-        q = ggml_add(g.ctx, q, L.bq);
-        ggml_tensor * k = ggml_mul_mat(g.ctx, L.wk, l);
-        k = ggml_add(g.ctx, k, L.bk);
-        ggml_tensor * v = ggml_mul_mat(g.ctx, L.wv, l);
-        v = ggml_add(g.ctx, v, L.bv);
-        if (il == 0) { ggml_set_name(q, "t_l0_q"); ggml_set_name(k, "t_l0_k"); }
-
-        ggml_tensor * q3 = ggml_reshape_3d(g.ctx, q, HD, NH, T);
-        ggml_tensor * k3 = ggml_reshape_3d(g.ctx, k, HD, NKV, T);
-        q3 = ggml_rope_multi(g.ctx, q3, g.pos_in, nullptr, HD, sec, GGML_ROPE_TYPE_MROPE,
-                             n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k3 = ggml_rope_multi(g.ctx, k3, g.pos_in, nullptr, HD, sec, GGML_ROPE_TYPE_MROPE,
-                             n_ctx, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-        // the cache is F16, so cast explicitly: ggml_set_rows copies element-wise
-        // and a mixed dtype silently writes garbage
-        ggml_tensor * k2 = ggml_cast(g.ctx, ggml_reshape_2d(g.ctx, k3, NKV * HD, T),
-                                     GGML_TYPE_F16);
-        ggml_tensor * v2 = ggml_cast(g.ctx, ggml_reshape_2d(g.ctx, v, NKV * HD, T),
-                                     GGML_TYPE_F16);
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.k[il], k2, g.slot_in));
-        ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx, kv.v[il], v2, g.slot_in));
-
-        ggml_tensor * qf = ggml_cont(g.ctx, ggml_permute(g.ctx, q3, 0, 2, 1, 3));   // [HD, T, NH]
-        ggml_tensor * kf = ggml_view_3d(g.ctx, kv.k[il], HD, S, NKV,
-                                        kv.k[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * vf = ggml_view_3d(g.ctx, kv.v[il], HD, S, NKV,
-                                        kv.v[il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
-        ggml_tensor * fa = ggml_flash_attn_ext(g.ctx, qf, kf, vf, g.mask_in,
-                                               1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(g.ctx, ggml_cont(g.ctx, fa), NH * HD, T);
-        attn = ggml_mul_mat(g.ctx, L.wo, attn);
-        x = ggml_add(g.ctx, x, attn);
-
-        ggml_tensor * m = ggml_rms_norm(g.ctx, x, rms_eps);
-        m = ggml_mul(g.ctx, m, L.ffn_norm);
-        ggml_tensor * gate = ggml_mul_mat(g.ctx, L.gate, m);
-        ggml_tensor * up = ggml_mul_mat(g.ctx, L.up, m);
-        m = ggml_swiglu_split(g.ctx, gate, up);
-        m = ggml_mul_mat(g.ctx, L.down, m);
-        x = ggml_add(g.ctx, x, m);
-        if (il == 0) ggml_set_name(x, "t_l0_out");
+        lc.k_cache = kv.k[il];
+        lc.v_cache = kv.v[il];
+        x = vqa::llm::block(g.ctx, x, il, tl[il], lc, lh);
     }
 
     if (for_talker) {
@@ -903,6 +904,14 @@ bool Qwen25Omni::build_text_graph(TextGraph & g, int T, int S, int n_img, int n_
     if (!ggml_gallocr_alloc_graph(allocr, g.gf)) {
         fprintf(stderr, "text graph allocation failed\n");
         return false;
+    }
+    if (getenv("QOMNI_PROFILE")) {   // node census per shape (fold A/B)
+        static int last_T = -1, last_S = -1;
+        if (T != last_T || S != last_S) {
+            last_T = T; last_S = S;
+            fprintf(stderr, "[graph] text T=%d S=%d: %d nodes\n", T, S,
+                    ggml_graph_n_nodes(g.gf));
+        }
     }
     return true;
 }
@@ -1076,6 +1085,7 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
     }
 
     const bool want_talker = talker_loaded && gp.speak_wav;
+    const auto t_pref0 = std::chrono::steady_clock::now();
     TextGraph g;
     if (!build_text_graph(g, T, T, n_img, n_aud, want_talker)) { ggml_free(g.ctx); return false; }
     vqa::set_causal_mask(g.mask_in, 0, T);
@@ -1088,6 +1098,10 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         return false;
     }
     ggml_free(g.ctx);
+    if (getenv("QOMNI_PROFILE"))
+        fprintf(stderr, "[profile] prefill T=%d (img %d aud %d) in %.1f ms\n", T, n_img, n_aud,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_pref0).count());
     if (getenv("QOMNI_LOGITS_DUMP")) {
         dump_bins(getenv("QOMNI_LOGITS_DUMP"), nullptr, 0, logits.data(), logits.size());
     }
@@ -1144,6 +1158,14 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         int S = n_past + 1;
         if (S <= 1024) { int b = 128; while (b < S) b <<= 1; S = b; }
         else           { S = ((S + 1023) / 1024) * 1024; }
+        if (const char * e = getenv("QOMNI_DECODE_BUCKET")) {
+            // A/B escape (parity + timing): N = fixed bucket width; 1 restores
+            // the exact per-token window, which rebuilds the decode graph every
+            // step - the pre-static-graph (1b1ad9d) path
+            const int b = atoi(e);
+            if (b == 1) S = n_past + 1;
+            else if (b > 1) S = ((S + b - 1) / b) * b;
+        }
         if (dec_g_bucket != S || dec_g_talker != want_talker) {
             if (dec_g.ctx) ggml_free(dec_g.ctx);
             dec_g = TextGraph{};
@@ -1188,6 +1210,12 @@ bool Qwen25Omni::ask(const vqa::MediaInput & media, const std::string & prompt,
         cur = vqa::sample_logits(lg, gp, rng_state);
         if (cur == id_eos) break;
         emit(cur);
+    }
+    if (getenv("QOMNI_PROFILE")) {
+        const auto t_gen1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t_gen1 - t_gen0).count();
+        fprintf(stderr, "[profile] decode %d tok in %.1f ms (%.2f ms/tok)\n", (int)out.size(),
+                ms, ms / (double)std::max<size_t>(out.size(), 1));
     }
     if (want_talker) {
         if (serial_talker) {
