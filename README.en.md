@@ -799,6 +799,39 @@ with drift in the last coordinates and in a few characters at block ends).
 relocation / native subtitles); the JSON does not echo `raw_out`; header promotion looks at table
 shape only, not at bold text; one page per call (loop in the caller for multi-page documents).
 
+## Engine-level optimisations (cross-backend, model-agnostic)
+
+Two things that came out of the nemotron_parse work are useful to every backend, and both live in the
+shared layer:
+
+**1. One reused decode graph, bucketed KV window (`src/core/engine/decode_graph.hpp`)**
+
+Every backend used to build its graph per generated token: fresh `ggml_context` → build → gallocr
+alloc → compute → free. Two costs: build+alloc is ~0.5 ms (a quarter of a CUDA step), and — the
+subtle one — **ggml-cuda keys its CUDA graph cache on `cgraph->nodes[0]`**, so a context per token
+means the node addresses change every step and a capture is never replayed. `vqa::decode_bucket()` +
+`vqa::GraphSlot<T>` bucket the KV window (128 on CPU, 1024 on GPU) and rebuild only when the bucket
+changes. Out-of-range query rows are masked -inf by `set_causal_mask`, so **widening the window is
+numerically exact** — it only makes attention read keys that cannot contribute, which costs on CPU
+(attention-bound, keep buckets narrow) and pays on GPU (launch-bound). Wired into smolvlm / qwen2vl /
+janus / nemotron_parse (videochat3, qwen3_5 and qwen25omni already had their own variants).
+`VQA_DECODE_BUCKET=N` overrides the width for A/B runs (`1` restores the per-token window).
+
+**2. Fold normalization affines into the following matmul, at load time (`LnFoldPlan` in `weight_load.hpp`)**
+
+`y = norm(x)·γ + β` followed by `W y + b` is exactly `(W·diag γ)·norm(x) + (b + W β)`, so the graph
+runs `norm` alone and drops one per-channel mul (plus one add when β is present) per layer. The
+important part is **where** it happens: at load time, so **existing GGUFs work unchanged** — no
+re-conversion, no re-download. Folded tensors keep their type (f16 stays f16), biases stay f32;
+`llm_block` gained a `norm_folded` switch and `vit_block` already had `drop_ln_mul/drop_ln_add`.
+Default: **on for GPU, off for CPU** (on CPU the weights leave the mmap and become resident while the
+win is ~2%); `VQA_FOLD_LN=1/0` forces either way.
+
+Measured: smolvlm output is **byte-identical** with and without the fold; nemotron_parse stays
+**token-identical** to the official torch stack (text graph 321 → 281 nodes, vision 696 → 588; CPU
+prefill 553 → 529 ms, decode 10.8 → 10.4 ms; on GPU the difference is inside the noise — elementwise
+ops were not its bottleneck).
+
 ## Why a standalone engine?
 
 moondream3.1 is a 9B-parameter mixture-of-experts vision-language model (2B active per token)

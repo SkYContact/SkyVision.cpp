@@ -803,6 +803,33 @@ block 尾部字符有漂移）。
 **已知简化**：图表只按文本处理（不做 upstream 的 panel 渲染/caption 上移/原生小标题）；
 JSON 不回带 `raw_out`；表头提升只看形状不看加粗；一次一页（多页由调用方循环）。
 
+## 引擎级优化（跨后端，与具体模型无关）
+
+跑 nemotron_parse 时挖出两项能直接给所有后端用的东西，都落在共享层：
+
+**1. 分桶复用的 decode 图（`src/core/engine/decode_graph.hpp`）**
+
+以前每个后端每生成一个 token 都要：新建 `ggml_context` → 重建整张图 → `gallocr_alloc_graph` → 算完丢掉。
+两条代价：建图+分配约 0.5 ms（CUDA 上约占每 token 25%），以及 **`ggml-cuda` 的 CUDA graph 缓存按
+`cgraph->nodes[0]` 做键**——每步换上下文，节点地址每步都变，capture 永远命中不了。
+`vqa::decode_bucket()` + `vqa::GraphSlot<T>` 把 KV 窗口按 128（CPU）/1024（GPU）分桶，图只在跨桶时重建。
+越界的 query 行会被 `set_causal_mask` 打成 -inf，所以**加宽窗口是数值精确的**，只是让 attention 多读不能
+贡献的 key —— CPU 上 attention 是瓶颈（桶要窄），GPU 上 kernel launch 是瓶颈（桶可以宽）。
+已接入 smolvlm / qwen2vl / janus / nemotron_parse（videochat3 / qwen3_5 / qwen25omni 本来就有各自的实现）。
+`VQA_DECODE_BUCKET=N` 覆盖桶宽做 A/B，`=1` 等价于旧的逐步窗口。
+
+**2. 加载期把归一化仿射折进 matmul（`weight_load.hpp` 的 `LnFoldPlan`）**
+
+`y = norm(x)·γ + β` 后接 `W y + b`，等价于 `(W·diag γ)·norm(x) + (b + W β)`，所以图里只跑 `norm`，
+省掉每层一次的逐通道乘（有 β 时再省一次加）。**关键是放在加载期**：现有 GGUF 完全不用改、不用重新转换、
+不用重新下载。折叠后张量类型不变（f16 还是 f16），bias 保持 f32；`llm_block` 加了 `norm_folded` 开关，
+`vit_block` 本来就有 `drop_ln_mul/drop_ln_add`。默认 **GPU 开、CPU 关**（CPU 上权重会离开 mmap 变成常驻
+内存，而收益只有 ~2%），`VQA_FOLD_LN=1/0` 可强制。
+
+实测：smolvlm 折叠前后输出**逐字节相同**；nemotron_parse 折叠后整页输出与官方 torch 参考仍**逐 token 相同**
+（text 图 321→281 节点、vision 图 696→588 节点；CPU prefill 553→529 ms、decode 10.8→10.4 ms，GPU 上在噪声
+范围内测不出差别——它的 elementwise 本来就不是瓶颈）。
+
 ## 为什么做独立引擎？
 
 moondream3.1 是 Moondream 团队推出的 90 亿参数混合专家（MoE）视觉语言模型（每 token 激活 2B）。

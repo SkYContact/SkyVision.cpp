@@ -84,6 +84,11 @@ struct LayerCtx {
     int n_ctx = 0;                     // rope freq_base context
     float rms_eps = 1e-6f;
     float rope_theta = 1000000.0f;
+    // The converter folded every RMSNorm scale into the following projection
+    // weights (W' = W diag(gamma), see convert/_lib.py fold_ln_affine), so the
+    // graph must NOT apply L.norm / L.ffn_norm again. Set from the GGUF metadata
+    // "<arch>.ln_affine_folded".
+    bool norm_folded = false;
     // batch path: per-group (col_start, col_count, kv_base, window) plus the
     // pre-created per-group masks (shared across layers; null -> single path)
     const std::vector<std::array<int, 4>> *bat_groups = nullptr;
@@ -135,7 +140,7 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     const bool dbg = !h.dbg_name && h.dbg_layer0 && il == 0;
 
     ggml_tensor * l = ggml_rms_norm(ctx, x, c.rms_eps);
-    l = ggml_mul(ctx, l, L.norm);
+    if (!c.norm_folded) l = ggml_mul(ctx, l, L.norm);
     if (const char * nm = h.dbg_name ? h.dbg_name(h.ud, il, "norm") : (dbg ? "t_l0_norm" : nullptr))
         ggml_set_name(l, nm);
 
@@ -241,7 +246,7 @@ inline ggml_tensor * block(ggml_context *ctx, ggml_tensor *x, int il,
     // pass both, so the guard never fires on their node streams.
     if (!L.ffn_norm || !L.gate) return x;
     ggml_tensor * m = ggml_rms_norm(ctx, x, c.rms_eps);
-    m = ggml_mul(ctx, m, L.ffn_norm);
+    if (!c.norm_folded) m = ggml_mul(ctx, m, L.ffn_norm);
     ggml_tensor * gate = ggml_mul_mat(ctx, L.gate, m);
     ggml_tensor * up = ggml_mul_mat(ctx, L.up, m);
     if (h.swiglu_split) {

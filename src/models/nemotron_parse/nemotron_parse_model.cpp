@@ -172,6 +172,9 @@ private:
     ggml_backend_buffer_t wbuf = nullptr;
     vqa::MMap mm;
     vqa::AlignedBuf host_f32;
+    vqa::AlignedBuf host_fold;                 // folded normalization weights
+    vqa::weights::LnFoldPlan fold;
+    bool ln_folded = false;                    // norms' affine already in the weights
     ggml_gallocr_t allocr = nullptr;
 
     // decoder weights
@@ -294,8 +297,37 @@ bool NemotronParse::load_weights(const char * path) {
 
     vqa::weights::promote_1d_to_f32(wctx, host_f32);
     {
+        // Fold every normalization's affine into the matmul that consumes it (see
+        // weight_load.hpp): norm(x)*gamma+beta followed by W y + b becomes
+        // (W diag gamma) norm(x) + (b + W beta), so the graphs skip the mul/add.
+        // Device backends by default, CPU on request (the weights stop being
+        // zero-copy mmap pages there).
+        if (vqa::weights::ln_fold_enabled(ggml_backend_is_cpu(backend))) {
+            auto g = [&](const char * n) { return ggml_get_tensor(wctx, n); };
+            for (int i = 0; i < n_layer; i++) {
+                char b[64];
+                auto lay = [&](const char * suf) {
+                    snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf);
+                    return g(b);
+                };
+                fold.add(lay("wqkv.weight"), lay("ln1.weight"), lay("ln1.bias"), lay("bqkv"));
+                fold.add(lay("fc1.weight"), lay("ln2.weight"), lay("ln2.bias"), lay("fc1.bias"));
+            }
+            for (int i = 0; i < v_layer; i++) {
+                char b[64];
+                auto lay = [&](const char * suf) {
+                    snprintf(b, sizeof(b), "v.blk.%d.%s", i, suf);
+                    return g(b);
+                };
+                fold.add(lay("wqkv.weight"), lay("ln1.weight"), lay("ln1.bias"), lay("bqkv"));
+                fold.add(lay("fc0.weight"), lay("ln2.weight"), lay("ln2.bias"), lay("fc0.bias"));
+            }
+            fold.apply(host_fold);
+            ln_folded = !fold.empty();
+        }
         vqa::weights::Bound bound = vqa::weights::bind_to_backend(
-            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
+            wctx, backend, mm,
+            { { host_f32.data(), host_f32.size() }, { host_fold.data(), host_fold.size() } });
         if (!bound.ok) return false;
         wbuf = bound.main_buf;
         if (!ggml_backend_is_cpu(backend)) mm.release();
@@ -440,6 +472,8 @@ bool NemotronParse::build_vision_graph(int n_patch, int rows, int cols) {
     venv.no_rope = true;
     venv.dbg_names = !dump_dir.empty();
     vqa::vit::BlockHooks vh;
+    vh.drop_ln_mul = ln_folded;   // gamma already folded into wqkv / fc0
+    vh.drop_ln_add = ln_folded;
     vh.attention = vqa::vit::vit_attention_hook;
     vh.gelu = [](void * ud, ggml_tensor * t) -> ggml_tensor * {
         // timm's nn.GELU() (approximate="none") is the erf form
@@ -600,8 +634,10 @@ ggml_tensor * NemotronParse::dec_layer(TextGraph & g, ggml_tensor * x, const Dec
     const int HD = head_dim, NH = n_head, NKV = n_kv_head;
 
     ggml_tensor * l = ggml_norm(c, x, ln_eps);
-    l = ggml_mul(c, l, L.ln1_w);
-    l = ggml_add(c, l, L.ln1_b);
+    if (!ln_folded) {   // the fold pushed gamma into wqkv and W*beta into bqkv
+        l = ggml_mul(c, l, L.ln1_w);
+        l = ggml_add(c, l, L.ln1_b);
+    }
 
     // one projection for q|k|v: [NH*HD + 2*NKV*HD, T], then slice
     const int qd = NH * HD, kvd = NKV * HD;
@@ -633,8 +669,10 @@ ggml_tensor * NemotronParse::dec_layer(TextGraph & g, ggml_tensor * x, const Dec
     if (il == 0) ggml_set_name(x, "t_l0_resid");
 
     ggml_tensor * m = ggml_norm(c, x, ln_eps);
-    m = ggml_mul(c, m, L.ln2_w);
-    m = ggml_add(c, m, L.ln2_b);
+    if (!ln_folded) {
+        m = ggml_mul(c, m, L.ln2_w);
+        m = ggml_add(c, m, L.ln2_b);
+    }
     m = ggml_add(c, ggml_mul_mat(c, L.fc1_w, m), L.fc1_b);
     m = ggml_gelu_erf(c, m);
     m = ggml_add(c, ggml_mul_mat(c, L.fc2_w, m), L.fc2_b);

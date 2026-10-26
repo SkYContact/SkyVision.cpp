@@ -22,6 +22,7 @@
 
 #include "core/engine/attention.hpp"
 #include "core/engine/backend.hpp"
+#include "core/engine/decode_graph.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -104,6 +105,7 @@ private:
     int n_layer = 30, n_embd = 576, n_head = 9, n_kv_head = 3, head_dim = 64;
     int n_ff = 1536, n_vocab = 49280;
     float rms_eps = 1e-5f, rope_theta = 1e5f;
+    bool ln_folded = false;   // norm scales live in the weights (GGUF metadata or load-time fold)
 
     // vision
     int v_layer = 12, v_embd = 768, v_head = 12, v_ff = 3072;
@@ -117,7 +119,10 @@ private:
     ggml_backend_buffer_t wbuf = nullptr;
     vqa::MMap mm;
     vqa::AlignedBuf host_f32;
+    vqa::AlignedBuf host_fold;                       // folded normalization weights
+    vqa::weights::LnFoldPlan fold;
     ggml_gallocr_t allocr = nullptr;
+    vqa::GraphSlot<TextGraph> dec_slot;   // reused decode graph (decode_graph.hpp)
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr, *lm_head = nullptr;
     std::vector<vqa::llm::LayerWeights> tl;   // core/llm_block.hpp
@@ -146,6 +151,7 @@ private:
 // ---------------------------------------------------------------- lifecycle
 
 SmolVLM::~SmolVLM() {
+    dec_slot.reset();
     kv.free();
     if (vctx) ggml_free(vctx);
     if (allocr) ggml_gallocr_free(allocr);
@@ -174,6 +180,7 @@ bool SmolVLM::load_weights(const char * path) {
     head_dim  = vqa::gguf::u32(gu, "smolvlm.attention.key_length", head_dim);
     n_ff      = vqa::gguf::u32(gu, "smolvlm.feed_forward_length", n_ff);
     rms_eps   = vqa::gguf::f32(gu, "smolvlm.attention.layer_norm_rms_epsilon", rms_eps);
+    ln_folded = vqa::gguf::boolean(gu, "smolvlm.ln_affine_folded", false);
     rope_theta = vqa::gguf::f32(gu, "smolvlm.rope.freq_base", rope_theta);
 
     v_layer   = vqa::gguf::u32(gu, "smolvlm.vision.block_count", v_layer);
@@ -212,8 +219,36 @@ bool SmolVLM::load_weights(const char * path) {
 
     vqa::weights::promote_1d_to_f32(wctx, host_f32);
     {
+        // Fold every RMSNorm scale into the matmuls that consume it (see
+        // weight_load.hpp): the graph then runs rms_norm alone. Device backends
+        // get it by default (launch-bound), CPU only when asked (VQA_FOLD_LN=1),
+        // because there the weights stop being zero-copy mmap pages and the gain
+        // is just two memory passes.
+        if (!ln_folded) {
+            const bool want = vqa::weights::ln_fold_enabled(ggml_backend_is_cpu(backend));
+            if (want) {
+                auto g = [&](const char * n) { return ggml_get_tensor(wctx, n); };
+                for (int i = 0; i < n_layer; i++) {
+                    char b[64];
+                    auto lay = [&](const char * suf) {
+                        snprintf(b, sizeof(b), "t.blk.%d.%s", i, suf);
+                        return g(b);
+                    };
+                    ggml_tensor * n1 = lay("attn_norm.weight");
+                    ggml_tensor * n2 = lay("ffn_norm.weight");
+                    fold.add(lay("wq.weight"), n1);
+                    fold.add(lay("wk.weight"), n1);
+                    fold.add(lay("wv.weight"), n1);
+                    fold.add(lay("w_gate.weight"), n2);
+                    fold.add(lay("w_up.weight"), n2);
+                }
+                fold.apply(host_fold);
+                ln_folded = !fold.empty();
+            }
+        }
         vqa::weights::Bound bound = vqa::weights::bind_to_backend(
-            wctx, backend, mm, { { host_f32.data(), host_f32.size() } });
+            wctx, backend, mm,
+            { { host_f32.data(), host_f32.size() }, { host_fold.data(), host_fold.size() } });
         if (!bound.ok) return false;
         wbuf = bound.main_buf;
         if (!ggml_backend_is_cpu(backend)) mm.release();
@@ -560,6 +595,7 @@ bool SmolVLM::build_text_graph(TextGraph & g, int T, int S, int n_img, bool logi
     lc.n_ctx = n_ctx;
     lc.rms_eps = rms_eps;
     lc.rope_theta = rope_theta;
+    lc.norm_folded = ln_folded;   // converter folded the RMSNorm scale into q/k/v + gate/up
     vqa::llm::BlockHooks lh;   // dbg_layer0 keeps the t_l0_* probe names stamped
     for (int il = 0; il < n_layer; il++) {
         lc.k_cache = kv.k[il];
@@ -719,17 +755,15 @@ bool SmolVLM::ask(const vqa::MediaInput & media, const std::string & prompt,
     if (cur != id_eos) emit(cur);
 
     for (int i = 1; i < gp.max_tokens && cur != id_eos; i++) {
-        const int S = n_past + 1;
-        TextGraph d;
-        if (!build_text_graph(d, 1, S, 0, true)) { ggml_free(d.ctx); return false; }
+        // one graph for the whole run, KV window bucketed (see decode_graph.hpp)
+        const int S = vqa::decode_bucket(n_past + 1, n_ctx, ggml_backend_is_cpu(backend));
+        if (!dec_slot.prepare(S, [&](TextGraph & g) { return build_text_graph(g, 1, S, 0, true); }))
+            return false;
+        TextGraph & d = dec_slot.g;
         vqa::set_causal_mask(d.mask_in, n_past, 1);
         std::vector<int> p1(1, n_past);
         std::vector<float> lg;
-        if (!run_text(d, { cur }, p1, nullptr, nullptr, lg, n_past)) {
-            ggml_free(d.ctx);
-            return false;
-        }
-        ggml_free(d.ctx);
+        if (!run_text(d, { cur }, p1, nullptr, nullptr, lg, n_past)) return false;
         n_past++;
         cur = vqa::sample_logits(lg, gp, rng_state);
         if (cur == id_eos) break;

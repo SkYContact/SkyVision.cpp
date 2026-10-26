@@ -19,6 +19,7 @@
 
 #include "core/engine/attention.hpp"
 #include "core/engine/backend.hpp"
+#include "core/engine/decode_graph.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -130,6 +131,7 @@ private:
     vqa::MMap mm;
     vqa::AlignedBuf host_f32;
     ggml_gallocr_t allocr = nullptr;
+    vqa::GraphSlot<TextGraph> dec_slot;   // reused decode graph (decode_graph.hpp)
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr;
     std::vector<TxtLayer> tl;
@@ -148,6 +150,7 @@ private:
 // ---------------------------------------------------------------- lifecycle
 
 Qwen25VL::~Qwen25VL() {
+    dec_slot.reset();
     kv.free();
     tower_.free();
     if (allocr) ggml_gallocr_free(allocr);
@@ -674,14 +677,15 @@ bool Qwen25VL::ask(const vqa::MediaInput & media, const std::string & prompt,
     if (cur != id_eos) emit(cur);
 
     for (int i = 1; i < gp.max_tokens && cur != id_eos; i++) {
-        const int S = n_past + 1;
-        TextGraph d;
-        if (!build_text_graph(d, 1, S, 0, false)) { ggml_free(d.ctx); return false; }
+        // one graph for the whole run, KV window bucketed (see decode_graph.hpp)
+        const int S = vqa::decode_bucket(n_past + 1, n_ctx, ggml_backend_is_cpu(backend));
+        if (!dec_slot.prepare(S, [&](TextGraph & g) { return build_text_graph(g, 1, S, 0, false); }))
+            return false;
+        TextGraph & d = dec_slot.g;
         vqa::set_causal_mask(d.mask_in, n_past, 1);
         std::vector<int> p1((size_t)4, next_pos);
         std::vector<float> lg;
-        if (!run_text(d, { cur }, p1, nullptr, nullptr, lg, n_past)) { ggml_free(d.ctx); return false; }
-        ggml_free(d.ctx);
+        if (!run_text(d, { cur }, p1, nullptr, nullptr, lg, n_past)) return false;
         n_past++;
         next_pos++;
         cur = vqa::sample_logits(lg, gp, rng_state);
