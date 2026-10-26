@@ -78,6 +78,10 @@ struct Hooks {
     const char * log_tag = "ec";         // "keye ec" / "qomni ec"
     const char * pf_env = nullptr;       // "KEYE_EC_PF" / "QOMNI_EC_PF" (0 = off)
     const char * spec_env = nullptr;     // ..._EC_SPEC (0 = no speculation)
+    // per-Hooks one-time env caches (set on the first decode_step)
+    mutable const char * pf_off_cache = nullptr;
+    mutable int spec_cache = 1;
+    mutable bool env_cached = false;
 
     bool (*build_a)(void * model, int il, vqa::StepGraph & sg, AIO & io);
     bool (*feed_a)(void * model, int il, AIO & io, vqa::StepGraph & sg,
@@ -334,9 +338,14 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
         // speculation (hot experts repeat across steps). No-op without
         // enable_async. pf_env=0 disables every call, spec_env=0 the
         // speculation half.
-        if (h.async_ok && (h.pf_env == nullptr || getenv(h.pf_env) == nullptr)) {
-            const int spec = h.spec_env && getenv(h.spec_env)
-                           ? atoi(getenv(h.spec_env)) : 1;
+        if (!h.env_cached) {   // one-time lookup (per-Hooks, not global)
+            h.pf_off_cache = h.pf_env ? getenv(h.pf_env) : nullptr;
+            h.spec_cache = h.spec_env && getenv(h.spec_env)
+                         ? atoi(getenv(h.spec_env)) : 1;
+            h.env_cached = true;
+        }
+        if (h.async_ok && h.pf_off_cache == nullptr) {
+            const int spec = h.spec_cache;
             std::vector<std::pair<int, int>> pf;
             for (int ke = 0; ke < K; ke++) pf.push_back({ il, sel_host[ke] });
             const bool has_next = spec && il + 1 < h.n_layer

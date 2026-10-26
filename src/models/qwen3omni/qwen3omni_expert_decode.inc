@@ -209,10 +209,14 @@ bool Qwen3Omni::ec_feed_a(void * m, int il, vqa::moe_decode::AIO & io,
     Qwen3Omni & M = *(Qwen3Omni *) m;
     EcGraphA & eg = *(EcGraphA *) io.model_io;
     const int S = M.ec_st.S;
-    std::vector<ggml_fp16_t> mask((size_t)S, ggml_fp32_to_fp16(-INFINITY));
-    for (int sq = 0; sq <= n_past; sq++) mask[(size_t)sq] = ggml_fp32_to_fp16(0.0f);
+    if (M.ec_mask.size() != (size_t)S || M.ec_mask_n != n_past) {
+        M.ec_mask.assign((size_t)S, ggml_fp32_to_fp16(-INFINITY));
+        for (int sq = 0; sq <= n_past; sq++) M.ec_mask[(size_t)sq] = ggml_fp32_to_fp16(0.0f);
+        M.ec_mask_n = n_past;
+    }
     return sg.set_input(eg.mpos_in, step_ctx, sizeof(int) * 4) &&
-           sg.set_input(eg.mask_in, mask.data(), sizeof(ggml_fp16_t) * mask.size());
+           sg.set_input(eg.mask_in, M.ec_mask.data(),
+                        sizeof(ggml_fp16_t) * M.ec_mask.size());
 }
 
 void Qwen3Omni::ec_post_a(void * m, int il, const float * xmid, const float * mn,

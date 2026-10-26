@@ -180,6 +180,8 @@ private:
     };
     struct EcGaUd { Qwen3Omni * m; int il; EcGraphA * io; };
     std::vector<EcGraphA> ec_ga_io;            // model leaves per layer
+    std::vector<ggml_fp16_t> ec_mask;   // per-step causal mask cache
+    int ec_mask_n = -1;
     bool ec_init();
     static ggml_tensor * ec_ga_builder(ggml_context * c, void * ud);
     static bool ec_build_a(void * m, int il, vqa::StepGraph & sg,
