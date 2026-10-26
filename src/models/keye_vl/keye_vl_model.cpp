@@ -42,6 +42,7 @@
 
 #include "core/engine/attention.hpp"
 #include "core/engine/backend.hpp"
+#include "core/engine/decode_graph.hpp"
 #include "core/blocks/vit_block.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -230,6 +231,7 @@ private:
     ggml_context * wctx = nullptr;          // text weights
     ggml_backend_buffer_t wbuf = nullptr;
     vqa::MMap mm;
+    vqa::GraphSlot<TextGraph> dec_slot;     // reused decode graph (decode_graph.hpp)
     ggml_context * vctx = nullptr;          // vision weights (mmproj)
     ggml_backend_buffer_t vbuf = nullptr;
     vqa::MMap vmm;
@@ -271,6 +273,7 @@ private:
 // ---------------------------------------------------------------- lifecycle
 
 KeyeVL2::~KeyeVL2() {
+    dec_slot.reset();
     kv.free();
     split_sched.free_sched();
     if (host_wbuf) ggml_backend_buffer_free(host_wbuf);
@@ -1398,20 +1401,41 @@ bool KeyeVL2::ask(const vqa::MediaInput & media, const std::string & prompt,
             emit(cur);
             continue;
         }
-        // KV window rounded to a block so every decode graph has the same
-        // shape: the split scheduler then reuses its buffers instead of
-        // reallocating on each step (the mask hides the padding slots)
-        const int S = split_mode ? vqa::block_for(n_past + 1) : n_past + 1;
-        const int S_log = n_past + 1;
-        TextGraph d;
-        if (!build_text_graph(d, 1, S, 0, false)) { ggml_free(d.ctx); return false; }
-        // decode step: every cached key is causally visible, padding hidden
+        // Graph reuse + KV-window bucketing (see decode_graph.hpp), scoped by
+        // what the A/B numbers support per placement:
+        //  - split mode: the per-step rebuild stays - the two-backend sched
+        //    rewrites node->src to its per-split copy tensors (ggml-backend.cpp
+        //    split_graph), so a graph reused across steps is re-split in an
+        //    already-rewritten state; window stays block_for(512) as before.
+        //  - CPU (default): attention + the DSA indexer scale with S and own
+        //    the step, so dead-key padding is pure loss (bucket-128 measured
+        //    4.7x slower in the tail past n_past 128) while the per-step
+        //    rebuild costs ~0.1 of ~9-11 ms - keep the exact window.
+        //  - all-GPU (launch-bound): one graph per 1024 bucket, the
+        //    decode_graph.hpp shape; VQA_DECODE_BUCKET overrides the width.
+        const bool on_cpu = ggml_backend_is_cpu(backend);
+        const int S = split_mode ? vqa::block_for(n_past + 1)
+                   : on_cpu      ? n_past + 1
+                                 : vqa::decode_bucket(n_past + 1, n_ctx, false);
+        TextGraph step{};
+        TextGraph * dp = &step;
+        if (!split_mode && !on_cpu) {
+            if (!dec_slot.prepare(S, [&](TextGraph & g) { return build_text_graph(g, 1, S, 0, false); }))
+                return false;
+            dp = &dec_slot.g;
+        } else if (!build_text_graph(step, 1, S, 0, false)) {
+            ggml_free(step.ctx);
+            return false;
+        }
+        // decode step: every cached key is causally visible, padding hidden.
+        // F32 mask (the DSA scores are F32; the shared set_causal_mask is F16).
         std::vector<float> mask((size_t)S, -INFINITY);
-        for (int s = 0; s < S_log; s++) mask[(size_t)s] = 0.0f;
+        for (int s = 0; s <= n_past; s++) mask[(size_t)s] = 0.0f;
         std::vector<int> p1((size_t)4, next_pos);
         std::vector<float> lg;
-        if (!run_text(d, { cur }, p1, nullptr, nullptr, lg, n_past, &mask)) { ggml_free(d.ctx); return false; }
-        ggml_free(d.ctx);
+        const bool ok = run_text(*dp, { cur }, p1, nullptr, nullptr, lg, n_past, &mask);
+        if (dp == &step) ggml_free(step.ctx);   // slot graphs live until the next bucket
+        if (!ok) return false;
         n_past++;
         next_pos++;
         cur = vqa::sample_logits(lg, gp, rng_state);
