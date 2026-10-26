@@ -392,6 +392,10 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
     // shared constants (one graph node reused by every MoE layer)
     struct ggml_tensor * one_fill = ggml_fill(gctx, ggml_new_tensor_3d(gctx, GGML_TYPE_F32, 1, 1, 1), 1.0f);
 
+    // MoE GeGLU node chain: fused ggml_geglu_erf_split by default (MD_NO_FUSION=1
+    // restores the pre-fusion cont+gelu+add+mul chain for parity debugging)
+    static const bool no_fusion = getenv("MD_NO_FUSION") != nullptr;
+
     int il_max = M.n_layer, il_min = 0;
     { const char * e = getenv("MD_MAX_LAYER"); if (e) il_max = atoi(e); }
     { const char * e = getenv("MD_MIN_LAYER"); if (e) il_min = atoi(e); }
@@ -515,11 +519,21 @@ struct ggml_cgraph * Engine::build_graph(struct ggml_context * gctx, const int *
             struct ggml_tensor * gu = ggml_mul_mat_id(gctx, L.up_exps, cur, sel);      // [2I, K, T]
             struct ggml_tensor * h = ggml_view_3d(gctx, gu, M.inter, M.n_experts_used, T, gu->nb[1], gu->nb[2], 0);
             struct ggml_tensor * g = ggml_view_3d(gctx, gu, M.inter, M.n_experts_used, T, gu->nb[1], gu->nb[2], M.inter * gu->nb[0]);
-            // h is a row-strided view of gu (first I of 2I rows per expert slice); the CUDA unary
-            // kernel only accepts contiguous src0, so materialize it like the rope path above
-            cur = ggml_gelu_erf(gctx, ggml_cont(gctx, h));   // ref layers.py MoE GeGLU uses F.gelu (erf)
-            g = ggml_add(gctx, g, one_fill);           // g + 1
-            cur = ggml_mul(gctx, cur, g);
+            // official kestrel moe.py gelu_residual: F.gelu(x, approximate="none")
+            // (exact erf) * (y + 1); h/g are the two row-strided halves of gu
+            if (no_fusion) {
+                // h is a row-strided view of gu (first I of 2I rows per expert slice); the CUDA unary
+                // kernel only accepts contiguous src0, so materialize it like the rope path above
+                cur = ggml_gelu_erf(gctx, ggml_cont(gctx, h));
+                g = ggml_add(gctx, g, one_fill);           // g + 1
+                cur = ggml_mul(gctx, cur, g);
+            } else {
+                // geglu_erf_split reads both halves of gu in place (GLU kernels only
+                // need row-contiguity): gelu_erf(h)·(g+1) in one kernel, no [I,K,T]
+                // materialized copy, 4 element-wise nodes -> 2
+                struct ggml_tensor * g1 = ggml_add(gctx, g, one_fill);   // g + 1
+                cur = ggml_geglu_erf_split(gctx, h, g1);
+            }
             struct ggml_tensor * ff3 = ggml_mul_mat_id(gctx, L.down_exps, cur, sel);   // [D, K, T]
             // weighted K-sum: broadcast-mul router weights, permute K to ne0, one sum_rows
             // (2 compute kernels instead of 15 mul/add + 16 view nodes)
@@ -704,6 +718,14 @@ int Engine::step(const std::vector<int> & toks, float * last_logits_out,
     if (logits && logits->data) {
         std::vector<float> lv(model.n_vocab);
         ggml_backend_tensor_get(logits, lv.data(), 0, sizeof(float) * model.n_vocab);
+        if (const char * ldir = getenv("MD_LOGITS")) {   // parity helper: per-step logits dump
+            char lpath[512];
+            snprintf(lpath, sizeof(lpath), "%s\\logits_%04d.f32", ldir, n_steps);
+            if (FILE * lf = fopen(lpath, "wb")) {
+                fwrite(lv.data(), sizeof(float), model.n_vocab, lf);
+                fclose(lf);
+            }
+        }
         // ids 1..9 are reserved control tokens and never sampled
         argmax = vqa::greedy_argmax(lv.data(), model.n_vocab, 1, 9);
         if (last_logits_out) memcpy(last_logits_out, lv.data(), sizeof(float) * model.n_vocab);
