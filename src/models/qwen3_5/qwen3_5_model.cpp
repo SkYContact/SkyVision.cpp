@@ -23,6 +23,19 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+// The cached decode/spec graphs below are byte-stable between steps (only
+// input VALUES change, never shapes or pointers), so ggml-cuda can skip its
+// per-step node-properties fingerprint and take the uid fast path. Without a
+// uid every graph_compute re-fingerprints the whole graph (a struct copy +
+// compare per node, ~1 MB of memory traffic on the ~450-node verify graph)
+// on the CPU, serial with the GPU. Assigning a stable non-zero uid needs the
+// ggml_cgraph definition, which lives in the ggml checkout's internal header
+// (not on this target's include path for prebuilt-ggml builds, hence the
+// __has_include guard).
+#if __has_include("../../../ggml/src/ggml-impl.h")
+#   include "../../../ggml/src/ggml-impl.h"
+#   define QWEN35_GRAPH_UID 1
+#endif
 #ifdef GGML_USE_CUDA
 #   include "ggml-cuda.h"
 #endif
@@ -1660,6 +1673,9 @@ bool Qwen3_5::run_text(TextGraph & g, const std::vector<int> & toks,
             dg.ctx = dec_ctx;
             if (!build_text_graph(dg, 1, blk, 0)) { ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr; return false; }
             dec_gf = dg.gf;
+#ifdef QWEN35_GRAPH_UID
+            dec_gf->uid = ggml_graph_next_uid();   // byte-stable graph: skip ggml-cuda's per-step fingerprint
+#endif
             if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
                 fprintf(stderr, "static decode graph alloc failed\n");
                 ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;

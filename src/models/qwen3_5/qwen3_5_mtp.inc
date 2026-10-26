@@ -13,6 +13,25 @@
 //           against the chosen slot, so no post-hoc device copying.
 // This file is included inside namespace qwen3_5, after class Qwen3_5.
 // ---------------------------------------------------------------------------
+// QWEN35_SPEC_PROF detail: phase split inside the draft/verify graph calls
+// (input upload / graph compute / readback), accumulated process-wide and
+// printed at exit.
+struct SpecProf {
+    double din = 0, dco = 0, drb = 0;      // draft: inputs / compute / readback
+    double vin = 0, vco = 0, vrb = 0;      // verify
+    long nd = 0, nv = 0;
+    ~SpecProf() {
+        if (getenv("QWEN35_SPEC_PROF") && (nd || nv))
+            fprintf(stderr, "[spec prof detail] draft %ld: in %.3f compute %.3f rb %.3f ms | verify %ld: in %.3f compute %.3f rb %.3f ms (avg/call)\n",
+                    nd, nd ? din / nd : 0.0, nd ? dco / nd : 0.0, nd ? drb / nd : 0.0,
+                    nv, nv ? vin / nv : 0.0, nv ? vco / nv : 0.0, nv ? vrb / nv : 0.0);
+    }
+};
+static SpecProf g_spec_prof;
+static double specprof_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // MTP draft: one forward of the single-block head.
 //   tok   : the last (accepted or drafted) token id
 //   h     : the matching hidden state [n_embd] (target final-norm output,
@@ -44,6 +63,9 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
         if (!ctx) return -1;
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
         c.ctx = ctx; c.gf = gf; c.blk = blk;
+#ifdef QWEN35_GRAPH_UID
+        gf->uid = ggml_graph_next_uid();   // cached across steps: let ggml-cuda replay without the fingerprint
+#endif
         t_tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_name(t_tok, "dt_tok");
         t_h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 1);
@@ -111,6 +133,7 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
         if (!c.alloc) c.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!ggml_gallocr_alloc_graph(c.alloc, gf)) { ggml_free(ctx); c.ctx = nullptr; c.blk = -1; return -1; }
     }
+    const double pin0 = specprof_ms();
     ggml_backend_tensor_set(t_tok, &tok, 0, sizeof(int));
     ggml_backend_tensor_set(t_h, h, 0, sizeof(float) * D);
     int mpos[4] = { axis, axis, axis, slot };
@@ -133,11 +156,15 @@ int Qwen3_5::mtp_draft_step(int tok, const float * h, int slot, int axis,
     } else {
         vqa::set_causal_mask(t_mask, slot, 1);
     }
+    const double pin1 = specprof_ms();
     if (ggml_backend_graph_compute(backend, c.gf) != GGML_STATUS_SUCCESS) return -1;
+    const double pco1 = specprof_ms();
     h_out.resize(D);
     ggml_backend_tensor_get(h_out_t, h_out.data(), 0, sizeof(float) * D);
     int best = -1;
     ggml_backend_tensor_get(t_am, &best, 0, sizeof(int));
+    g_spec_prof.din += pin1 - pin0; g_spec_prof.dco += pco1 - pin1; g_spec_prof.drb += specprof_ms() - pco1;
+    g_spec_prof.nd++;
     return best;
 }
 
@@ -178,11 +205,15 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
         if (!c.alloc) c.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!ggml_gallocr_alloc_graph(c.alloc, g.gf)) { ggml_free(g.ctx); return false; }
         c.ctx = g.ctx; c.gf = g.gf; c.blk = S; c.slot = state_slot;
+#ifdef QWEN35_GRAPH_UID
+        c.gf->uid = ggml_graph_next_uid();   // cached across steps: let ggml-cuda replay without the fingerprint
+#endif
         c.tok = g.tok_in; c.mpos = g.mpos_in; c.mask = g.mask_in; c.logits = g.logits;
         c.hout = ggml_graph_get_tensor(g.gf, "t_final_norm");
     }
     ggml_cgraph * gf = c.gf;
     ggml_tensor * g_tok = c.tok, * g_mpos = c.mpos, * g_mask = c.mask, * g_logits = c.logits, * g_hn = c.hout;
+    const double pin0 = specprof_ms();
     ggml_backend_tensor_set(g_tok, toks, 0, sizeof(int) * T);
     int mpos[8] = { axis0, axis0 + 1,          // t axis, both tokens
                     axis0, axis0 + 1,          // h axis
@@ -190,7 +221,9 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
                     n_past, n_past + 1 };      // absolute KV slots
     ggml_backend_tensor_set(g_mpos, mpos, 0, sizeof(mpos));
     vqa::set_causal_mask(g_mask, n_past, T);
+    const double pin1 = specprof_ms();
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) return false;
+    const double pco1 = specprof_ms();
     int am[2] = { 0, 0 };
     if (c.am) {
         ggml_backend_tensor_get(c.am, am, 0, sizeof(am));
@@ -207,6 +240,8 @@ bool Qwen3_5::mtp_verify(const int * toks, int n_past, int axis0, int state_slot
     }
     h_out.resize((size_t)2 * n_embd);   // col0 = after one token, col1 = after both
     ggml_backend_tensor_get(g_hn, h_out.data(), 0, sizeof(float) * 2 * n_embd);
+    g_spec_prof.vin += pin1 - pin0; g_spec_prof.vco += pco1 - pin1; g_spec_prof.vrb += specprof_ms() - pco1;
+    g_spec_prof.nv++;
     if (sdump) {
         for (const char * const * n = dump_names; *n; ++n)
             vqa::dump::write(gf, sdump, *n);
@@ -235,6 +270,13 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
     int state_slot = 0;
     long accepted = 0, rounds = 0;
     static const bool trace = getenv("QWEN35_SPEC_TRACE") != nullptr;
+    // per-phase wall time (QWEN35_SPEC_PROF=1): where a mixed round spends its
+    // budget - plain forward vs draft/verify compute vs rollback state copies
+    static const bool prof = getenv("QWEN35_SPEC_PROF") != nullptr;
+    double p_restore = 0, p_plain = 0, p_d1 = 0, p_d2 = 0, p_ver = 0;
+    long n_restore = 0, n_plain = 0, n_spec = 0;
+    auto tick_ms = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    auto prof_add = [&](double & acc, double t0) { acc += tick_ms() - t0; };
     if (getenv("QWEN35_SPEC_SELFTEST") && n_past >= 2) {
         // minimal reject-path probe: verify_a [pending, X] (rolled back),
         // then verify_b reading slot1 at write_base = np+1 - must equal the
@@ -523,10 +565,16 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
     // cheaper than paying the T=2 verify for a likely single-token round. The
     // floor is therefore base speed, and every PROBE_INTERVAL plain rounds a
     // real spec round re-measures acceptance so recovery is picked up.
+    // ema_min default: a spec round costs verify + 2 drafts while a plain
+    // round is one decode step, and every op is bandwidth-bound (q8 weights
+    // streamed once either way), so the blend only wins above roughly
+    // round_tokens/round_cost >= step_tokens/step_cost -> double-hit ~0.7 on
+    // the cards this backend targets (measured: plateau 0.45..0.75 all ~= base,
+    // 0.30 takes rounds that lose ~25%). QWEN35_SPEC_EMA_MIN overrides.
     double ema = 0.5;                 // EMA of per-round double-hit
     int plain_streak = 0;
     int plain_streak_total = 0;
-    const double ema_min = getenv("QWEN35_SPEC_EMA_MIN") ? atof(getenv("QWEN35_SPEC_EMA_MIN")) : 0.30;
+    const double ema_min = getenv("QWEN35_SPEC_EMA_MIN") ? atof(getenv("QWEN35_SPEC_EMA_MIN")) : 0.55;
     const int probe_interval = getenv("QWEN35_SPEC_PROBE") ? atoi(getenv("QWEN35_SPEC_PROBE")) : 32;
     // bisect helper: force the first k rounds plain, then pure-spec
     const int plain_first = getenv("QWEN35_SPEC_PLAIN_FIRST") ? atoi(getenv("QWEN35_SPEC_PLAIN_FIRST")) : -1;
@@ -542,16 +590,20 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             // from a stale state and the text degenerates
             if (state_slot == 1) {
                 const int n_linp = n_layer - n_full_layers;
+                const double tr0 = prof ? tick_ms() : 0;
                 for (int i = 0; i < n_linp; i++) {
                     ggml_backend_tensor_copy(ssm_state_b[i], ssm_state[i]);
                     ggml_backend_tensor_copy(conv_state_b[i], conv_state[i]);
                 }
+                if (prof) { prof_add(p_restore, tr0); n_restore++; }
             }
             std::vector<float> Lp(n_vocab), hp(n_embd);
             std::vector<int> pp = { cur + 1, cur + 1, cur + 1, write_base };
             n_past = write_base;    // run_text's static path derives the KV
                                     // window + mask base from the member
+            const double tp0 = prof ? tick_ms() : 0;
             if (!run_text(g_plain, { pending }, nullptr, nullptr, pp, Lp, &hp)) return false;
+            if (prof) { prof_add(p_plain, tp0); n_plain++; }
             // debug: how far is the static path's h from the verify path's h
             // for the SAME token+state? (draft-chain sensitivity probe)
             static const bool hchk = getenv("QWEN35_SPEC_HCHK") != nullptr;
@@ -582,10 +634,14 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
         plain_streak = 0;
         // two-step MTP recursion: step 1 predicts the PENDING position (already
         // decided - only its hidden feeds the chain), step 2 predicts d1
+        const double td0 = prof ? tick_ms() : 0;
         const int d0 = mtp_draft_step(seed_tok, h.data(), write_base, cur + 1, dlog, dh, write_base);
         if (d0 < 0) return false;
+        if (prof) prof_add(p_d1, td0);
+        const double td1 = prof ? tick_ms() : 0;
         const int d1 = mtp_draft_step(d0, dh.data(), write_base + 1, cur + 2, dlog, dh, write_base);
         if (d1 < 0) return false;
+        if (prof) prof_add(p_d2, td1);
         const int toks[2] = { pending, d1 };
         static const int livechk = getenv("QWEN35_SPEC_LIVECHK") ? atoi(getenv("QWEN35_SPEC_LIVECHK")) : 0;
         const bool do_chk = livechk > 0 && rounds < (size_t)livechk;
@@ -603,7 +659,9 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
             }
         }
         int v_am[2] = { -1, -1 };
+        const double tv0 = prof ? tick_ms() : 0;
         if (!mtp_verify(toks, write_base, cur + 1, state_slot, L2, h_d, v_am)) return false;
+        if (prof) { prof_add(p_ver, tv0); n_spec++; }
         // snapshot verify's persistent writes for the state comparison below
         std::vector<std::vector<char>> sv_post, cv_post, kv_post;
         if (do_chk) {
@@ -733,5 +791,11 @@ bool Qwen3_5::run_speculative(int next, int seed0, const std::vector<float> & lo
     fprintf(stderr, "[spec] %d rounds (%d plain), %ld double-hits (%.0f%%), %d tokens, %.1f tok/round\n",
             (int)rounds, plain_streak_total, accepted, rounds ? 100.0 * accepted / rounds : 0.0f, n_dec,
             rounds ? (double)n_dec / rounds : 0.0);
+    if (prof)
+        fprintf(stderr, "[spec prof] plain %ld rounds %.2f ms | restore %ld x %.2f ms | spec %ld rounds: d1 %.2f d2 %.2f verify %.2f ms (per round)\n",
+                n_plain, n_plain ? p_plain / n_plain : 0.0,
+                n_restore, n_restore ? p_restore / n_restore : 0.0,
+                n_spec, n_spec ? p_d1 / n_spec : 0.0, n_spec ? p_d2 / n_spec : 0.0,
+                n_spec ? p_ver / n_spec : 0.0);
     return true;
 }
