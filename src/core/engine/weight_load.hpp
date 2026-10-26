@@ -146,12 +146,32 @@ inline Bound bind_to_backend(ggml_context * wctx, ggml_backend_t backend, const 
 }
 
 // Host f32 copy of a weight tensor. Needed when a graph builder reads weight
-// values on the host (mel filterbanks, mm_proj snapshots) but the tensor now
-// lives in a device buffer after bind_to_backend - its ->data is a device
-// pointer that must not be dereferenced.
+// values on the host (mel filterbanks, position tables, mm_proj snapshots) but
+// the tensor now lives in a device buffer after bind_to_backend - its ->data is
+// a device pointer that must not be dereferenced, so GPU-resident tensors are
+// pulled through the backend API instead of a raw memcpy.
 inline void snapshot_to_f32_host(ggml_tensor * t, std::vector<float> & out) {
-    out.resize((size_t)ggml_nelements(t));
-    gguf::tensor_to_f32(t, out.data());
+    const int64_t n = ggml_nelements(t);
+    out.resize((size_t)n);
+    const bool device = t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer);
+    if (!device) {
+        gguf::tensor_to_f32(t, out.data());
+        return;
+    }
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n * sizeof(float));
+        return;
+    }
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp((size_t)n);
+        ggml_backend_tensor_get(t, tmp.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < n; i++) out[(size_t)i] = ggml_fp16_to_fp32(tmp[(size_t)i]);
+        return;
+    }
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+    tt->to_float(raw.data(), out.data(), n);
 }
 
 // ---------------------------------------------------------------------------

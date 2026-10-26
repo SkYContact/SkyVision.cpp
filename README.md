@@ -109,7 +109,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | VideoMAE 视频分类 / 特征 | ✅ 一个 GGUF 装全部权重（94M 参数，f16 约 180MB）：16 帧均匀采样 → 中心裁剪 224 → 一次全时空注意力前向 → top-k 标签；无 tokenizer、无 KV cache。**逐级对拍已验证**（numpy 从 GGUF 权重复算整条前向）：12 层全长相对差 ~1e-3、patch 嵌入 3e-3、block0 注意力 3e-4、Kinetics-400 的 400 个类别概率差 <1e-4。预训练版（无分类头）输出 pooled 嵌入，`--mode embed` 直出 768 维 JSON。CPU 单 clip（1568 token×12 层）约 0.85 s（q8_0 权重 0.59 s）|
 | EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
 | V-JEPA 2 特征 / 分类 / 掩码预测 | ✅ ViT-L（326M + predictor 25M，f16 653MB）：64 帧 → 短边 292（双线性）→ 裁 256 → **8192 token 全时空注意力 ×24 层** → 1024 维特征；SSv2 微调版（16 帧）再走 **3 层 attentive pooler + 174 类线性头**，`--mode 5` 直出标签；`--mode predict` 跑 12 层 masked-latent predictor。**对拍已验证**（transformers 5.x）：同输入下 24 层全长 cos **1.000000**（max 0.065）；端到端（各自预处理）pooled cos **0.9994**、SSv2 top-1 标签一致（0.916 vs 0.921，概率最大差 4.5e-3）、predictor cos **0.998**。CPU 单 clip（8192 token）约 25 s，SSv2（2048 token）约 5 s |
-| Nemotron-3.5-Parse 文档解析 | ✅ 端到端 + 官方 torch 参考逐级对拍（`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：内容归一化位置场 **2.7e-7**、patch 嵌入 2.8e-3（f16 权重噪声）、ViT/neck 均值误差 5e-3、首 token logits top8 **8/8**、**整页 159 步贪心输出与官方逐 token 相同**（含最后那张 LaTeX 表转出来的 HTML 表）。踩到的坑记一笔：HF 的重复惩罚按 `input_ids.unique()` 施加，按出现次数施加会让重复的坐标 token 被罚两次、greedy 在长页面上从中间起分叉。全程无常驻下载：一个 1.3 GB GGUF + 官方 `tokenizer.json`（新增了 added-token 感知的词表估算，否则 50k 基础词表 + 22k 坐标 token 会被当成陌生 tokenizer 拒掉）。CPU（19 线程）1024 长边一页 ≈ 11 s 视觉 + 0.7 s prefill |
+| Nemotron-3.5-Parse 文档解析 | ✅ 端到端 + 官方 torch 参考逐级对拍（`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：内容归一化位置场 **2.7e-7**、patch 嵌入 2.8e-3（f16 权重噪声）、ViT/neck 均值误差 5e-3、首 token logits top8 **8/8**、**整页 159 步贪心输出与官方逐 token 相同**（含最后那张 LaTeX 表转出来的 HTML 表）。踩到的坑记一笔：HF 的重复惩罚按 `input_ids.unique()` 施加，按出现次数施加会让重复的坐标 token 被罚两次、greedy 在长页面上从中间起分叉。全程无常驻下载：一个 1.3 GB GGUF + 官方 `tokenizer.json`（新增了 added-token 感知的词表估算，否则 50k 基础词表 + 22k 坐标 token 会被当成陌生 tokenizer 拒掉）。CPU（19 线程）一页 ≈ 20 s（视觉 17.6 s + prefill 0.9 s + 158 token decode），CUDA（4070 SUPER）≈ 1.1 s（0.68 s + 0.019 s + 0.4 s），输出逐 block 一致 |
 
 ## 快速开始
 
@@ -733,6 +733,49 @@ python convert/convert_embedgemma2.py --src models/embeddinggemma-2 -o embedding
   标准做法补齐到 256 倍数、mask 屏蔽补齐位（均值池化只算真实 token），GPU 与 CPU 数值一致
   0.999996+。文本 n_ctx 默认 8192（32 帧视频 ≈3.9k token）。CPU 上 q8_0 权重只快 ~8%
   （瓶颈在 f32 attention，不在权重带宽）
+
+### Nemotron-3.5-Parse（文档解析）
+
+0.63B 的文档解析模型，一个 1.3 GB 单文件 GGUF 就能把整页扫描件/截图/PDF 页变成
+**带版面类别与坐标的结构化结果**。它不是通用 VLM：拒绝闲聊，只有一套任务（也算它的好处——
+提示词就是 6 个控制 token，不会被用户问法带偏）。
+
+```bash
+pip install -r convert/requirements.txt
+hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse   # 权重 + tokenizer
+python convert/convert_nemotron_parse.py                                     # -> nemotron-parse-f16.gguf
+
+# 原始标记（默认）：<x_0.0586><y_0.0539>Quarterly Report 2026<x_0.1621><y_0.0633><class_Text>
+vqa-cli --model nemotron-parse-f16.gguf --tokenizer models/Nemotron-3.5-Parse \
+        --image page.png --ask parse --n-ctx 8192 --max-tokens 4000
+
+# 渲染成 markdown（LaTeX 表转 HTML）/ postprocess_document 形状的 JSON / 纯文本
+vqa-cli ... --mode markdown
+vqa-cli ... --mode json
+```
+
+JSON 里每个 block 是 `{"class","bbox":[x1,y1,x2,y2]（内容区归一化）,"bbox_pixels","text","content"}`，
+顶层还有 `markdown` 与 `warnings`（表格没转成 HTML 时会点名）。MCP 侧对应 `parse_document`
+工具（`format=json|markdown|raw`）。
+
+**精度**（与官方 torch 栈逐级对拍，`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：
+内容归一化位置场**逐元素一致**（2.7e-7）、patch 嵌入 2.8e-3（f16 权重噪声）、ViT/neck 均值误差
+5e-3；**CPU 上整页 159 步贪心输出与官方逐 token 相同**；CUDA 上 7/7 个 block 的类别与文本完全
+一致，只有 5 个字符差异、全在坐标末位（f16 kernel 舍入 → 相邻坐标分箱）。
+
+**性能**（1000×1300 的一页，默认画布 1313 visual token / 158 个输出 token）：
+
+| | 视觉塔 | prefill | decode |
+|---|---|---|---|
+| CPU（19 线程） | 17.6 s | 0.89 s | 11.8 ms/token（84 tok/s） |
+| CUDA（RTX 4070 SUPER） | **0.68 s** | **0.019 s** | **2.5 ms/token（404 tok/s）** |
+
+整页端到端 CPU ≈ 20 s、GPU ≈ 1.1 s。开关：`NEMOTRON_PARSE_MAX_EDGE=1024`（默认画布 2048×1664，
+降下来能把视觉塔成本砍到 1/16——塔是 O(视觉 token²)）；`NEMOTRON_PARSE_PROFILE=1` 打印图规模与
+`compute / graph build` 拆分。`--max-tokens` 要给够（整页 2-8k，截断前会告警）。
+
+**已知简化**：图表只按文本处理（不做 upstream 的 panel 渲染/caption 上移/原生小标题）；
+JSON 不回带 `raw_out`；表头提升只看形状不看加粗；一次一页（多页由调用方循环）。
 
 ## 为什么做独立引擎？
 

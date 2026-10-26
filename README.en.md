@@ -96,7 +96,7 @@ Full per-backend details are in the hand-maintained table below:
 | VideoMAE classification / features | ✅ single-GGUF tower (94M params, ~180 MB at f16): 16 uniform frames → center crop 224 → one full space-time attention pass → top-k labels; no tokenizer, no KV cache. **Parity verified** against an independent numpy recomputation from the GGUF weights: ~1e-3 relative over 12 layers, patch embedding 3e-3, block-0 attention 3e-4, all 400 Kinetics probabilities within 1e-4. Headless pretraining checkpoints return the pooled embedding (`--mode embed` dumps 768 floats as JSON). ~0.85 s per clip on CPU (q8_0 weights: 0.59 s) |
 | ViViT-b/16x2 classification | ✅ same video tower (the `videomae` backend, arch `vivit`): the only differences are a learned **cls token**, a learned position table, `gelu_fast` (tanh form), LN eps 1e-6, bias on all of q/k/v and a bilinear 256→224 preprocessing with zero centering. 32 frames → 3136+1 tokens, Kinetics-400 labels. Parity vs `VivitForVideoClassification`: probabilities within 6e-3, identical top-5 order, ~2.2 s per clip on CPU |
 | V-JEPA 2 features / classification / masked prediction | ✅ ViT-L (326M + a 25M predictor, 653 MB at f16): 64 frames → shortest edge 292 (bilinear) → crop 256 → **8192-token full space-time attention x 24 layers** → 1024-d feature; the SSv2 fine-tune (16 frames) adds a **3-layer attentive pooler + 174-way linear head** (`--mode 5` prints labels), and `--mode predict` runs the 12-layer masked-latent predictor. **Parity verified** against transformers 5.x: with the *same* patch input the 24-layer stream matches at cos **1.000000** (max 0.065); end to end (each with its own preprocessing) the pooled feature is cos **0.9994**, the SSv2 top-1 label agrees (0.916 vs 0.921, probabilities within 4.5e-3) and the predictor lands at cos **0.998**. ~25 s per 8192-token clip on CPU (19 cores), ~5 s for SSv2 |
-| Nemotron-3.5-Parse document parsing | ✅ end to end, stage-by-stage against the official torch stack (`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`): content-normalized position field **2.7e-7**, patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3, first-token logits top8 **8/8**, and all **159 greedy tokens of a full page are identical** to the official stack, down to the HTML table rendered from its LaTeX. One trap worth recording: HF applies the repetition penalty over `input_ids.unique()`, so applying it per occurrence double-penalises the repeated coordinate tokens and greedy decoding forks mid-page. One 1.3 GB GGUF plus the upstream `tokenizer.json` (the registry's vocab probe now counts added tokens, otherwise 50k base + 22k coordinate tokens looks like a stranger's tokenizer); on CPU (19 threads) a 1024-long-edge page costs ~11 s of vision + 0.7 s of prefill |
+| Nemotron-3.5-Parse document parsing | ✅ end to end, stage-by-stage against the official torch stack (`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`): content-normalized position field **2.7e-7**, patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3, first-token logits top8 **8/8**, and all **159 greedy tokens of a full page are identical** to the official stack, down to the HTML table rendered from its LaTeX. One trap worth recording: HF applies the repetition penalty over `input_ids.unique()`, so applying it per occurrence double-penalises the repeated coordinate tokens and greedy decoding forks mid-page. One 1.3 GB GGUF plus the upstream `tokenizer.json` (the registry's vocab probe now counts added tokens, otherwise 50k base + 22k coordinate tokens looks like a stranger's tokenizer); one page costs ~20 s on CPU (17.6 s vision + 0.9 s prefill + 158 decoded tokens) versus ~1.1 s on CUDA (0.68 s + 0.019 s + 0.4 s), with identical per-block output |
 | Qwen2.5-VL-3B | ✅ arch `qwen2vl`: Qwen2 text trunk (36L GQA 16:2, qkv bias, section MRoPE 16/24/24, SwiGLU) + Qwen2.5 ViT (32L, patch 14, temporal 2, 2×2 merge, **window attention** with a global layer every 8th) + merger, dynamic resolution through `smart_resize`. Preprocessing is CLIP mean/std, bicubic, patches in **2×2 group order**. Merged features corr 0.9935 vs the official tower, same answers ("There are five people in the image.") |
 | SmolVLM-256M (Idefics3) | ✅ arch `smolvlm`, the smallest backend here: SigLIP-base tower (12L, patch 16, 512², learned positions, LayerNorm/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30L, no biases, GQA 9:3, rope 1e5). Idefics3 preprocessing: longest edge 2048 → pad to multiples of 512 → 512² tiles + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8. Logits corr 0.99991 and byte-identical answers |
 | EmbeddingGemma-2 (740M) | ✅ arch `embgemma2`, multimodal **embedding** (no text generation): Gemma3 text tower (24L d=512, GQA 4:1, interleaved SWA/full, per-layer PLE) + Gemma4 ViT (16L patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / chunk-12 local attention with Transformer-XL rel-shift bias; every linear is a ClippableLinear with finite clamps from the checkpoint). `--embed` emits 768-d vectors (Matryoshka truncation `--embed-dim`, official task prefixes `--embed-preset`, batch `--embed-file`). All four modalities vs the fp32 HF reference: text 0.9999999 / image 0.99999 / audio 0.99999 / video 0.9999998 |
@@ -720,6 +720,54 @@ vqa-cli --model embeddinggemma2-f16.gguf --tokenizer models/embeddinggemma-2 \
   counts real tokens only); GPU matches CPU to 0.999996+. Text n_ctx defaults to 8192
   (32 frames ≈ 3.9k tokens). On CPU, q8_0 weights are only ~8% faster — the bottleneck is
   f32 attention, not weight bandwidth
+
+### Nemotron-3.5-Parse (document parsing)
+
+A 0.63B document parser: one 1.3 GB GGUF turns a whole scanned page, screenshot or PDF page
+into **structured output with layout classes and boxes**. It is not a general VLM — it refuses
+chit-chat and only has one task, which is a feature: the prompt is six control tokens, so a
+user's phrasing cannot steer it off the rails.
+
+```bash
+pip install -r convert/requirements.txt
+hf download nvidia/Nemotron-3.5-Parse --local-dir models/Nemotron-3.5-Parse   # weights + tokenizer
+python convert/convert_nemotron_parse.py                                     # -> nemotron-parse-f16.gguf
+
+# raw markup (the default): <x_0.0586><y_0.0539>Quarterly Report 2026<x_0.1621><y_0.0633><class_Text>
+vqa-cli --model nemotron-parse-f16.gguf --tokenizer models/Nemotron-3.5-Parse \
+        --image page.png --ask parse --n-ctx 8192 --max-tokens 4000
+
+# rendered: markdown (LaTeX tables become HTML) / postprocess_document-shaped JSON / plain text
+vqa-cli ... --mode markdown
+vqa-cli ... --mode json
+```
+
+Each JSON block is `{"class", "bbox":[x1,y1,x2,y2] (content-normalized), "bbox_pixels", "text",
+"content"}`, plus a top-level `markdown` and `warnings` (naming the tables that could not be
+converted to HTML). The MCP side is the `parse_document` tool (`format=json|markdown|raw`).
+
+**Parity** against the official torch stack, stage by stage (`scripts/ref_nemotron_parse.py` →
+`convert/compare_dumps.py`): the content-normalized position field is **element-exact** (2.7e-7),
+patch embeddings 2.8e-3 (f16 weight noise), ViT/neck mean error 5e-3; **on CPU all 159 greedy
+tokens of a full page are identical to the official stack**; on CUDA all 7 blocks match in class
+and text, with 5 characters differing — all in the last digit of a coordinate (f16 kernel
+rounding lands on the neighbouring coordinate bin).
+
+**Performance** (a 1000×1300 page, default canvas: 1313 visual tokens, 158 output tokens):
+
+| | vision tower | prefill | decode |
+|---|---|---|---|
+| CPU (19 threads) | 17.6 s | 0.89 s | 11.8 ms/token (84 tok/s) |
+| CUDA (RTX 4070 SUPER) | **0.68 s** | **0.019 s** | **2.5 ms/token (404 tok/s)** |
+
+End to end that is ~20 s per page on CPU and ~1.1 s on GPU. Knobs: `NEMOTRON_PARSE_MAX_EDGE=1024`
+cuts the tower cost by ~16× (the default canvas is 2048×1664 and the tower is quadratic in visual
+tokens); `NEMOTRON_PARSE_PROFILE=1` prints the graph shape and the compute / graph-build split;
+`--max-tokens` needs room (a page is 2-8k tokens, and the backend warns before clipping).
+
+**Known simplifications**: charts are treated as text (no upstream panel rendering / caption
+relocation / native subtitles); the JSON does not echo `raw_out`; header promotion looks at table
+shape only, not at bold text; one page per call (loop in the caller for multi-page documents).
 
 ## Why a standalone engine?
 

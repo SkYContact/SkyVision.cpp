@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,7 @@ private:
 
     vqa::KvCache kv;
     int n_past = 0;
+    double ms_compute = 0.0;   // accumulated graph_compute time (build vs compute split)
 
     uint64_t rng_state = 0x243F6A8885A308D3ull;
 };
@@ -397,6 +399,9 @@ bool NemotronParse::build_vision_graph(int n_patch, int rows, int cols) {
     venv.N = N;
     venv.vhd = E / v_head;
     venv.vhd_f = venv.vhd;
+    // head_dim has no padding here, so the FA output can feed wo through a plain
+    // reshape - without this the hook takes the de-pad path and copies it
+    venv.wo_padded = true;
     venv.no_rope = true;
     venv.dbg_names = !dump_dir.empty();
     vqa::vit::BlockHooks vh;
@@ -428,13 +433,10 @@ bool NemotronParse::build_vision_graph(int n_patch, int rows, int cols) {
         return ggml_add(vctx, t, b);
     };
 
-    // ---- summary token: class tokens 0 and 1, concatenated along the feature axis
-    ggml_tensor * sum_in = nullptr;
-    for (int i = 0; i < v_summary; i++) {
-        ggml_tensor * c = ggml_cont(vctx, ggml_view_2d(vctx, x, E, 1, x->nb[1],
-                                                       (size_t)i * x->nb[1]));
-        sum_in = sum_in ? ggml_concat(vctx, sum_in, c, 0) : c;
-    }
+    // ---- summary token: class tokens 0 and 1, concatenated along the feature
+    // axis. They are adjacent in memory (token stride == nb[1]), so one view
+    // expresses the concat and no copy is needed.
+    ggml_tensor * sum_in = ggml_view_2d(vctx, x, (int64_t)E * v_summary, 1, x->nb[1], 0);
     ggml_tensor * sum = ggml_add(vctx, ggml_mul_mat(vctx, n_sum_w, sum_in), n_sum_b);
     sum = layer_norm(sum, n_ln3_w, n_ln3_b);
 
@@ -466,6 +468,15 @@ bool NemotronParse::build_vision_graph(int n_patch, int rows, int cols) {
     if (!ggml_gallocr_alloc_graph(allocr, vgf)) {
         fprintf(stderr, "vision graph allocation failed\n");
         return false;
+    }
+    if (getenv("NEMOTRON_PARSE_PROFILE")) {
+        std::map<std::string, int> hist;
+        for (int i = 0; i < ggml_graph_n_nodes(vgf); i++)
+            hist[ggml_op_name(ggml_graph_node(vgf, i)->op)]++;
+        fprintf(stderr, "[graph] vision n_patch=%d: %d nodes\n", n_patch,
+                ggml_graph_n_nodes(vgf));
+        for (const auto & e : hist)
+            fprintf(stderr, "[graph]   %-16s %d\n", e.first.c_str(), e.second);
     }
     v_n_patch = n_patch;
     (void)rows; (void)cols;
@@ -574,7 +585,8 @@ ggml_tensor * NemotronParse::dec_layer(TextGraph & g, ggml_tensor * x, const Dec
                                     kv.v[(size_t)il]->nb[1], HD * sizeof(ggml_fp16_t), 0);
     ggml_tensor * fa = ggml_flash_attn_ext(c, qf, kf, vf, g.mask_in,
                                            1.0f / sqrtf((float)HD), 0.0f, 0.0f);
-    ggml_tensor * attn = ggml_reshape_2d(c, ggml_cont(c, fa), NH * HD, T);
+    // the FA output is already contiguous ([hd, h, T] -> [hd*h, T]), so no copy
+    ggml_tensor * attn = ggml_reshape_2d(c, fa, NH * HD, T);
     attn = ggml_add(c, ggml_mul_mat(c, L.wo, attn), L.bo);
     x = ggml_add(c, x, attn);
     if (il == 0) ggml_set_name(x, "t_l0_resid");
@@ -643,6 +655,18 @@ bool NemotronParse::build_text_graph(TextGraph & g, int T_tok, int n_vis, int S,
         fprintf(stderr, "text graph allocation failed (S=%d T=%d)\n", S, T);
         return false;
     }
+    if (getenv("NEMOTRON_PARSE_PROFILE")) {
+        static bool dumped = false;
+        if (!dumped) {   // op histogram of the decode shape, once per process
+            dumped = true;
+            std::map<std::string, int> hist;
+            for (int i = 0; i < ggml_graph_n_nodes(g.gf); i++)
+                hist[ggml_op_name(ggml_graph_node(g.gf, i)->op)]++;
+            fprintf(stderr, "[graph] text T=%d: %d nodes\n", T, ggml_graph_n_nodes(g.gf));
+            for (const auto & e : hist)
+                fprintf(stderr, "[graph]   %-16s %d\n", e.first.c_str(), e.second);
+        }
+    }
     return true;
 }
 
@@ -653,10 +677,13 @@ bool NemotronParse::run_text(TextGraph & g, const std::vector<int> & toks,
     ggml_backend_tensor_set(g.pos_in, pos.data(), 0, sizeof(int) * pos.size());
     if (g.vis_in && vis && n_vis > 0)
         ggml_backend_tensor_set(g.vis_in, vis, 0, sizeof(float) * (size_t)n_embd * n_vis);
+    const auto t0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "text compute failed\n");
         return false;
     }
+    ms_compute += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
     logits.resize((size_t)n_vocab);
     ggml_backend_tensor_get(g.logits, logits.data(), 0, sizeof(float) * logits.size());
     return true;
@@ -774,11 +801,13 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
     auto emit = [&](int t) {
         std::string piece = tok_.decode({ t });
         out.push_back(t);
-        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+        if (gp.stream && gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
     };
     apply_repetition_penalty(logits, seen, rep_penalty);
     int cur = vqa::sample_logits(logits, gp, rng_state);
     int generated = 0;
+    const auto td0 = std::chrono::steady_clock::now();
+    const double compute_before = ms_compute;
     while (cur != id_eos && generated < max_new) {
         emit(cur);
         mark(cur);
@@ -799,6 +828,18 @@ bool NemotronParse::ask(const vqa::MediaInput & media, const std::string & promp
     if (generated >= max_new && cur != id_eos)
         fprintf(stderr, "nemotron_parse: hit the %d token cap (raise --max-tokens for long "
                         "pages; a full page is often 2-8k tokens)\n", max_new);
+    if (generated > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - td0).count();
+        fprintf(stderr, "[perf] nemotron_parse decode: %.1f ms/token (%.1f tok/s, %d tokens)\n",
+                ms / generated, generated * 1000.0 / ms, generated);
+        if (getenv("NEMOTRON_PARSE_PROFILE")) {
+            const double comp = (ms_compute - compute_before) / generated;
+            fprintf(stderr, "[perf] nemotron_parse split: compute %.2f ms/token, "
+                            "graph build + alloc %.2f ms/token\n",
+                    comp, ms / generated - comp);
+        }
+    }
 
     const std::string raw = tok_.decode(out);
     out_text = render_answer(raw, mode, media.width, media.height);
