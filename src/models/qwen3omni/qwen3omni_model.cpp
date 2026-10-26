@@ -41,6 +41,7 @@
 #endif
 #include "core/text/tokenizer.hpp"
 #include "core/engine/attention.hpp"
+#include "core/engine/decode_graph.hpp"
 #include "core/engine/moe_decode_driver.hpp"
 #include "core/blocks/omni_speech.hpp"
 #include "core/engine/sampler.hpp"
@@ -254,12 +255,14 @@ private:
 
     vqa::KvCache kv;
     ggml_gallocr_t allocr = nullptr;
+    vqa::GraphSlot<TextGraph> dec_slot;   // reused bucketed decode graph (decode_graph.hpp)
     int n_past = 0;
     int last_mpos[3] = {0, 0, 0};
     uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 };
 
 Qwen3Omni::~Qwen3Omni() {
+    dec_slot.reset();   // bucketed decode graph (decode_graph.hpp)
     kv.free();
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wctx) ggml_free(wctx);
@@ -832,66 +835,86 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
     const auto tb0 = std::chrono::steady_clock::now();
     const bool for_talker = (emb_all || h24_all);
     if (for_talker) fprintf(stderr, "[dbg] run_text T=%d for_talker\n", T);
-    if (!build_text_graph(g, T, S, n_img, false, for_talker)) return false;
-    const auto tb1 = std::chrono::steady_clock::now();
-    if (split_mode ? !split_sched.alloc(g.gf)
-                   : !ggml_gallocr_alloc_graph(allocr, g.gf)) {
-        fprintf(stderr, "text graph allocation failed\n");
-        ggml_free(g.ctx);
-        g.ctx = nullptr;
+    // decode (T == 1, no media rows) runs on one persistent bucketed graph
+    // (decode_graph.hpp): build + alloc happen once per KV-window bucket
+    // instead of every token - this graph (48 MoE layers + IMROPE) is the
+    // most expensive per-token rebuild in the repo - and the stable node
+    // addresses let ggml-cuda's CUDA-graph cache (keyed on cgraph->nodes[0])
+    // capture once and replay. The talker-capture graph (for_talker) has a
+    // different shape, so it keys its own slot entry.
+    const bool decode_step = (T == 1 && n_img == 0);
+    const int window_S = decode_step
+        ? vqa::decode_bucket(S, n_ctx, ggml_backend_is_cpu(backend)) : S;
+    TextGraph * dg = &g;
+    if (decode_step) {
+        const int slot_key = window_S * 2 + (for_talker ? 1 : 0);
+        if (!dec_slot.prepare(slot_key, [&](TextGraph & d) {
+                return build_text_graph(d, 1, window_S, 0, false, for_talker);
+            }))
+            return false;
+        dg = &dec_slot.g;
+    } else if (!build_text_graph(g, T, S, n_img, false, for_talker)) {
         return false;
     }
-    ggml_backend_tensor_set(g.tok_in, toks.data(), 0, sizeof(int) * T);
-    ggml_backend_tensor_set(g.mpos_in, mpos.data(), 0, sizeof(int) * 4 * T);
+    const auto tb1 = std::chrono::steady_clock::now();
+    if (split_mode ? !split_sched.alloc(dg->gf)
+                   : !ggml_gallocr_alloc_graph(allocr, dg->gf)) {
+        fprintf(stderr, "text graph allocation failed\n");
+        if (decode_step) dec_slot.reset();
+        else { ggml_free(g.ctx); g.ctx = nullptr; }
+        return false;
+    }
+    ggml_backend_tensor_set(dg->tok_in, toks.data(), 0, sizeof(int) * T);
+    ggml_backend_tensor_set(dg->mpos_in, mpos.data(), 0, sizeof(int) * 4 * T);
     if (n_img > 0) {
-        ggml_backend_tensor_set(g.img_in, img_feats->data(), 0, sizeof(float) * img_feats->size());
-        ggml_backend_tensor_set(g.img_pos_in, img_pos->data(), 0, sizeof(int) * n_img);
+        ggml_backend_tensor_set(dg->img_in, img_feats->data(), 0, sizeof(float) * img_feats->size());
+        ggml_backend_tensor_set(dg->img_pos_in, img_pos->data(), 0, sizeof(int) * n_img);
     }
     const auto tb2 = std::chrono::steady_clock::now();
-    vqa::set_causal_mask(g.mask_in, n_past, T);
+    vqa::set_causal_mask(dg->mask_in, n_past, T);
     static const bool prof = getenv("QOMNI_PROFILE") != nullptr;
     static vqa::op_profile::State prof_state;
     static int prof_step = 0;
     bool ok;
     if (prof) {
-        ok = vqa::op_profile::profile_graph(backend, g.gf, prof_state,
+        ok = vqa::op_profile::profile_graph(backend, dg->gf, prof_state,
                                             T > 1 ? "prefill" : "decode",
                                             prof_step++, T > 1 ? 1000000 : 32);
     } else {
-        ok = split_mode ? split_sched.run(g.gf)
-                        : ggml_backend_graph_compute(backend, g.gf) == GGML_STATUS_SUCCESS;
+        ok = split_mode ? split_sched.run(dg->gf)
+                        : ggml_backend_graph_compute(backend, dg->gf) == GGML_STATUS_SUCCESS;
     }
     if (!ok) {
         fprintf(stderr, "text compute failed\n");
-        ggml_free(g.ctx);
-        g.ctx = nullptr;
+        if (decode_step) dec_slot.reset();
+        else { ggml_free(g.ctx); g.ctx = nullptr; }
         return false;
     }
     static const bool dump_prefill_only = getenv("QOMNI_PREFILL_DUMP_ONLY") != nullptr;
     if (!dump_prefill_only || T > 1) {
-        dump(g.gf, "emb");
-        dump(g.gf, "t_l0_attn");
-        dump(g.gf, "t_l0_resid");
-        dump(g.gf, "t_l0_m");
-        dump(g.gf, "t_l0_rlogits");
-        dump(g.gf, "t_l0_act");
-        dump(g.gf, "t_l0_moe");
-        dump(g.gf, "t_l0_out");
-        dump(g.gf, "t_final_norm");
-        dump(g.gf, "logits");
+        dump(dg->gf, "emb");
+        dump(dg->gf, "t_l0_attn");
+        dump(dg->gf, "t_l0_resid");
+        dump(dg->gf, "t_l0_m");
+        dump(dg->gf, "t_l0_rlogits");
+        dump(dg->gf, "t_l0_act");
+        dump(dg->gf, "t_l0_moe");
+        dump(dg->gf, "t_l0_out");
+        dump(dg->gf, "t_final_norm");
+        dump(dg->gf, "logits");
     }
 
     logits_out.resize(n_vocab);
-    ggml_backend_tensor_get(g.logits, logits_out.data(), 0, sizeof(float) * n_vocab);
-    if (emb_all && g.emb_out) {
-        fprintf(stderr, "[dbg] read emb_out ne1=%lld\n", (long long)g.emb_out->ne[1]);
+    ggml_backend_tensor_get(dg->logits, logits_out.data(), 0, sizeof(float) * n_vocab);
+    if (emb_all && dg->emb_out) {
+        fprintf(stderr, "[dbg] read emb_out ne1=%lld\n", (long long)dg->emb_out->ne[1]);
         emb_all->resize((size_t)n_embd * T);
-        ggml_backend_tensor_get(g.emb_out, emb_all->data(), 0, sizeof(float) * emb_all->size());
+        ggml_backend_tensor_get(dg->emb_out, emb_all->data(), 0, sizeof(float) * emb_all->size());
     }
-    if (h24_all && g.h24_out) {
-        fprintf(stderr, "[dbg] read h24_out ne1=%lld\n", (long long)g.h24_out->ne[1]);
+    if (h24_all && dg->h24_out) {
+        fprintf(stderr, "[dbg] read h24_out ne1=%lld\n", (long long)dg->h24_out->ne[1]);
         h24_all->resize((size_t)n_embd * T);
-        ggml_backend_tensor_get(g.h24_out, h24_all->data(), 0, sizeof(float) * h24_all->size());
+        ggml_backend_tensor_get(dg->h24_out, h24_all->data(), 0, sizeof(float) * h24_all->size());
     }
     if (getenv("QOMNI_TIME") && T == 1) {
         static double b_ms = 0, a_ms = 0, c_ms = 0; static int ns = 0;
@@ -904,8 +927,7 @@ bool Qwen3Omni::run_text(TextGraph & g, const std::vector<int> & toks,
                     b_ms / ns, a_ms / ns, c_ms / ns);
     }
     n_past = S;
-    ggml_free(g.ctx);
-    g.ctx = nullptr;
+    if (!decode_step) { ggml_free(g.ctx); g.ctx = nullptr; }   // the decode slot persists
     return true;
 }
 
