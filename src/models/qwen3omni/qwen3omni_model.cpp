@@ -218,6 +218,12 @@ private:
     vqa::MMap mm;
 
     ggml_tensor *tok_embd = nullptr, *out_norm = nullptr, *out_w = nullptr;
+    // ec split mode: host copy of tok_embd for the (CPU) deferred talker's
+    // rows_any reads - reading a CUDA-buffered table from the CPU segfaults
+    std::vector<uint8_t> tok_embd_host_mem;
+    ggml_context * tok_embd_host_ctx = nullptr;
+    ggml_backend_buffer_t tok_embd_host_buf = nullptr;
+    ggml_tensor * tok_embd_host = nullptr;
     std::vector<TxtLayer> tl;
     ggml_tensor *v_patch_w = nullptr;
 
@@ -254,6 +260,8 @@ Qwen3Omni::~Qwen3Omni() {
     if (allocr) ggml_gallocr_free(allocr);
     split_sched.free_sched();
     if (host_wbuf) ggml_backend_buffer_free(host_wbuf);
+    if (tok_embd_host_buf) ggml_backend_buffer_free(tok_embd_host_buf);
+    if (tok_embd_host_ctx) ggml_free(tok_embd_host_ctx);
     if (backend_cpu) ggml_backend_free(backend_cpu);
     if (backend) ggml_backend_free(backend);
 }
@@ -1047,8 +1055,8 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
     }
     (void)n_dec;
     if (gp.speak_wav && talker_deferred) {
-        talker_deferred = false;
-        load_talker();
+        load_talker();          // while talker_deferred is still set: the
+        talker_deferred = false; // CPU-partner placement decision reads it
     }
     if (ec_enabled && ec_ok && ec_steps > 0) {
         vqa::ExpertCacheStats st;
@@ -1105,7 +1113,20 @@ bool Qwen3Omni::generate(const std::vector<int> & ids, const std::vector<float> 
             si.gen_ids = &gen_ids;
             si.traj_emb = &traj_emb;
             si.traj_h24 = &traj_h24;
-            si.thinker_embd = tok_embd;
+            if (split_mode && !tok_embd_host) {
+                // one-time D2H of the whole table (~250 MB Q6_K)
+                const size_t nb = ggml_nbytes(tok_embd);
+                tok_embd_host_mem.resize(nb);
+                ggml_backend_tensor_get(tok_embd, tok_embd_host_mem.data(), 0, nb);
+                tok_embd_host_ctx = ggml_init({ 128ull << 10, NULL, /*no_alloc*/ true });
+                tok_embd_host = ggml_new_tensor_2d(tok_embd_host_ctx, tok_embd->type,
+                                                   tok_embd->ne[0], tok_embd->ne[1]);
+                tok_embd_host_buf = ggml_backend_cpu_buffer_from_ptr(
+                    tok_embd_host_mem.data(), nb);
+                tok_embd_host->buffer = tok_embd_host_buf;
+                tok_embd_host->data = tok_embd_host_mem.data();
+            }
+            si.thinker_embd = tok_embd_host ? tok_embd_host : tok_embd;
             si.thinker_embd_dim = n_embd;
             si.rng = &rng_state;
             std::vector<float> wav;
