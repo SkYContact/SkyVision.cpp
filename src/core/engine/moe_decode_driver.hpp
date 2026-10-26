@@ -282,14 +282,21 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
     const int T = 1;
     const int K = h.n_expert_used;
 
-    // KV window rounded to a 512 block so the graph shape only changes every
-    // 512 positions (mask hides the padding); the per-layer graphs rebuild
-    // once per block, not per step
-    const int S_need = vqa::block_for(n_past + 1, 512);
+    // KV window block for the EC step. MUST match the model standard decode
+    // bucket (decode_graph.hpp decode_bucket: 128 CPU / 1024 GPU): the CPU
+    // flash_attn_ext kernel splits the KV range into per-thread chunks whose
+    // online-softmax partials are recombined with expf rescaling, so a padded
+    // window of a DIFFERENT width is mathematically equivalent but not
+    // bit-equal - a 1-ulp attention difference flips router top-k near-ties
+    // and the whole reply diverges (qwen3omni xchk drifted at step 16 with
+    // the old 512 block; bit-exact with 128). MOE_EC_BLOCK overrides for A/B.
+    int ec_block = ggml_backend_is_cpu(h.backend) ? 128 : 1024;
+    if (const char * e = getenv("MOE_EC_BLOCK")) ec_block = atoi(e);
+    const int S_need = vqa::block_for(n_past + 1, ec_block);
     if (!st.ga_ready || S_need != st.S) {
         if (st.ga_ready) {
-            fprintf(stderr, "%s: KV window crossed a 512 block (%d -> %d),"
-                    " rebuilding %d layer-A graphs\n", h.log_tag, st.S, S_need,
+            fprintf(stderr, "%s: KV window crossed a %d block (%d -> %d),"
+                    " rebuilding %d layer-A graphs\n", h.log_tag, ec_block, st.S, S_need,
                     h.n_layer);
             st.ga_ready = false;
         }
