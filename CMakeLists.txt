@@ -345,6 +345,12 @@ add_executable(vram-probe tools/vram_probe.cpp src/core/runtime/vram_guard.cpp)
 target_link_libraries(vram-probe PRIVATE ggml ggml-cpu)
 target_include_directories(vram-probe PRIVATE ${GGML_INC} ${SRC_INC})
 
+# --- Nemotron-Parse answer renderer test: np_markup.hpp is header-only and pulls
+#     in nothing but the C++ standard library, so this target needs no ggml and no
+#     weights - it is cheap enough for the always-on CI job. ---
+add_executable(np_markup_test src/models/nemotron_parse/np_markup_test.cpp)
+target_include_directories(np_markup_test PRIVATE ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse)
+
 add_executable(qwen3omni-pw-test tools/qwen3omni_pw_test.cpp
     src/models/qwen3omni/qwen3omni_talker.cpp
     src/core/util/mmap.cpp)

@@ -928,6 +928,9 @@ ggml/                  the only third-party dependency (clone it, not tracked)
   table and the four-step recipe for pulling a duplicated implementation in (prove both copies
   already agree numerically, diff them before merging, default new behavior off, then run
   `scripts/ref_*.py` and `scripts/smoke.sh`).
+- **Pure C++ self-test**: `cmake --build build --target np_markup_test` runs the Nemotron-Parse answer
+  renderer assertions (chart tables and captions, caption relocation, list bullets and soft hyphens,
+  JSON); it needs neither ggml nor weights, so CI runs it on every push.
 - **Tokenizer data**: `scripts/gen_unicode_ranges.py` regenerates `src/core/text/unicode_ranges.inc`.
 
 ## License

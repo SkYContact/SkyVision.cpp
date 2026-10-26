@@ -922,6 +922,8 @@ ggml/                  唯一第三方依赖（clone 得到，不入库）
 - **改分词器数据**：`scripts/gen_unicode_ranges.py` 重新生成 `src/core/text/unicode_ranges.inc`。
 - **回归冒烟**：`scripts/smoke.sh` 跑跨后端金标准电池（smolvlm/vc3/moss/qwen3.5 各一条贪婪，CPU
   + 钉死 `--threads 1` 保证可复现）；`--golden FILE` 对既有金标准逐字节比对。改共享层/做迁移后先跑它。
+- **纯 C++ 自检**：`cmake --build build --target np_markup_test` 跑 Nemotron-Parse 的答案渲染断言
+  （图表表格/标题/字幕、caption 上移、列表符号与软连字符、JSON），不依赖 ggml 与权重，CI 每次都跑。
 
 ## License
 

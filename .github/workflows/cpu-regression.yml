@@ -91,6 +91,13 @@ jobs:
           cmake --build build --target vqa-cli
           test -x build/vqa-cli
 
+      # pure-C++ assertions for the Nemotron-Parse answer renderer (chart tables,
+      # captions, typography, JSON); no ggml and no weights involved
+      - name: Answer renderer self-test
+        run: |
+          cmake --build build --target np_markup_test
+          ./build/np_markup_test
+
       # content assertion: parse the JSON, not just the exit code
       - name: Capability spec table must be complete
         run: |
