@@ -23,6 +23,32 @@
 // makes flash attention read keys that cannot contribute. That is a bad trade
 // where attention is the bottleneck and a good one where kernel launch is, so
 // the bucket width follows the backend (see decode_bucket).
+//
+// SPLIT-PLACEMENT CONTRACT: a slot graph must never be fed to the two-backend
+// Strata scheduler (sched.hpp) step after step. ggml_backend_sched_split_graph()
+// MUTATES the caller's cgraph: every cross-split node's src pointer is
+// rewritten to a sched-owned per-split copy tensor ("<backend>#<name>#<slot>"),
+// and the copy slot alternates on every alloc_graph (cur_copy increments mod
+// n_copies). Feeding the same cgraph through alloc_graph() again re-splits it
+// in the already-rewritten state: the second pass sees src pointers into last
+// step's copy buffers instead of real graph nodes and produces garbage
+// activations (measured on keye_vl split: output degenerates to blank tokens
+// from the first reused step, ggml-backend.cpp ~1547). Single-backend
+// placements are unaffected - with no split there is no rewriting, and
+// re-allocating the same graph through one backend's gallocr is the standard
+// decode pattern. Consumers must gate slot reuse on the placement (see
+// keye_vl / qwen3omni: `reuse = decode_step && !split_mode`).
+//
+// Placement audit (who can hand a slot graph to a multi-backend sched):
+//   keye_vl    split REACHABLE (VQA_SPLIT=1, KEYE_EXPERTCACHE implies split,
+//              VRAM-shortage CPU fallback)   -> gated under split_mode
+//   qwen3omni  split REACHABLE (QOMNI_EXPERTCACHE=1 implies split on CUDA;
+//              QOMNI_EC_OFF=1 then routes the non-EC T=1 decode, including
+//              the deferred talker's for_talker graphs, through it)
+//                                                -> gated under split_mode
+//   janus      structurally single-backend: one init_backend() backend, no
+//   qwen2vl    sched and no split placement anywhere in the file -> the slot
+//   smolvlm    is safe as-is; re-audit before ever adding a split placement
 #pragma once
 
 #include "ggml.h"
