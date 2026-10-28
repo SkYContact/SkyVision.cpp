@@ -102,7 +102,10 @@
 #include "core/text/tokenizer.hpp"
 #include "core/engine/attention.hpp"
 #include "core/engine/decode_graph.hpp"
+#include "core/engine/expert_cache.hpp"
+#include "core/engine/moe_decode_driver.hpp"
 #include "core/engine/sampler.hpp"
+#include "core/engine/sched.hpp"
 #include "core/util/aligned_buf.hpp"
 #include "core/util/mmap.hpp"
 #include "core/engine/backend.hpp"
@@ -122,6 +125,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+// internal (not in the frozen headers): the cgraph under construction during
+// vqa::StepGraph::build() - used by the graph-A builder in
+// nemotronomni_expert_decode.inc. Declared at GLOBAL scope (namespace-nemo
+// would shadow ::vqa and break every vqa:: reference below).
+namespace vqa {
+ggml_cgraph * step_graph_builder_gf();
+}
 
 namespace nemo {
 
@@ -419,6 +430,61 @@ private:
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     void dump(ggml_cgraph * gf, const char * name);
 
+    // ---- NEMOTRONOMNI_EXPERTCACHE: expert-granular dynamic decode ----------
+    // (nemotronomni_expert_decode.inc; the moe_decode driver's third
+    // consumer). ec_enabled is the request, ec_ok the initialized state;
+    // decode falls back to the existing path whenever ec_ok is false.
+    bool ec_enabled = false, ec_ok = false;
+    std::vector<vqa::ExpertCache> ec_caches;
+    std::vector<int> ec_group;          // MoE-slot -> cache group
+    int ec_n_groups = 0;
+    std::vector<int> ec_moe_of;         // driver layer -> MoE slot (-1: none)
+    std::vector<int> ec_e_layer;        // MoE slot -> driver layer
+    std::vector<int> ec_m_idx;          // driver layer -> mamba state index
+    std::vector<int> ec_kv_idx;         // driver layer -> kv cache index
+    vqa::moe_decode::State ec_st;
+    vqa::moe_decode::Hooks ec_hooks;
+    // fixed per-layer graph-A holders (StepGraph, built once, re-fed every
+    // step; S is block-aligned so shapes never change mid-block)
+    struct EcGraphA {
+        ggml_tensor *tok_in = nullptr, *hid_in = nullptr, *pos_in = nullptr,
+                    *mask_in = nullptr, *ssm_ids = nullptr;
+        ggml_tensor *w8_o = nullptr, *sel_o = nullptr, *m_o = nullptr, *x_o = nullptr;
+        ggml_tensor *ids_in = nullptr;     // graph-B slot ids (set in feed_b)
+    };
+    struct EcGaUd { NemotronOmni * m; int il; EcGraphA * io; };
+    std::vector<EcGraphA> ec_ga_io;
+    std::vector<int> ec_b_ids = std::vector<int>(16, 0);   // host slot-id scratch
+    std::vector<ggml_fp16_t> ec_mask;   // per-step causal mask cache
+    int ec_mask_n = -1;
+    std::vector<uint8_t> ec_state_snap; // xchk: Mamba2 conv/ssm state snapshot
+    std::vector<float> ec_ref_layers;   // xchk: per-layer ref output snapshot
+    bool ec_init();
+    static ggml_tensor * ec_ga_builder(ggml_context * c, void * ud);
+    static bool ec_build_a(void * m, int il, vqa::StepGraph & sg,
+                           vqa::moe_decode::AIO & io);
+    static bool ec_feed_a(void * m, int il, vqa::moe_decode::AIO & io,
+                          vqa::StepGraph & sg, const void * step_ctx,
+                          int cur_tok, int n_past, const float * hid);
+    static void ec_post_a(void * m, int il, const float * xmid, const float * mn,
+                          const int * sel, const float * w8);
+    static ggml_tensor * ec_build_b(void * m, int il, ggml_context * cb,
+                                    ggml_cgraph * fb, ggml_tensor * moe_in,
+                                    ggml_tensor * xmid_in,
+                                    const std::vector<ggml_tensor *> & slots,
+                                    ggml_tensor * w_in);
+    static void ec_feed_b(void * m, int il);
+    static bool ec_layer_check(void * m, int il, float * hid_io);
+    bool ec_decode_step(int cur_tok, int n_past, std::vector<float> & logits);
+
+    // CUDA EC split placement: dense + towers + KV + Mamba2 states on the
+    // GPU, the expert tables left in the host mmap (ExpertCache mirrors the
+    // selected ones into VRAM slots per step). Prefill rides the two-backend
+    // SplitSched; EC decode never touches it (single-backend graphs only).
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_buffer_t host_wbuf = nullptr;
+    vqa::SplitSched split_sched;
+
     vqa::Capabilities caps_;
     vqa::Tokenizer tok_;
 
@@ -497,8 +563,11 @@ NemotronOmni::~NemotronOmni() {
     if (sbuf) ggml_backend_buffer_free(sbuf);
     if (sctx) ggml_free(sctx);
     if (wbuf) ggml_backend_buffer_free(wbuf);
+    if (host_wbuf) ggml_backend_buffer_free(host_wbuf);
     if (wctx) ggml_free(wctx);
     if (allocr) ggml_gallocr_free(allocr);
+    split_sched.free_sched();
+    if (backend_cpu) ggml_backend_free(backend_cpu);
     if (backend) ggml_backend_free(backend);
 }
 
@@ -507,7 +576,16 @@ bool NemotronOmni::init_backend() {
     backend = vqa::init_backend(use_gpu, n_threads);
     if (!backend) return false;
     if (!allocr) allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    return allocr != nullptr;
+    if (!allocr) return false;
+#ifdef GGML_USE_CUDA
+    // split partner for the EC placement: a CPU backend for the expert
+    // mul_mat_ids (prefill only - EC decode keeps the experts in its own slots)
+    if (!ggml_backend_is_cpu(backend)) {
+        backend_cpu = vqa::init_backend(false, n_threads);
+        if (!backend_cpu) return false;
+    }
+#endif
+    return true;
 }
 
 bool NemotronOmni::load(const std::string & gguf_path, const std::string & tokenizer_path,
@@ -518,6 +596,7 @@ bool NemotronOmni::load(const std::string & gguf_path, const std::string & token
                      strcmp(getenv("NEMOTRONOMNI_ROPE"), "partial84") == 0;
     if (getenv("NEMOTRONOMNI_DT_CLAMP")) dt_clamp = atoi(getenv("NEMOTRONOMNI_DT_CLAMP")) != 0;
     logits_all_env = getenv("NEMOTRONOMNI_LOGITS_ALL") != nullptr;
+    ec_enabled = getenv("NEMOTRONOMNI_EXPERTCACHE") != nullptr;
     if (!init_backend()) return false;
     if (!load_weights(gguf_path.c_str())) return false;
     // tokenizer: the checkpoint ships the Mistral/Pixtral byte-BPE family
@@ -544,13 +623,15 @@ bool NemotronOmni::load(const std::string & gguf_path, const std::string & token
     vqa::assign_token_ids(tok_, { { "<image>", &id_image },
                                   { "<so_embedding>", &id_sound } });
     if (!load_towers()) return false;
+    if (ec_enabled && !ec_init()) return false;
     fprintf(stderr, "nemotronomni: %d layers d=%d (%d mamba / %d attn / %d moe),"
-                    " experts %d/%d+%d x%.2f, ssm %dx%d g%d s%d%s%s eos=%d\n",
+                    " experts %d/%d+%d x%.2f, ssm %dx%d g%d s%d%s%s eos=%d%s\n",
             n_layer, n_embd, n_mamba, n_attn, n_layer - n_mamba - n_attn,
             n_expert_used, n_expert, n_ff_shexp, routed_scaling,
             ssm_n_head, ssm_head_dim, ssm_n_group, ssm_d_state,
             rope_partial84 ? " rope=partial84(A/B)" : " rope=off(NoPE)",
-            dt_clamp ? "" : " dt_clamp=off", eos_id);
+            dt_clamp ? "" : " dt_clamp=off", eos_id,
+            ec_ok ? " [ec]" : (ec_enabled ? " [ec off]" : ""));
     return true;
 }
 
@@ -714,16 +795,48 @@ bool NemotronOmni::load_weights(const char * path) {
         ggml_set_name(t, b);
     }
 
-    // CPU: zero-copy from the mmap. GPU/split placement is the EC wave's
-    // problem (weight_load.hpp §5); for now a non-CPU backend takes the
-    // plain upload path.
-    vqa::weights::Bound bound = vqa::weights::bind_to_backend(
-        wctx, backend, mm, { { host_f32_storage.data(), host_f32_storage.size() },
-                             { a_storage.data(), a_storage.size() } });
-    if (!bound.ok) return false;
-    wbuf = bound.main_buf;
-    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    if (!ggml_backend_is_cpu(backend)) mm.release();
+    // CPU: zero-copy from the mmap. GPU/split: the EC wave's Strata placement
+    // (weight_load.hpp §5) - dense weights + towers up, the expert tables
+    // stay in the host mmap for the ExpertCache slots (NEMOTRONOMNI_EXPERTCACHE
+    // on a CUDA backend); a non-CPU backend without EC takes the plain
+    // full-upload path (will not fit a 30B F16 on a 12 GB card - known).
+    bool want_split = false;
+#ifdef GGML_USE_CUDA
+    if (backend_cpu && ec_enabled && !ggml_backend_is_cpu(backend)) {
+        size_t dev_total = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(wctx); t; t = ggml_get_next_tensor(wctx, t))
+            if (!vqa::weights::moe_expert_pred(t->name)) dev_total += ggml_nbytes(t);
+        size_t free_vram = 0, total_vram = 0;
+        ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
+        // dense trunk + towers + KV + Mamba2 states + compute headroom
+        // (EC slot budget is audited separately in ec_init)
+        if (dev_total + (size_t)2.5e9 <= free_vram) want_split = true;
+        fprintf(stderr, "nemo split: dense+towers %.2f GB, free VRAM %.2f GB"
+                " -> %s\n", dev_total / 1e9, free_vram / 1e9,
+                want_split ? "experts on host (EC split)" : "no split (too little VRAM)");
+    }
+#endif
+    if (want_split) {
+        vqa::weights::SplitBound sb = vqa::weights::split_bind_to_backends(
+            wctx, backend, mm, vqa::weights::moe_expert_pred,
+            { { host_f32_storage.data(), host_f32_storage.size() },
+              { a_storage.data(), a_storage.size() } });
+        if (!sb.ok) return false;
+        wbuf = sb.dev_buf;
+        host_wbuf = sb.host_buf;
+        ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(host_wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        split_mode = true;
+        if (!split_sched.init(backend, backend_cpu, 32768)) return false;
+    } else {
+        vqa::weights::Bound bound = vqa::weights::bind_to_backend(
+            wctx, backend, mm, { { host_f32_storage.data(), host_f32_storage.size() },
+                                 { a_storage.data(), a_storage.size() } });
+        if (!bound.ok) return false;
+        wbuf = bound.main_buf;
+        ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!ggml_backend_is_cpu(backend)) mm.release();
+    }
 
     auto gt = [&](const char * n) {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -1012,6 +1125,7 @@ bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all
     int max_layers = n_layer;
     if (const char * e = getenv("NEMOTRONOMNI_MAX_LAYERS"))
         max_layers = std::min(max_layers, atoi(e));
+    const bool layer_dup = getenv("NEMO_EC_LAYERCHK") != nullptr;
 
     for (int il = 0; il < max_layers; il++) {
         TxtLayer & L = tl[(size_t)il];
@@ -1044,6 +1158,19 @@ bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all
             n_e++;
         }
         if (il == 0) ggml_set_name(x, "t_l0_out");
+        // NEMO_EC_LAYERCHK: retain every layer output in its own buffer (a
+        // trailing dup - mid-graph node memory is reused by the gallocr, so
+        // only a dup survives until readback). Pure debug surface: no effect
+        // on values, ~0.5 MB extra activation for 52 layers. The lookup name
+        // goes to the dup only (two same-named tensors would make
+        // ggml_graph_get_tensor return the clobbered mid-graph node).
+        if (layer_dup) {
+            ggml_tensor * d = ggml_dup(c, x);
+            ggml_set_name(d, ("t_l" + std::to_string(il) + "_out_o").c_str());
+            ggml_build_forward_expand(g.gf, d);
+        } else {
+            ggml_set_name(x, ("t_l" + std::to_string(il) + "_out_o").c_str());
+        }
     }
 
     x = ggml_rms_norm(c, x, rms_eps);
@@ -1089,7 +1216,11 @@ bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
 
     // decode (T == 1) runs on one persistent bucketed graph per KV window
     // (decode_graph.hpp); the !split_mode gate keeps the slot single-backend
-    // (the EC wave re-audits this with the Strata scheduler)
+    // (decode_graph.hpp SPLIT-PLACEMENT CONTRACT: ggml_backend_sched's
+    // split_graph() rewrites the caller graph's node->src, so a slot graph
+    // fed through the Strata scheduler twice re-splits in an already-rewritten
+    // state and produces garbage - split placement rebuilds per step instead;
+    // EC decode replaces the T=1 path entirely when ec_ok)
     const bool decode_step = (T == 1);
     // decode reuses one bucketed persistent graph per KV window
     // (decode_graph.hpp GraphSlot - the qwen3_5/qwen3omni architecture).
@@ -1116,9 +1247,11 @@ bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
     } else if (!build_text_graph(g, T, S, want_all, n_mm)) {
         return false;
     }
-    // split_mode never engages this wave; the EC wave swaps the alloc in for
-    // its SplitSched exactly like qwen3omni (sched.hpp)
-    if (!ggml_gallocr_alloc_graph(allocr, dg->gf)) {
+    // split placement runs the two-backend Strata scheduler (fresh graphs
+    // only - see the SPLIT-PLACEMENT CONTRACT above); single-backend takes
+    // the plain gallocr + graph_compute pattern
+    if (split_mode ? !split_sched.alloc(dg->gf)
+                   : !ggml_gallocr_alloc_graph(allocr, dg->gf)) {
         fprintf(stderr, "nemotronomni: text graph allocation failed\n");
         if (reuse_graph) dec_slot.reset();
         else { ggml_free(g.ctx); g.ctx = nullptr; }
@@ -1137,8 +1270,12 @@ bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
         ggml_backend_tensor_set(dg->mm_pos_in, mm_pos->data(), 0,
                                 sizeof(int) * mm_pos->size());
     }
-    if (ggml_backend_graph_compute(backend, dg->gf) != GGML_STATUS_SUCCESS) {
+    if (split_mode ? (split_sched.run(dg->gf) != true)
+                   : (ggml_backend_graph_compute(backend, dg->gf)
+                      != GGML_STATUS_SUCCESS)) {
         fprintf(stderr, "nemotronomni: text compute failed\n");
+        if (reuse_graph) dec_slot.reset();
+        else { ggml_free(g.ctx); g.ctx = nullptr; }
         return false;
     }
     ggml_tensor * lg = ggml_graph_get_tensor(dg->gf, "logits");
@@ -1255,8 +1392,37 @@ bool NemotronOmni::generate(const std::vector<int> & ids, const vqa::GenParams &
         }
         if (step + 1 >= max_new) break;
         const int p = n_past;
-        if (!run_text(g, { cur }, { p }, logits)) return false;
+        if (ec_enabled && ec_ok && !getenv("NEMOTRONOMNI_EC_OFF")) {
+            // dynamic expert-cache decode path (the moe_decode driver's third
+            // consumer); ec_decode_step does not advance n_past (run_text does)
+            if (!ec_decode_step(cur, p, logits)) return false;
+            n_past = p + 1;
+        } else if (!run_text(g, { cur }, { p }, logits)) return false;
         cur = sample(logits, gp);
+    }
+    if (ec_enabled && ec_ok && ec_st.steps > 0) {
+        vqa::ExpertCacheStats stt;
+        for (auto & c : ec_caches) {
+            const vqa::ExpertCacheStats s = c.stats();
+            stt.hits += s.hits; stt.misses += s.misses; stt.evictions += s.evictions;
+            stt.swap_bytes += s.swap_bytes; stt.resident += s.resident; stt.n_slots += s.n_slots;
+        }
+        const uint64_t acc = stt.hits + stt.misses;
+        int in_flight = 0;
+        for (auto & c : ec_caches) in_flight += c.in_flight();
+        fprintf(stderr, "nemo ec: %d decode steps, %.1f ms/step (A %.2f + B %.2f"
+                " + swap-wait %.2f + readback %.2f), %.1f tok/s | cache:"
+                " %llu hits / %llu misses (%.1f%% hit), %llu evictions,"
+                " %.2f GB swapped, %d/%d slots resident, in_flight %d (async %s)\n",
+                ec_st.steps, ec_st.ms_fin / ec_st.steps, ec_st.ms_a / ec_st.steps,
+                ec_st.ms_b / ec_st.steps, ec_st.ms_swap / ec_st.steps,
+                ec_st.ms_rb / ec_st.steps,
+                (double)(ec_st.steps * 1000) / ec_st.ms_fin,
+                (unsigned long long)stt.hits, (unsigned long long)stt.misses,
+                acc ? 100.0 * (double)stt.hits / (double)acc : 0.0,
+                (unsigned long long)stt.evictions, stt.swap_bytes / 1e9,
+                stt.resident, stt.n_slots, in_flight,
+                ec_hooks.async_ok ? "on" : "off/v1");
     }
     return true;
 }
@@ -1390,6 +1556,10 @@ bool NemotronOmni::ask(const vqa::MediaInput & media, const std::string & prompt
     if (gp.on_stage) gp.on_stage("done", (int)out_ids.size(), (int)out_ids.size(), gp.on_stage_ud);
     return true;
 }
+
+// wave 5: expert-cache decode (the moe_decode driver's third consumer) +
+// the CUDA EC-split placement. Included inside namespace nemo on purpose.
+#include "nemotronomni_expert_decode.inc"
 
 }  // namespace nemo
 

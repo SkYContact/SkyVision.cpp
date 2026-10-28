@@ -19,6 +19,28 @@
 //   decode_step  - one token step: graph A per layer -> readback -> acquire
 //                  -> graph B -> graph C, with the optional hooks below
 //
+// Third-consumer extensions (nemotronomni hybrid decoder; all default to the
+// exact keye_vl/qwen3omni semantics, i.e. nullptr/3/false keeps this driver
+// bit-for-bit on the previous behavior):
+//   Hooks::moe_of          - driver layer -> MoE-slot index for non-uniform
+//                            stacks (nemotronomni interleaves Mamba2 /
+//                            attention / MoE layers); -1 marks a layer with no
+//                            routed experts: its graph A carries the WHOLE
+//                            layer and decode_step skips prefetch/acquire/
+//                            graph B for it (Hooks::attn_only must report true
+//                            there so hid passes through)
+//   Hooks::tensors_per_expert - 2 for non-gated experts (up/down only)
+//   Hooks::build_b         - replaces the fixed gated-SILU graph B for MoE
+//                            blocks the moe::build_expert_ffn[_table]_res
+//                            shapes cannot express (nemotronomni: relu^2
+//                            non-gated experts + dense shared expert, with the
+//                            standard path's exact reduction order)
+//   InitSpec::tensors_per_expert / InitSpec::budget_is_hard - cache side of
+//                            the above; budget_is_hard keeps the slot count
+//                            strictly budget-derived (the default raises it to
+//                            layers*K*2, which a 12 GB card cannot host next
+//                            to a 30B F16 model's dense weights)
+//
 // Hook call points inside decode_step (all optional, nullptr = skip):
 //   attn_only(il)          - true: skip the MoE for this layer (isolation
 //                            debugging; hid = the residual row)
@@ -93,6 +115,33 @@ struct Hooks {
     bool (*attn_only)(void * model, int il) = nullptr;
     void (*trace)(void * model, int il, int phase) = nullptr;
     bool (*layer_check)(void * model, int il, float * hid_io) = nullptr;
+    // ---- third-consumer extensions (nullptr / 0 = legacy semantics) --------
+    // driver layer -> MoE-slot index (caches/group space); nullptr = il maps
+    // 1:1 (uniform-MoE stacks). -1: the layer has no routed experts - its
+    // graph A computes the entire layer, decode_step skips the MoE half and
+    // attn_only(il) must return true for it (hid = the residual row).
+    const int * moe_of = nullptr;
+    int tensors_per_expert = 3;        // slot tensors per selected expert
+    // model-specific graph B: receives the per-layer scratch ctx + graph, the
+    // normed row (moe_in), the residual row (xmid_in), the acquired slot
+    // tensors ([K][tensors_per_expert], spec order) and the [K, T] F32 weight
+    // input; returns the final tensor to read back into hid (nullptr = fail).
+    // When set, the driver's default build (gate/up/down vectors + slot-table
+    // ids) is skipped entirely - the model owns the MoE math, including any
+    // cache table()/slot_index() use (slot ids stay valid: no further acquire
+    // happens before this call). Input leaves the hook creates must NOT be
+    // written here (no buffer yet before the alloc); stash them and upload in
+    // feed_b.
+    ggml_tensor * (*build_b)(void * model, int il, ggml_context * cb,
+                             ggml_cgraph * fb, ggml_tensor * moe_in,
+                             ggml_tensor * xmid_in,
+                             const std::vector<ggml_tensor *> & slots,
+                             ggml_tensor * w_in) = nullptr;
+    // optional: called right after the graph-B allocation, before the compute
+    // - the point where graph-input bytes can be uploaded (the driver feeds
+    // its own moe_in/xmid_in/w_in the same way; build_b stashes any input
+    // leaves it created on the model side keyed by il).
+    void (*feed_b)(void * model, int il) = nullptr;
 };
 
 struct State {
@@ -128,9 +177,15 @@ struct InitSpec {
     const char * log_tag = "ec";
     bool & enabled;                // caller's flag; cleared when unusable
     std::vector<vqa::ExpertCache> & caches;
-    std::vector<int> & group;      // out: layer -> group
+    std::vector<int> & group;      // layer -> group
     int & n_groups;                // out
     bool & async_ok;               // out
+    // ---- third-consumer extensions (defaults = legacy behavior) ------------
+    int tensors_per_expert = 3;    // expert = 2 tensors for non-gated FFNs
+    bool budget_is_hard = false;   // slots strictly from the budget: the legacy
+                                   // path raises n_want to layers*K*2 (276
+                                   // x 20 MB slots will not fit a 12 GB card
+                                   // beside a 30B F16 dense trunk)
 };
 
 inline bool init_grouped(InitSpec s) {
@@ -168,17 +223,21 @@ inline bool init_grouped(InitSpec s) {
 #endif
     }
     // group layers by their expert-tensor (type, shape) signature
+    const int NTE = s.tensors_per_expert > 0 ? s.tensors_per_expert : 3;
     std::vector<int> grp((size_t)s.n_layer, 0);
     int n_grp = 0;
     for (int l = 0; l < s.n_layer; l++) {
-        const ggml_tensor * ex[3] = { s.tensor(l, 0), s.tensor(l, 1), s.tensor(l, 2) };
+        std::vector<const ggml_tensor *> ex(NTE);
+        for (int t = 0; t < NTE; t++) ex[(size_t)t] = s.tensor(l, t);
         int g = -1;
         for (int l2 = 0; l2 < l; l2++) {
-            const ggml_tensor * ey[3] = { s.tensor(l2, 0), s.tensor(l2, 1), s.tensor(l2, 2) };
             bool same = true;
-            for (int t = 0; t < 3; t++)
-                if (ex[t]->type != ey[t]->type || ex[t]->ne[0] != ey[t]->ne[0]
-                    || ex[t]->ne[1] != ey[t]->ne[1]) { same = false; break; }
+            for (int t = 0; t < NTE; t++) {
+                const ggml_tensor * ey = s.tensor(l2, t);
+                if (ex[(size_t)t]->type != ey->type
+                    || ex[(size_t)t]->ne[0] != ey->ne[0]
+                    || ex[(size_t)t]->ne[1] != ey->ne[1]) { same = false; break; }
+            }
             if (same) { g = grp[(size_t)l2]; break; }
         }
         if (g < 0) g = n_grp++;
@@ -192,30 +251,31 @@ inline bool init_grouped(InitSpec s) {
         int first = -1, layers = 0;
         for (int l = 0; l < s.n_layer; l++)
             if (grp[(size_t)l] == g) { ++layers; if (first < 0) first = l; }
-        const ggml_tensor * ex0[3] = { s.tensor(first, 0), s.tensor(first, 1), s.tensor(first, 2) };
         vqa::ExpertCacheSpec spec;
         spec.n_layers = s.n_layer;
         spec.n_experts = s.n_expert;
-        spec.tensors_per_expert = 3;
-        spec.layer_base.assign((size_t)s.n_layer, std::vector<const uint8_t *>(3, nullptr));
-        spec.desc.resize(3);
+        spec.tensors_per_expert = NTE;
+        spec.layer_base.assign((size_t)s.n_layer,
+                               std::vector<const uint8_t *>(NTE, nullptr));
+        spec.desc.resize((size_t)NTE);
         size_t slot_bytes = 0, est_slot = 0;
-        for (int t = 0; t < 3; t++) {
-            spec.desc[(size_t)t].ne[0] = ex0[t]->ne[0];
-            spec.desc[(size_t)t].ne[1] = ex0[t]->ne[1];
+        for (int t = 0; t < NTE; t++) {
+            const ggml_tensor * ex0 = s.tensor(first, t);
+            spec.desc[(size_t)t].ne[0] = ex0->ne[0];
+            spec.desc[(size_t)t].ne[1] = ex0->ne[1];
             spec.desc[(size_t)t].ne[2] = 1;
             spec.desc[(size_t)t].ne[3] = 1;
-            spec.desc[(size_t)t].type = ex0[t]->type;
-            spec.desc[(size_t)t].host_stride = ggml_nbytes((ggml_tensor *)ex0[t]) / ex0[t]->ne[2];
+            spec.desc[(size_t)t].type = ex0->type;
+            spec.desc[(size_t)t].host_stride = ggml_nbytes((ggml_tensor *)ex0) / ex0->ne[2];
             slot_bytes += spec.desc[(size_t)t].host_stride;
             // the cache's internal slot estimate (elements x type size)
             // overcounts block-quants; rescaled via n_want below
-            est_slot += (size_t)ex0[t]->ne[0] * ex0[t]->ne[1]
-                      * ggml_type_size(ex0[t]->type);
+            est_slot += (size_t)ex0->ne[0] * ex0->ne[1]
+                      * ggml_type_size(ex0->type);
         }
         for (int l = 0; l < s.n_layer; l++) {
             if (grp[(size_t)l] != g) continue;
-            for (int t = 0; t < 3; t++)
+            for (int t = 0; t < NTE; t++)
                 spec.layer_base[(size_t)l][(size_t)t] =
                     (const uint8_t *) s.tensor(l, t)->data;
         }
@@ -229,7 +289,8 @@ inline bool init_grouped(InitSpec s) {
         int n_want = (int)(gbudget / slot_bytes);
         if (n_want > layers * s.n_expert) n_want = layers * s.n_expert;
         const int n_min = layers * s.n_expert_used * 2;   // a step pins 2x K
-        if (n_want < n_min) n_want = std::min(layers * s.n_expert, n_min);
+        if (!s.budget_is_hard && n_want < n_min)
+            n_want = std::min(layers * s.n_expert, n_min);
         if (!s.caches[(size_t)g].init(s.backend, spec, (size_t)n_want * est_slot)) {
             fprintf(stderr, "%s: ExpertCache init failed (group %d) -> falling back\n",
                     s.log_tag, g);
@@ -315,6 +376,15 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
     for (int il = 0; il < h.n_layer; il++) {
         vqa::StepGraph & sg = st.ga[(size_t)il];
         AIO & io = st.ga_io[(size_t)il];
+        // non-uniform stacks: moe_of maps the driver layer to its MoE slot
+        // (caches/group space); -1 = the layer carries no routed experts and
+        // graph A already computed the whole layer (incl. Mamba2 state writes)
+        const int moe_idx = h.moe_of ? h.moe_of[il] : il;
+        // skip evaluated BEFORE prefetch so a skipped layer's garbage router
+        // readback never warms the cache (legacy attn_only debug isolation
+        // moves with it - results unchanged, only cache warmth differs)
+        const bool skip_moe = moe_idx < 0
+                           || (h.attn_only && h.attn_only(model, il));
 
         // ---------------- graph A: fixed StepGraph, re-fed ----------------
         const auto ta0 = std::chrono::steady_clock::now();
@@ -351,53 +421,61 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
                          ? atoi(getenv(h.spec_env)) : 1;
             h.env_cached = true;
         }
-        if (h.async_ok && h.pf_off_cache == nullptr) {
+        if (!skip_moe && h.async_ok && h.pf_off_cache == nullptr) {
             const int spec = h.spec_cache;
             std::vector<std::pair<int, int>> pf;
-            for (int ke = 0; ke < K; ke++) pf.push_back({ il, sel_host[ke] });
-            const bool has_next = spec && il + 1 < h.n_layer
+            for (int ke = 0; ke < K; ke++) pf.push_back({ moe_idx, sel_host[ke] });
+            const int next_moe = h.moe_of && il + 1 < h.n_layer
+                               ? h.moe_of[il + 1] : il + 1;
+            const bool has_next = spec && next_moe >= 0
                                 && !st.prev_sel[(size_t)il + 1].empty();
             const bool next_same_grp = has_next
-                && (*h.group)[(size_t)il + 1] == (*h.group)[(size_t)il];
+                && (*h.group)[(size_t)next_moe] == (*h.group)[(size_t)moe_idx];
             if (next_same_grp)
-                for (int e : st.prev_sel[(size_t)il + 1]) pf.push_back({ il + 1, e });
-            (*h.caches)[(size_t)(*h.group)[(size_t)il]].prefetch(pf);
+                for (int e : st.prev_sel[(size_t)il + 1]) pf.push_back({ next_moe, e });
+            (*h.caches)[(size_t)(*h.group)[(size_t)moe_idx]].prefetch(pf);
             // next-layer pairs may belong to the other layout group's cache
             if (has_next && !next_same_grp) {
                 std::vector<std::pair<int, int>> pf2;
-                for (int e : st.prev_sel[(size_t)il + 1]) pf2.push_back({ il + 1, e });
-                (*h.caches)[(size_t)(*h.group)[(size_t)il + 1]].prefetch(pf2);
+                for (int e : st.prev_sel[(size_t)il + 1]) pf2.push_back({ next_moe, e });
+                (*h.caches)[(size_t)(*h.group)[(size_t)next_moe]].prefetch(pf2);
             }
         }
 
-        if (h.attn_only && h.attn_only(model, il)) {
-            hid = xmid_host;   // isolation: skip the MoE, pass the residual
+        if (skip_moe) {
+            hid = xmid_host;   // whole layer already in graph A / isolation
             continue;
         }
 
         // ---------------- graph B: the K slot experts ----------------
         const auto tsw0 = std::chrono::steady_clock::now();
+        const int NTE = h.tensors_per_expert > 0 ? h.tensors_per_expert : 3;
+        std::vector<ggml_tensor *> slots((size_t)NTE * (size_t)K);
         std::vector<ggml_tensor *> gate(K), up(K), down(K);
-        vqa::ExpertCache & ec_c = (*h.caches)[(size_t)(*h.group)[(size_t)il]];
-        // v3: with the table layout the K experts go through 3 mul_mat_id
-        // launches over the slot tables, and gate/up + GLU hit the CUDA
-        // fused pass
-        const bool ec_tbl_avail = ec_c.table(0) && ec_c.table(1) && ec_c.table(2);
+        vqa::ExpertCache & ec_c = (*h.caches)[(size_t)(*h.group)[(size_t)moe_idx]];
+        bool ec_tbl = false;
+        if (!h.build_b) {
+            // legacy path owns the slot-table pairing (3 gate/up/down tensors)
+            ec_tbl = ec_c.table(0) && ec_c.table(1) && ec_c.table(2);
+        }
         int ids_gu_host[16] = {}, ids_dn_host[16] = {};
-        bool ec_tbl = ec_tbl_avail;
         for (int ke = 0; ke < K; ke++) {
-            std::vector<ggml_tensor *> sl = ec_c.acquire(il, sel_host[ke]);
-            if (sl.size() != 3) {
+            std::vector<ggml_tensor *> sl = ec_c.acquire(moe_idx, sel_host[ke]);
+            if ((int)sl.size() != NTE) {
                 fprintf(stderr, "%s: acquire failed (layer %d expert %d)\n",
                         h.log_tag, il, sel_host[ke]);
                 return false;
             }
-            gate[(size_t)ke] = sl[1];
-            up[(size_t)ke]   = sl[0];
-            down[(size_t)ke] = sl[2];
-            ids_gu_host[ke] = ec_c.slot_index(sl[1]);   // gate/up ids
-            ids_dn_host[ke] = ec_c.slot_index(sl[2]);   // down ids
-            if (ids_gu_host[ke] < 0 || ids_dn_host[ke] < 0) ec_tbl = false;
+            for (int t = 0; t < NTE; t++)
+                slots[(size_t)ke * NTE + (size_t)t] = sl[(size_t)t];
+            if (!h.build_b) {   // spec order: 0 up / 1 gate / 2 down
+                gate[(size_t)ke] = sl[1];
+                up[(size_t)ke]   = sl[0];
+                down[(size_t)ke] = sl[2];
+                ids_gu_host[ke] = ec_c.slot_index(sl[1]);   // gate/up ids
+                ids_dn_host[ke] = ec_c.slot_index(sl[2]);   // down ids
+                if (ids_gu_host[ke] < 0 || ids_dn_host[ke] < 0) ec_tbl = false;
+            }
         }
         st.ms_swap += ms_since(tsw0);
         st.prev_sel[(size_t)il].assign(sel_host, sel_host + K);
@@ -410,23 +488,35 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
         ggml_tensor * xmid_in = ggml_new_tensor_2d(cb, GGML_TYPE_F32, D, T);
         ggml_tensor * w_in = ggml_new_tensor_2d(cb, GGML_TYPE_F32, K, T);
 
-        ggml_tensor * ids_gu_in = nullptr, * ids_dn_in = nullptr;
         ggml_tensor * hout;
-        if (ec_tbl) {
-            ids_gu_in = ggml_new_tensor_2d(cb, GGML_TYPE_I32, K, T);
-            ids_dn_in = ggml_new_tensor_2d(cb, GGML_TYPE_I32, K, T);
-            hout = vqa::moe::build_expert_ffn_table_res(cb, fb, moe_in, xmid_in,
-                    ec_c.table(1), ec_c.table(0), ec_c.table(2),
-                    ids_gu_in, ids_dn_in, w_in, GGML_UNARY_OP_SILU);
+        ggml_tensor * ids_gu_in = nullptr, * ids_dn_in = nullptr;
+        if (h.build_b) {
+            // model-specific MoE math (non-gated / shared-expert shapes);
+            // the ids readback contract: slot ids are read inside the hook,
+            // before any further acquire touches the cache
+            hout = h.build_b(model, il, cb, fb, moe_in, xmid_in, slots, w_in);
+            if (!hout) {
+                fprintf(stderr, "%s: build_b failed (layer %d)\n", h.log_tag, il);
+                ggml_free(cb);
+                return false;
+            }
         } else {
-            hout = vqa::moe::build_expert_ffn_res(cb, fb, moe_in, xmid_in,
-                                                  gate, up, down, w_in,
-                                                  GGML_UNARY_OP_SILU);
-        }
-        if (!hout) {
-            fprintf(stderr, "%s: build_expert_ffn failed (layer %d)\n", h.log_tag, il);
-            ggml_free(cb);
-            return false;
+            if (ec_tbl) {
+                ids_gu_in = ggml_new_tensor_2d(cb, GGML_TYPE_I32, K, T);
+                ids_dn_in = ggml_new_tensor_2d(cb, GGML_TYPE_I32, K, T);
+                hout = vqa::moe::build_expert_ffn_table_res(cb, fb, moe_in, xmid_in,
+                        ec_c.table(1), ec_c.table(0), ec_c.table(2),
+                        ids_gu_in, ids_dn_in, w_in, GGML_UNARY_OP_SILU);
+            } else {
+                hout = vqa::moe::build_expert_ffn_res(cb, fb, moe_in, xmid_in,
+                                                      gate, up, down, w_in,
+                                                      GGML_UNARY_OP_SILU);
+            }
+            if (!hout) {
+                fprintf(stderr, "%s: build_expert_ffn failed (layer %d)\n", h.log_tag, il);
+                ggml_free(cb);
+                return false;
+            }
         }
         if (h.trace) h.trace(model, il, 2);
         const auto tb0 = std::chrono::steady_clock::now();
@@ -439,10 +529,11 @@ inline bool decode_step(Hooks & h, State & st, void * model, const void * step_c
         ggml_backend_tensor_set(moe_in, m_host.data(), 0, sizeof(float) * D);
         ggml_backend_tensor_set(xmid_in, xmid_host.data(), 0, sizeof(float) * D);
         ggml_backend_tensor_set(w_in, w8_host, 0, sizeof(float) * K);
-        if (ec_tbl) {   // slot ids are valid only until the next acquire
+        if (ids_gu_in) {   // slot ids are valid only until the next acquire
             ggml_backend_tensor_set(ids_gu_in, ids_gu_host, 0, sizeof(int) * K);
             ggml_backend_tensor_set(ids_dn_in, ids_dn_host, 0, sizeof(int) * K);
         }
+        if (h.feed_b) h.feed_b(model, il);
         if (h.trace) h.trace(model, il, 4);
         if (ggml_backend_graph_compute(h.backend, fb) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: graph B compute failed (layer %d)\n", h.log_tag, il);

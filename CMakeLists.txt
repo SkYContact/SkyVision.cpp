@@ -387,6 +387,9 @@ add_executable(nemotronomni-seg-test tools/nemotronomni_seg_test.cpp
     src/models/nemotronomni/nemotronomni_audio.cpp
     src/models/nemotronomni/nemotronomni_model.cpp
     src/core/engine/backend.cpp
+    src/core/engine/expert_cache.cpp
+    src/core/engine/moe_compute.cpp
+    src/core/engine/step_graph.cpp
     src/core/text/tokenizer.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp
     src/core/util/mmap.cpp)
 target_include_directories(nemotronomni-seg-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/nemotronomni)
