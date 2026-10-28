@@ -265,10 +265,12 @@ set(NEMOTRON_PARSE_SRC
     src/models/nemotron_parse/nemotron_parse_model.cpp)
 
 #   src/models/nemotronomni/ NVIDIA Nemotron-3-Nano-Omni-30B-A3B (Mamba2/NoPE
-#                           GQA/MoE hybrid trunk; text chain first, vision and
-#                           audio towers staged)
+#                           GQA/MoE hybrid trunk + C-RADIOv4-H vision tower +
+#                           Parakeet/FastConformer audio tower)
 set(NEMOTRONOMNI_SRC
-    src/models/nemotronomni/nemotronomni_model.cpp)
+    src/models/nemotronomni/nemotronomni_model.cpp
+    src/models/nemotronomni/nemotronomni_vision.cpp
+    src/models/nemotronomni/nemotronomni_audio.cpp)
 
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
@@ -306,7 +308,7 @@ if (TARGET ggml-cuda)
     target_include_directories(vqa-cli PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(vqa-cli PRIVATE CUDA::cudart)
 endif()
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse)
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse ${CMAKE_SOURCE_DIR}/src/models/nemotronomni)
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(vqa-cli PRIVATE jpeg-static)
@@ -380,6 +382,9 @@ target_link_libraries(qwen3omni-c2w-test PRIVATE ggml ggml-cpu)
 #     weights through the three branch builders; the numpy comparison lives in
 #     nemotron3omni-port/3a/parity_nemotronomni_seg.py (outside the repo) ---
 add_executable(nemotronomni-seg-test tools/nemotronomni_seg_test.cpp
+    src/core/media/resample.cpp
+    src/models/nemotronomni/nemotronomni_vision.cpp
+    src/models/nemotronomni/nemotronomni_audio.cpp
     src/models/nemotronomni/nemotronomni_model.cpp
     src/core/engine/backend.cpp
     src/core/text/tokenizer.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp

@@ -297,5 +297,106 @@ inline bool log_mel_gemma(const std::vector<float> & wav, int fft_n, int frame_l
     return true;
 }
 
+// ------------------------------------------------------------- parakeet family
+//
+// transformers ParakeetFeatureExtractor (librosa slaney mel) family: torch
+// STFT semantics (center=True, constant pad), power spectrum, librosa slaney
+// filterbank computed at fp32, natural log(x + 2^-24). Numerically distinct
+// from both families above (they are log10-clamped whisper / HTK-magnitude
+// gemma); do not cross the wires. Used by the Nemotron-3-Omni audio tower.
+
+// librosa.filters.mel(sr, n_fft, n_mels, fmin, fmax, htk=False, norm="slaney")
+// at fp32. `fb` is row-major [n_mels, n_fft/2 + 1] (assign()s).
+inline void mel_filterbank_slaney(int n_mels, int fft_n, float fmin, float fmax, int sr,
+                                  std::vector<float> & fb) {
+    const int n_bins = fft_n / 2 + 1;
+    fb.assign((size_t)n_mels * n_bins, 0.0f);
+    // slaney mel scale (all in float32, matching librosa's dtype)
+    const float f_sp = 200.0f / 3.0f;
+    const float min_log_hz = 1000.0f;
+    const float min_log_mel = (min_log_hz - fmin) / f_sp;
+    const float logstep = logf(6.4f) / 27.0f;
+    auto hz_to_mel_s = [&](float f) {
+        float m = (f - fmin) / f_sp;
+        if (f >= min_log_hz) m = min_log_mel + logf(f / min_log_hz) / logstep;
+        return m;
+    };
+    auto mel_to_hz_s = [&](float m) {
+        float f = fmin + f_sp * m;
+        if (m >= min_log_mel) f = min_log_hz * expf(logstep * (m - min_log_mel));
+        return f;
+    };
+    // n_mels + 2 corner frequencies (librosa linspace over the mel axis)
+    const float m_lo = hz_to_mel_s(fmin), m_hi = hz_to_mel_s(fmax);
+    std::vector<float> mpts((size_t)n_mels + 2), fpts((size_t)n_mels + 2);
+    for (int i = 0; i < n_mels + 2; i++) {
+        const float m = m_lo + (float)i * (m_hi - m_lo) / (float)(n_mels + 1);
+        mpts[(size_t)i] = m;
+        fpts[(size_t)i] = mel_to_hz_s(m);
+    }
+    std::vector<float> bins((size_t)n_bins);
+    for (int b = 0; b < n_bins; b++) bins[(size_t)b] = (float)((double)sr / 2.0 * (double)b / (double)(fft_n / 2));
+    for (int m = 0; m < n_mels; m++) {
+        const float fl = fpts[(size_t)m], fc = fpts[(size_t)m + 1], fh = fpts[(size_t)m + 2];
+        const float enorm = 2.0f / (fh - fl);        // slaney norm
+        float * row = fb.data() + (size_t)m * n_bins;
+        for (int b = 0; b < n_bins; b++) {
+            const float lower = (bins[(size_t)b] - fl) / (fc - fl);
+            const float upper = (fh - bins[(size_t)b]) / (fh - fc);
+            row[b] = std::max(0.0f, std::min(lower, upper)) * enorm;
+        }
+    }
+}
+
+// ParakeetFeatureExtractor.__call__ on one mono clip: preemphasis 0.97 inside
+// the valid length, torch.stft(center=True, pad_mode="constant") power
+// spectrum (hann periodic=False, win 400, n_fft 512, hop 160), slaney
+// filterbank, log(x + 2^-24). Output [T, n_mels] row-major PER FRAME
+// (mel[t * n_mels + j]); T = 1 + n_samples / hop. No CMVN here - pair with
+// the caller's per-utterance CMVN over the valid frames.
+inline void log_mel_parakeet(const float * pcm, int n_samples, int n_fft, int hop,
+                             int win_length, int n_mels, float preemph,
+                             const float * fb, std::vector<float> & mel) {
+    // preemphasis (single clip: no batch padding, the timemask covers all L)
+    std::vector<float> x((size_t)n_samples);
+    if (n_samples > 0) x[0] = pcm[0];
+    for (int i = 1; i < n_samples; i++) x[(size_t)i] = pcm[i] - preemph * pcm[i - 1];
+
+    const int pad = n_fft / 2;
+    const int T = 1 + n_samples / hop;
+    mel.assign((size_t)T * n_mels, 0.0f);
+
+    // hann periodic=False (symmetric): 0.5 - 0.5 cos(2 pi i / (n-1))
+    std::vector<float> win((size_t)win_length);
+    for (int i = 0; i < win_length; i++)
+        win[(size_t)i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)(win_length - 1));
+
+    const int n_bins = n_fft / 2 + 1;
+    std::vector<float> re(n_fft), im(n_fft), pw(n_bins);
+    // torch.stft(win_length < n_fft): the window is CENTERED in the fft frame
+    // ((n_fft - win_length)/2 zeros on each side)
+    const int win_left = (n_fft - win_length) / 2;
+    for (int t = 0; t < T; t++) {
+        const int base = t * hop - pad;               // center=True constant pad
+        std::fill(re.begin(), re.end(), 0.0f);
+        std::fill(im.begin(), im.end(), 0.0f);
+        for (int j = 0; j < win_length; j++) {
+            const int idx = base + win_left + j;
+            const float s = (idx >= 0 && idx < n_samples) ? x[(size_t)idx] : 0.0f;
+            re[(size_t)(win_left + j)] = s * win[(size_t)j];
+        }
+        fft_radix2(re.data(), im.data(), n_fft);
+        for (int b = 0; b < n_bins; b++)
+            pw[(size_t)b] = re[(size_t)b] * re[(size_t)b] + im[(size_t)b] * im[(size_t)b];
+        float * row = mel.data() + (size_t)t * n_mels;
+        for (int m = 0; m < n_mels; m++) {
+            double sum = 0.0;
+            const float * frow = fb + (size_t)m * n_bins;
+            for (int b = 0; b < n_bins; b++) sum += (double)frow[b] * (double)pw[(size_t)b];
+            row[m] = logf((float)sum + 6.103515625e-08f);   // + 2^-24
+        }
+    }
+}
+
 }  // namespace audio
 }  // namespace vqa

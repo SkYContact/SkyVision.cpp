@@ -82,8 +82,13 @@
 // with synthetic weights and compared against numpy references. Wave 3b wired
 // the real GGUF (metadata-conformant loader, checkpoint-side tokenizer,
 // registry row, ChatML/raw ask()): the text end-to-end chain matches the
-// official-stack oracle on prefill logits and greedy generation. Vision/audio
-// towers and EC expert residency stay with wave 4.
+// official-stack oracle on prefill logits and greedy generation.
+//
+// Wave-4 scope: C-RADIOv4-H vision tower (nemotronomni_vision.*) and Parakeet
+// audio tower (nemotronomni_audio.*) with oracle parity at every stage, media
+// injection in ask() (<image>/<so_embedding> expansion + set_rows embedding
+// swap, NoPE sequential positions) and the partial84 RoPE A/B kept compilable
+// (NEMOTRONOMNI_ROPE=partial84) for the closing ruling experiment.
 #include "core/vqa.hpp"
 
 #include "ggml-alloc.h"
@@ -106,6 +111,8 @@
 #include "core/runtime/load_util.hpp"
 #include "core/engine/weight_load.hpp"
 #include "nemotronomni_text.hpp"
+#include "nemotronomni_vision.hpp"
+#include "nemotronomni_audio.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -377,6 +384,7 @@ struct TextGraph {
     ggml_cgraph * gf = nullptr;
     ggml_tensor *tok_in = nullptr, *pos_in = nullptr, *mask_in = nullptr;
     ggml_tensor *ssm_ids = nullptr;
+    ggml_tensor *mm_in = nullptr, *mm_pos_in = nullptr;   // media rows (prefill only)
     ggml_tensor *logits = nullptr;
 };
 
@@ -396,17 +404,29 @@ public:
 private:
     bool init_backend();
     bool load_weights(const char * path);
+    bool load_towers();
     bool alloc_state();
-    bool build_text_graph(TextGraph & g, int T, int S, bool logits_all = false);
+    bool build_text_graph(TextGraph & g, int T, int S, bool logits_all = false,
+                          int n_mm = 0);
     bool run_text(TextGraph & g, const std::vector<int> & toks,
-                  const std::vector<int> & pos, std::vector<float> & logits_out);
+                  const std::vector<int> & pos, std::vector<float> & logits_out,
+                  const std::vector<float> * mm_feats = nullptr,
+                  const std::vector<int> * mm_pos = nullptr);
     bool generate(const std::vector<int> & ids, const vqa::GenParams & gp,
-                  std::vector<int> & out_ids, std::string & out_text);
+                  std::vector<int> & out_ids, std::string & out_text,
+                  const std::vector<float> * mm_feats = nullptr,
+                  const std::vector<int> * mm_pos = nullptr);
     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
     void dump(ggml_cgraph * gf, const char * name);
 
     vqa::Capabilities caps_;
     vqa::Tokenizer tok_;
+
+    // media towers (wave 4): C-RADIOv4-H vision + Parakeet audio
+    RadioTower vt;
+    ParakeetTower at;
+    int id_image = 18;                // <image> placeholder (config img_context_token_id)
+    int id_sound = 27;                // <so_embedding> (config sound_context_token_id)
 
     // real-checkpoint dims (arch-spec §2); the GGUF metadata overrides
     int n_layer = 52, n_embd = 2688, n_head = 32, n_kv_head = 2, head_dim = 128;
@@ -520,6 +540,10 @@ bool NemotronOmni::load(const std::string & gguf_path, const std::string & token
     }
     if (!kv.alloc(backend, n_attn, n_kv_head, head_dim, n_ctx)) return false;
     if (!alloc_state()) return false;
+    // wave 4: media towers (metadata-guarded; a text-only GGUF still loads)
+    vqa::assign_token_ids(tok_, { { "<image>", &id_image },
+                                  { "<so_embedding>", &id_sound } });
+    if (!load_towers()) return false;
     fprintf(stderr, "nemotronomni: %d layers d=%d (%d mamba / %d attn / %d moe),"
                     " experts %d/%d+%d x%.2f, ssm %dx%d g%d s%d%s%s eos=%d\n",
             n_layer, n_embd, n_mamba, n_attn, n_layer - n_mamba - n_attn,
@@ -611,6 +635,30 @@ bool NemotronOmni::load_weights(const char * path) {
     }
 
     vqa::weights::bind_from_mmap(gu, wctx, mm);
+
+    // wave 4 tower dims + preprocessing stats (tensors bind in load_towers,
+    // which runs after bind_to_backend put the weights on the backend)
+    vt.n_layer = vqa::gguf::u32(gu, "nemotronomni.vision.block_count", vt.n_layer);
+    vt.n_embd  = vqa::gguf::u32(gu, "nemotronomni.vision.embedding_length", vt.n_embd);
+    vt.n_head  = vqa::gguf::u32(gu, "nemotronomni.vision.attention.head_count", vt.n_head);
+    vt.n_ff    = vqa::gguf::u32(gu, "nemotronomni.vision.feed_forward_length", vt.n_ff);
+    vt.patch   = vqa::gguf::u32(gu, "nemotronomni.vision.patch_size", vt.patch);
+    vt.ln_eps  = vqa::gguf::f32(gu, "nemotronomni.vision.layer_norm_epsilon", vt.ln_eps);
+    at.n_layer = vqa::gguf::u32(gu, "nemotronomni.audio.block_count", at.n_layer);
+    at.d_model = vqa::gguf::u32(gu, "nemotronomni.audio.embedding_length", at.d_model);
+    at.n_head  = vqa::gguf::u32(gu, "nemotronomni.audio.attention.head_count", at.n_head);
+    at.n_mel   = vqa::gguf::u32(gu, "nemotronomni.audio.num_mel_bins", at.n_mel);
+    {
+        const int64_t idm = gguf_find_key(gu, "nemotronomni.vision.image_mean");
+        const int64_t ids = gguf_find_key(gu, "nemotronomni.vision.image_std");
+        if (idm >= 0 && gguf_get_kv_type(gu, idm) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_n(gu, idm) == 3)
+            memcpy(vt.img_mean, gguf_get_arr_data(gu, idm), 3 * sizeof(float));
+        if (ids >= 0 && gguf_get_kv_type(gu, ids) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_n(gu, ids) == 3)
+            memcpy(vt.img_std, gguf_get_arr_data(gu, ids), 3 * sizeof(float));
+    }
+
     gguf_free(gu);
 
     // 2D tensors the graphs use inside elementwise ops need plain F32 rows
@@ -631,6 +679,11 @@ bool NemotronOmni::load_weights(const char * path) {
         const std::string aname = pre + (has_a ? "ssm_a" : "ssm_a_log");
         if (ggml_get_tensor(wctx, aname.c_str())) extra.push_back(aname);
     }
+    // audio subsampling output projection: its input is the RAW conv flatten
+    // (unnormalized, |x| up to ~7e5), which overflows F16 in mul_mat's F16
+    // activation path - this 2D weight rides along the F32 promotion
+    if (ggml_get_tensor(wctx, "a.sub.proj.weight"))
+        extra.push_back("a.sub.proj.weight");
     for (const std::string & s : extra) extra_names.push_back(s.c_str());
     extra_names.push_back(nullptr);
     vqa::weights::promote_1d_to_f32(wctx, host_f32_storage, extra_names.data());
@@ -757,6 +810,134 @@ bool NemotronOmni::load_weights(const char * path) {
     return true;
 }
 
+// wave 4: bind the vision/audio tower tensors. A text-only GGUF (no v./a./mm.
+// tensors) skips cleanly so the wave-3 regression surface keeps loading.
+// Tower dims + image stats were read off the metadata in load_weights (the
+// gguf handle is gone by the time this runs).
+bool NemotronOmni::load_towers() {
+    auto gt = [&](const char * n) -> ggml_tensor * {
+        ggml_tensor * t = ggml_get_tensor(wctx, n);
+        if (!t) fprintf(stderr, "nemotronomni tower: missing tensor %s\n", n);
+        return t;
+    };
+    vt.allocr = allocr;
+    at.allocr = allocr;
+    if (!ggml_get_tensor(wctx, "v.patch_embd.weight")) {
+        fprintf(stderr, "nemotronomni towers: no media tensors in this GGUF"
+                        " (text-only build)\n");
+        return true;
+    }
+    vt.patch_w = gt("v.patch_embd.weight");
+    vt.cls_tok = gt("v.cls_token.weight");
+    vt.pos_embd = gt("v.pos_embd.weight");
+    vt.mm_ln = gt("mm.ln");
+    vt.mm_fc0 = gt("mm.fc0.weight");
+    vt.mm_fc1 = gt("mm.fc1.weight");
+    if (!vt.patch_w || !vt.cls_tok || !vt.pos_embd || !vt.mm_ln || !vt.mm_fc0 || !vt.mm_fc1)
+        return false;
+    vt.vl.resize((size_t)vt.n_layer);
+    for (int i = 0; i < vt.n_layer; i++) {
+        char b[96];
+        auto g = [&](const char * suf) {
+            snprintf(b, sizeof(b), "v.blk.%d.%s", i, suf);
+            return gt(b);
+        };
+        RadioVLayer & L = vt.vl[(size_t)i];
+        L.ln1_w = g("ln1.weight"); L.ln1_b = g("ln1.bias");
+        L.wqkv  = g("wqkv.weight"); L.bqkv  = g("bqkv");
+        L.wo    = g("wo.weight");  L.bo    = g("bo");
+        L.ln2_w = g("ln2.weight"); L.ln2_b = g("ln2.bias");
+        L.fc0_w = g("fc0.weight"); L.fc0_b = g("fc0.bias");
+        L.fc1_w = g("fc1.weight"); L.fc1_b = g("fc1.bias");
+        if (!L.ln1_w || !L.ln1_b || !L.wqkv || !L.bqkv || !L.wo || !L.bo ||
+            !L.ln2_w || !L.ln2_b || !L.fc0_w || !L.fc0_b || !L.fc1_w || !L.fc1_b)
+            return false;
+    }
+    // mean/std for the pixel normalization: read off the metadata in
+    // load_weights (stashed into vt.img_mean/img_std already)
+
+    // ---- audio (Parakeet) ----------------------------------------------------
+    at.al.resize((size_t)at.n_layer);
+    for (int i = 0; i < at.n_layer; i++) {
+        char b[96];
+        auto g = [&](const char * suf) {
+            snprintf(b, sizeof(b), "a.blk.%d.%s", i, suf);
+            return gt(b);
+        };
+        ParakeetBlk & L = at.al[(size_t)i];
+        L.ln_ff1_w = g("ln_ff1.weight"); L.ln_ff1_b = g("ln_ff1.bias");
+        L.ff1_w1 = g("ff1.w1");          L.ff1_w2 = g("ff1.w2");
+        L.ln_att_w = g("ln_att.weight"); L.ln_att_b = g("ln_att.bias");
+        L.att_q = g("att.q"); L.att_k = g("att.k");
+        L.att_v = g("att.v"); L.att_o = g("att.o");
+        L.att_rel_k = g("att.rel_k");
+        L.bias_u = g("att.bias_u"); L.bias_v = g("att.bias_v");
+        L.ln_conv_w = g("ln_conv.weight"); L.ln_conv_b = g("ln_conv.bias");
+        L.conv_pw1 = g("conv.pw1"); L.conv_pw2 = g("conv.pw2");
+        L.conv_dw_raw = g("conv.dw");
+        L.bn_w = g("conv.bn.weight"); L.bn_b = g("conv.bn.bias");
+        L.bn_mean = g("conv.bn.mean"); L.bn_var = g("conv.bn.var");
+        L.ln_ff2_w = g("ln_ff2.weight"); L.ln_ff2_b = g("ln_ff2.bias");
+        L.ff2_w1 = g("ff2.w1");          L.ff2_w2 = g("ff2.w2");
+        L.ln_out_w = g("ln_out.weight"); L.ln_out_b = g("ln_out.bias");
+        if (!L.ln_ff1_w || !L.ln_ff1_b || !L.ff1_w1 || !L.ff1_w2 ||
+            !L.ln_att_w || !L.ln_att_b || !L.att_q || !L.att_k || !L.att_v ||
+            !L.att_o || !L.att_rel_k || !L.bias_u || !L.bias_v ||
+            !L.ln_conv_w || !L.ln_conv_b || !L.conv_pw1 || !L.conv_dw_raw ||
+            !L.bn_w || !L.bn_b || !L.bn_mean || !L.bn_var || !L.conv_pw2 ||
+            !L.ln_ff2_w || !L.ln_ff2_b || !L.ff2_w1 || !L.ff2_w2 ||
+            !L.ln_out_w || !L.ln_out_b)
+            return false;
+    }
+    at.sub_proj_w = gt("a.sub.proj.weight");
+    at.sub_proj_b = gt("a.sub.proj.bias");
+    at.proj_ln = gt("a.proj.ln");
+    at.proj_fc1 = gt("a.proj.fc1");
+    at.proj_fc2 = gt("a.proj.fc2");
+    ggml_tensor * s0w = gt("a.sub.0.weight"); ggml_tensor * s0b = gt("a.sub.0.bias");
+    ggml_tensor * s1d = gt("a.sub.1.weight"); ggml_tensor * s1db = gt("a.sub.1.bias");
+    ggml_tensor * s1p = gt("a.sub.2.weight"); ggml_tensor * s1pb = gt("a.sub.2.bias");
+    ggml_tensor * s2d = gt("a.sub.3.weight"); ggml_tensor * s2db = gt("a.sub.3.bias");
+    ggml_tensor * s2p = gt("a.sub.4.weight"); ggml_tensor * s2pb = gt("a.sub.4.bias");
+    if (!at.sub_proj_w || !at.sub_proj_b || !at.proj_ln || !at.proj_fc1 || !at.proj_fc2 ||
+        !s0w || !s0b || !s1d || !s1db || !s1p || !s1pb || !s2d || !s2db || !s2p || !s2pb)
+        return false;
+
+    // host F32 copies of the subsampling conv weights (the frontend runs on
+    // the host); the flat order matches the host loops' indexing directly.
+    // Converter layout: sub.0 = layers.0 (conv 1->256 3x3), sub.1 = layers.2
+    // (depthwise), sub.2 = layers.3 (pointwise), sub.3 = layers.5 (dw),
+    // sub.4 = layers.6 (pw) - ReLU slots 1/4/7 carry no tensors.
+    auto rd = [&](ggml_tensor * t, std::vector<float> & v) {
+        const size_t n = (size_t)ggml_nelements(t);
+        v.resize(n);
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, v.data(), 0, sizeof(float) * n);
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> h(n);
+            ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * n);
+            for (size_t i = 0; i < n; i++) v[i] = ggml_fp16_to_fp32(h[i]);
+        } else {
+            fprintf(stderr, "nemotronomni: unexpected sub-conv dtype %d\n", (int)t->type);
+            return false;
+        }
+        return true;
+    };
+    bool ok = rd(s0w, at.s0_w) && rd(s0b, at.s0_b) &&
+              rd(s1d, at.s1_dw) && rd(s1db, at.s1_dwb) &&
+              rd(s1p, at.s1_pw) && rd(s1pb, at.s1_pwb) &&
+              rd(s2d, at.s2_dw) && rd(s2db, at.s2_dwb) &&
+              rd(s2p, at.s2_pw) && rd(s2pb, at.s2_pwb) &&
+              at.fold_bn(backend);
+    if (!ok) return false;
+
+    vt.dump_dir = dump_dir;
+    fprintf(stderr, "nemotronomni towers: vision %dx%d h%d f%d p%d | audio %dx%d h%d"
+                    " mel%d\n", vt.n_layer, vt.n_embd, vt.n_head, vt.n_ff, vt.patch,
+            at.n_layer, at.d_model, at.n_head, at.n_mel);
+    return true;
+}
+
 bool NemotronOmni::alloc_state() {
     const int conv_dim = ssm_n_head * ssm_head_dim + 2 * ssm_n_group * ssm_d_state;
     // 2 scalar constants + 2 tensors per mamba layer
@@ -785,7 +966,8 @@ bool NemotronOmni::alloc_state() {
     return true;
 }
 
-bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all) {
+bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all,
+                                    int n_mm) {
     if (!dump_dir.empty()) vqa::dump::dump_registry_clear();
     struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, /*no_alloc*/ true };
     g.ctx = ggml_init(ip);
@@ -810,6 +992,18 @@ bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all
 
     ggml_tensor * x = ggml_get_rows(c, tok_embd, g.tok_in);           // [D, T]
     ggml_set_name(x, "emb");
+    if (n_mm > 0) {
+        // media rows (vision/audio tower embeddings) scattered onto their
+        // placeholder positions before the trunk; decode (n_mm == 0) never
+        // builds these, keeping the bucketed decode graph bit-identical
+        g.mm_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_mm);
+        ggml_set_name(g.mm_in, "mm_in");
+        ggml_set_input(g.mm_in);
+        g.mm_pos_in = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_mm);
+        ggml_set_name(g.mm_pos_in, "mm_pos_in");
+        ggml_set_input(g.mm_pos_in);
+        x = ggml_set_rows(c, ggml_dup(c, x), g.mm_in, g.mm_pos_in);
+    }
     ggml_tensor * pos_slot = g.pos_in;   // KV slot == absolute position
     ggml_tensor * pos_rope = rope_partial84 ? g.pos_in : nullptr;   // NoPE when null
 
@@ -880,11 +1074,18 @@ bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all
 }
 
 bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
-                            const std::vector<int> & pos, std::vector<float> & logits_out) {
+                            const std::vector<int> & pos, std::vector<float> & logits_out,
+                            const std::vector<float> * mm_feats,
+                            const std::vector<int> * mm_pos) {
     const int T = (int)toks.size();
     const int S = n_past + T;
     if (S > n_ctx) { fprintf(stderr, "context overflow (%d > %d)\n", S, n_ctx); return false; }
     if ((int)pos.size() != T) { fprintf(stderr, "pos/tok length mismatch\n"); return false; }
+    const int n_mm = mm_feats ? (mm_feats->size() / (size_t)n_embd) : 0;
+    if (n_mm > 0 && (T == 1 || !mm_pos || (int)mm_pos->size() != n_mm)) {
+        fprintf(stderr, "nemotronomni: media rows only fit a T>1 prefill\n");
+        return false;
+    }
 
     // decode (T == 1) runs on one persistent bucketed graph per KV window
     // (decode_graph.hpp); the !split_mode gate keeps the slot single-backend
@@ -912,7 +1113,7 @@ bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
             }))
             return false;
         dg = &dec_slot.g;
-    } else if (!build_text_graph(g, T, S, want_all)) {
+    } else if (!build_text_graph(g, T, S, want_all, n_mm)) {
         return false;
     }
     // split_mode never engages this wave; the EC wave swaps the alloc in for
@@ -930,6 +1131,12 @@ bool NemotronOmni::run_text(TextGraph & g, const std::vector<int> & toks,
     const int32_t ids0 = 0;
     if (dg->ssm_ids->buffer) ggml_backend_tensor_set(dg->ssm_ids, &ids0, 0, sizeof(int32_t));
     if (dg->mask_in->buffer) vqa::set_causal_mask(dg->mask_in, n_past, T);
+    if (n_mm > 0 && dg->mm_in->buffer) {
+        ggml_backend_tensor_set(dg->mm_in, mm_feats->data(), 0,
+                                sizeof(float) * mm_feats->size());
+        ggml_backend_tensor_set(dg->mm_pos_in, mm_pos->data(), 0,
+                                sizeof(int) * mm_pos->size());
+    }
     if (ggml_backend_graph_compute(backend, dg->gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "nemotronomni: text compute failed\n");
         return false;
@@ -991,7 +1198,9 @@ int NemotronOmni::sample(const std::vector<float> & logits, const vqa::GenParams
 }
 
 bool NemotronOmni::generate(const std::vector<int> & ids, const vqa::GenParams & gp,
-                            std::vector<int> & out_ids, std::string & out_text) {
+                            std::vector<int> & out_ids, std::string & out_text,
+                            const std::vector<float> * mm_feats,
+                            const std::vector<int> * mm_pos) {
     out_ids.clear();
     out_text.clear();
     if ((int)ids.size() >= n_ctx) {
@@ -1012,7 +1221,9 @@ bool NemotronOmni::generate(const std::vector<int> & ids, const vqa::GenParams &
     std::vector<float> logits;
     std::vector<int> pos(ids.size());
     for (size_t i = 0; i < ids.size(); i++) pos[i] = (int)i;
-    if (!run_text(g, ids, pos, logits)) return false;
+    // prefill carries the media rows (NoPE: positions stay a plain 0..T-1 walk;
+    // media tokens flow through the Mamba2/attention states like any token)
+    if (!run_text(g, ids, pos, logits, mm_feats, mm_pos)) return false;
     // with NEMOTRONOMNI_LOGITS_ALL the block is [vocab, T]: the distribution
     // of the next token is the LAST position's row
     auto last_row = [&]() {
@@ -1053,30 +1264,129 @@ bool NemotronOmni::generate(const std::vector<int> & ids, const vqa::GenParams &
 bool NemotronOmni::ask(const vqa::MediaInput & media, const std::string & prompt,
                        const std::string & mode, const vqa::GenParams & gp,
                        std::string & out_text) {
-    if (!media.empty() || media.has_audio()) {
-        fprintf(stderr, "nemotronomni: vision/audio towers land with wave 4;"
-                        " text-only for now\n");
-        return false;
+    // ---- wave 4: media towers ------------------------------------------------
+    // NEMOTRONOMNI_TOWER_ONLY=1: encode + parity dumps, no generation
+    const bool tower_only = getenv("NEMOTRONOMNI_TOWER_ONLY") != nullptr;
+    std::vector<float> mm_feats;
+    std::vector<int> mm_pos;
+    size_t n_img_feat = 0, n_aud_feat = 0;
+    int img_tokens = 0, aud_tokens = 0;
+    std::vector<float> vfeats, afeats;
+
+    if (!media.empty()) {
+        if (media.frames.size() != 1) {
+            fprintf(stderr, "nemotronomni: video tubelets land with a later wave;"
+                            " one image frame only\n");
+            return false;
+        }
+        std::vector<float> pixels;
+        if (!vt.preprocess(media.frames[0].rgb.data(), media.width, media.height,
+                           pixels))
+            return false;
+        if (!vt.encode(backend, pixels, vfeats,
+                       tower_only || !dump_dir.empty() ? dump_dir.c_str() : nullptr))
+            return false;
+        img_tokens = vt.n_tok;
+        n_img_feat = vfeats.size();
     }
-    // mode "raw": the prompt is already the full continuation text (oracle
-    // parity path - no chat template, no BOS). Otherwise ChatML with the
-    // checkpoint's default template: empty system preamble + thinking on
-    // (chat_template.jinja add_generation_prompt/enable_thinking defaults).
-    std::string text;
+    if (media.has_audio()) {
+        if (media.sample_rate != 16000) {
+            fprintf(stderr, "nemotronomni: audio must be 16 kHz (got %d)\n",
+                    media.sample_rate);
+            return false;
+        }
+        int n_aud = 0;
+        if (!at.encode(backend, media.audio.data(), (int)media.audio.size(), afeats,
+                       &n_aud, tower_only || !dump_dir.empty() ? dump_dir.c_str() : nullptr))
+            return false;
+        aud_tokens = n_aud;
+        n_aud_feat = afeats.size();
+    }
+    if (tower_only) {
+        fprintf(stderr, "nemotronomni: TOWER_ONLY stop (image %d tok / audio %d tok)\n",
+                img_tokens, aud_tokens);
+        out_text.clear();
+        if (gp.on_stage) gp.on_stage("done", 0, 0, gp.on_stage_ud);
+        return true;
+    }
+
+    // ---- placeholder expansion (processing.py semantics) --------------------
+    //   <image>        -> <img> + N x <image> + </img>          (N = wp*hp/4)
+    //   <so_embedding> -> <so_start> + N x <so_embedding> + <so_end>
+    //                                                    (N = ceil^3(1 + L//160))
+    std::string text = prompt;
+    {
+        const size_t n_img_ph = [&] {
+            size_t n = 0, p = 0;
+            while ((p = text.find("<image>", p)) != std::string::npos) { n++; p += 7; }
+            return n;
+        }();
+        const size_t n_snd_ph = [&] {
+            size_t n = 0, p = 0;
+            while ((p = text.find("<so_embedding>", p)) != std::string::npos) { n++; p += 14; }
+            return n;
+        }();
+        if (n_img_ph > 1 || n_snd_ph > 1) {
+            fprintf(stderr, "nemotronomni: one image clip / one audio clip per"
+                            " request\n");
+            return false;
+        }
+        if ((n_img_ph && img_tokens <= 0) || (n_snd_ph && aud_tokens <= 0)) {
+            fprintf(stderr, "nemotronomni: media placeholder without matching"
+                            " media input\n");
+            return false;
+        }
+        size_t pos;
+        if (n_img_ph && (pos = text.find("<image>")) != std::string::npos) {
+            std::string expanded = text.substr(0, pos) + "<img>";
+            for (int k = 0; k < img_tokens; k++) expanded += "<image>";
+            expanded += "</img>" + text.substr(pos + 7);
+            text = expanded;
+        }
+        if (n_snd_ph && (pos = text.find("<so_embedding>")) != std::string::npos) {
+            std::string expanded = text.substr(0, pos) + "<so_start>";
+            for (int k = 0; k < aud_tokens; k++) expanded += "<so_embedding>";
+            expanded += "<so_end>" + text.substr(pos + 14);
+            text = expanded;
+        }
+    }
+
+    // ---- ChatML (same defaults as the text path: empty system, thinking on)
+    std::string full;
     if (mode == "raw") {
-        text = gp.history + prompt;
+        full = gp.history + text;
     } else {
-        text = gp.history + "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n" +
-               prompt + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        full = gp.history + "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n" +
+               text + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
     }
-    const std::vector<int> ids = tok_.encode(text);
+    const std::vector<int> ids = tok_.encode(full);
     if (getenv("NEMOTRONOMNI_DUMP_IDS")) {
         fprintf(stderr, "nemotronomni prompt ids (%zu):", ids.size());
         for (int id : ids) fprintf(stderr, " %d", id);
         fprintf(stderr, "\n");
     }
+    // placeholder positions in token order == tower feature order
+    int n_img = 0, n_snd = 0;
+    for (int id : ids) {
+        if (id == id_image) n_img++;
+        else if (id == id_sound) n_snd++;
+    }
+    if (n_img != img_tokens || n_snd != aud_tokens) {
+        fprintf(stderr, "nemotronomni: placeholder mismatch: %d/%d image, %d/%d"
+                        " audio\n", n_img, img_tokens, n_snd, aud_tokens);
+        return false;
+    }
+    mm_feats.reserve(n_img_feat + n_aud_feat);
+    mm_pos.reserve((size_t)(n_img + n_snd));
+    mm_feats.insert(mm_feats.end(), vfeats.begin(), vfeats.end());
+    mm_feats.insert(mm_feats.end(), afeats.begin(), afeats.end());
+    for (size_t i = 0; i < ids.size(); i++)
+        if (ids[i] == id_image || ids[i] == id_sound) mm_pos.push_back((int)i);
     std::vector<int> out_ids;
-    if (!generate(ids, gp, out_ids, out_text)) return false;
+    if (!generate(ids, gp, out_ids, out_text,
+                  mm_feats.empty() ? nullptr : &mm_feats,
+                  mm_feats.empty() ? nullptr : &mm_pos))
+        return false;
     if (gp.on_stage) gp.on_stage("done", (int)out_ids.size(), (int)out_ids.size(), gp.on_stage_ud);
     return true;
 }

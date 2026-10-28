@@ -534,6 +534,102 @@ void resize_bicubic_torch(const float * src, int sh, int sw, int dh, int dw, int
     }
 }
 
+// torch F.interpolate(mode="bicubic", align_corners=False, antialias=True)
+// over an interleaved fp32 (sh,sw,C) buffer -> (dh,dw,C). Torch's CPU AA path
+// (HelperInterpBase::_compute_index_ranges_weights) is the PIL-style filter:
+// center = scale*(dst+0.5), support widened only on a shrinking axis,
+// filter args (j - center + 0.5) * invscale with the a = -0.5 Keys kernel,
+// weights normalized per output - exactly what build_aa_filters (pil 3)
+// already implements for the uint8 pipelines, minus the int16 quantization.
+// This is the Nemotron-3-Omni image preprocessing resize (image_processing.py
+// feeds the uint8->fp32 tensor through exactly this op).
+void resize_bicubic_torch_aa(const float * src, int sh, int sw, int dh, int dw, int C,
+                             std::vector<float> & out) {
+    out.assign((size_t)dh * dw * C, 0.0f);
+    if (sh == dh && sw == dw) { memcpy(out.data(), src, sizeof(float) * (size_t)sh * sw * C); return; }
+
+    std::vector<Filter> fh, fv;
+    build_aa_filters(sw, dw, fh, /*pil_resample=*/3);
+    build_aa_filters(sh, dh, fv, /*pil_resample=*/3);
+
+    std::vector<float> tmp((size_t)dh * dw * C);
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < dw; x++) {
+            const Filter & f = fh[(size_t)x];
+            for (int c = 0; c < C; c++) {
+                double acc = 0;
+                for (size_t k = 0; k < f.w.size(); k++) {
+                    int xi = f.start + (int)k;
+                    xi = std::min(std::max(xi, 0), sw - 1);
+                    acc += f.w[k] * (double)src[((size_t)y * sw + xi) * C + c];
+                }
+                tmp[((size_t)y * dw + x) * C + c] = (float)acc;
+            }
+        }
+    }
+    for (int y = 0; y < dh; y++) {
+        const Filter & f = fv[(size_t)y];
+        for (int x = 0; x < dw; x++) {
+            for (int c = 0; c < C; c++) {
+                double acc = 0;
+                for (size_t k = 0; k < f.w.size(); k++) {
+                    int yi = f.start + (int)k;
+                    yi = std::min(std::max(yi, 0), sh - 1);
+                    acc += f.w[k] * (double)tmp[((size_t)yi * dw + x) * C + c];
+                }
+                out[((size_t)y * dw + x) * C + c] = (float)acc;
+            }
+        }
+    }
+}
+
+// torch F.interpolate(mode="bilinear", align_corners=False) of a (side, side,
+// dim) table onto (gh, gw): src = scale*(dst+0.5)-0.5 clamped at 0, two
+// clamped taps per axis. What the C-RADIO patch generator does to its learned
+// pos_embed before the window-select crop (vit_patch_generator.py
+// _get_pos_embeddings cpe-mode branch).
+void resize_bilinear_torch(const float * table, int side, int dim, int gh, int gw,
+                           std::vector<float>& out) {
+    out.assign((size_t)gh * gw * dim, 0.0f);
+    if (side == gh && side == gw) {
+        memcpy(out.data(), table, sizeof(float) * (size_t)side * side * dim);
+        return;
+    }
+    struct Axis { int i0; int i1; float lam0, lam1; };
+    auto make_axis = [](int in, int out_n) {
+        std::vector<Axis> ax(out_n);
+        const double scale = (double)in / (double)out_n;
+        for (int o = 0; o < out_n; o++) {
+            double real = ((double)o + 0.5) * scale - 0.5;
+            if (real < 0) real = 0;                      // bilinear clamps at 0
+            int i0 = (int)real;
+            if (i0 > in - 1) i0 = in - 1;
+            const float lam = (float)(real - i0);
+            ax[(size_t)o].i0 = i0;
+            ax[(size_t)o].i1 = i0 + 1 < in ? i0 + 1 : in - 1;
+            ax[(size_t)o].lam0 = 1.0f - lam;
+            ax[(size_t)o].lam1 = lam;
+        }
+        return ax;
+    };
+    const auto ay = make_axis(side, gh);
+    const auto ax_ = make_axis(side, gw);
+    for (int i = 0; i < gh; i++) {
+        for (int j = 0; j < gw; j++) {
+            const float * r00 = table + (size_t)(ay[(size_t)i].i0 * side + ax_[(size_t)j].i0) * dim;
+            const float * r01 = table + (size_t)(ay[(size_t)i].i0 * side + ax_[(size_t)j].i1) * dim;
+            const float * r10 = table + (size_t)(ay[(size_t)i].i1 * side + ax_[(size_t)j].i0) * dim;
+            const float * r11 = table + (size_t)(ay[(size_t)i].i1 * side + ax_[(size_t)j].i1) * dim;
+            float * o = out.data() + ((size_t)i * gw + j) * dim;
+            for (int d = 0; d < dim; d++) {
+                const float a = r00[d] * ay[(size_t)i].lam0 + r01[d] * ay[(size_t)i].lam1;
+                const float b = r10[d] * ay[(size_t)i].lam0 + r11[d] * ay[(size_t)i].lam1;
+                o[d] = a * ax_[(size_t)j].lam0 + b * ax_[(size_t)j].lam1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- pos table
 void interp_pos_grid(const float * table, int side, int dim, int gh, int gw,
                      std::vector<float>& out) {

@@ -62,6 +62,19 @@ void resize_bilinear_coeffs(const uint8_t * src, int sw, int sh, int sc,
 void resize_bicubic_torch(const float * src, int sh, int sw, int dh, int dw, int C,
                           std::vector<float>& out);
 
+// torch F.interpolate(mode="bicubic", align_corners=False, antialias=True)
+// (PIL-style a=-0.5 kernel, fp32 in/out, no uint8 rounding) of an interleaved
+// float (sh,sw,C) buffer -> (dh,dw,C). The Nemotron-3-Omni image
+// preprocessing resize (fp32 CHW-feed equivalent, interleaved here).
+void resize_bicubic_torch_aa(const float * src, int sh, int sw, int dh, int dw, int C,
+                             std::vector<float>& out);
+
+// torch F.interpolate(mode="bilinear", align_corners=False) of a
+// (side, side, dim) table onto (gh, gw), clamped taps. C-RADIO pos_embed
+// interpolation (square-interp then window-crop, done by the caller).
+void resize_bilinear_torch(const float * table, int side, int dim, int gh, int gw,
+                           std::vector<float>& out);
+
 // Bilinear interpolation of a learned (side, side, dim) position table onto a
 // (gh, gw) grid: torch.linspace(0, side-1, g) endpoints, floor/ceil clipping.
 // Writes (gh*gw, dim) row-major. Qwen2-VL / MOSS-VL semantic (VideoChat3 uses the
