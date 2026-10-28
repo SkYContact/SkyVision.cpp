@@ -3,7 +3,7 @@
 Usage::
 
   python convert/convert_nemotronomni.py [--src DIR] [-o OUT.gguf]
-                                         [--out-type f16|q8_0|q4_k_m]
+                                         [--out-type f16|q8_0|q6k_mixed]
                                          [--rope off|partial84]
 
 Source: E:/SkyVision-weights/nemotron3omni (17 BF16 shards, 7349 tensors,
@@ -71,11 +71,18 @@ names following llama.cpp nemotron-h(-moe) with the repo's custom bindings:
 The tokenizer is not embedded in the GGUF: the engine reads the checkpoint's
 tokenizer.json directly (model_registry), same as qwen3omni.
 
-Precision contract: every matmul operand follows --out-type (default f16);
-all norms/biases/router/exp_probs_b/pos_embed/cls_token/mel/BN are F32
-regardless of --out-type. Quantization rows: q8_0 needs in%32, q4_k_m needs
-in%256 (falls back to F16 with a warning otherwise; this repo has no Q4_K
-encoder yet -- gguf-py decodes only, wave 6 must port one like q6k.py).
+Precision contract: every matmul operand follows --out-type; all
+norms/biases/router/exp_probs_b/pos_embed/cls_token/mel/BN are F32
+regardless of --out-type. Tiers:
+  f16        66 GB parity baseline (everything 2-D at F16)
+  q8_0       ~35 GB uniform full-compat tier
+  q6k_mixed  ~23 GB per-tensor hybrid standing in for a uniform k-quant tier
+             (trunk widths 2688/1856/3712 are not %256, so k-quants can only
+             cover ~5% of the bytes): token_embd/lm_head Q8_0, expert stacks
+             Q5_0, in%256 tensors Q6_K, remaining %32 tensors Q5_0, and the
+             host-read tails (4-tap ssm conv, 4D audio subsampling convs) F16.
+             The Q6_K encoder is the ported ggml reference (q6k.py), verified
+             bit-exact against the engine dequantizer.
 """
 import argparse
 import ctypes
@@ -97,11 +104,56 @@ MODEL_ID = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 DEFAULT_SRC = r"E:\SkyVision-weights\nemotron3omni"
 DEFAULT_OUT_DIR = r"E:\SkyVision-weights\nemotronomni"
 
+# quantized tiers. "q8_0" is the uniform full-compat baseline; "q6k_mixed" is
+# the per-tensor hybrid that stands in for a uniform Q4_K/Q6_K tier (the trunk
+# widths 2688/1856/3712 are not multiples of 256, so k-quants can only cover
+# 5% of the bytes -- see 6prep/quant-compat.md):
+#   token_embd / lm_head      -> Q8_0 (output head + registry precision)
+#   expert stacks (exps_*)    -> Q5_0
+#   2D with in % 256 == 0     -> Q6_K  (towers, ssm_out/attn_o, audio linears)
+#   2D with in % 32  == 0     -> Q5_0  (ssm_in, attn_q/k/v, ffn_up_shexp)
+#   everything else           -> F16/F32 (1-D precision contract + row<32 tails
+#                               like the 4-tap ssm conv and 4D audio subsampling,
+#                               which the engine reads raw on the host)
 OUTTYPES = {"f16": (None, gguf.LlamaFileType.MOSTLY_F16),
-            "q8_0": (gguf.GGMLQuantizationType.Q8_0, gguf.LlamaFileType.MOSTLY_Q8_0),
-            "q4_k_m": (gguf.GGMLQuantizationType.Q4_K, gguf.LlamaFileType.MOSTLY_Q4_K_M)}
-QUANT_ROW = {gguf.GGMLQuantizationType.Q8_0: 32,
-             gguf.GGMLQuantizationType.Q4_K: 256}
+            "q8_0": (None, gguf.LlamaFileType.MOSTLY_Q8_0),
+            "q6k_mixed": (None, gguf.LlamaFileType.MOSTLY_Q6_K)}
+EMBEDDINGS = ("token_embd.weight", "lm_head.weight")
+
+
+def quant_policy(ops, out_type):
+    """Assign per-op quantized types (op["q"], kind "q") for the quant tiers.
+    f16 mode is a no-op; F32/1-D ops always keep their precision contract."""
+    if out_type not in ("q8_0", "q6k_mixed"):
+        return
+    for op in ops:
+        if op["k"] not in ("f16", "exps_up", "exps_down"):
+            continue                                  # F32/1-D contract
+        row = op["s"][-1]
+        if out_type == "q8_0" and row % 32 == 0:
+            qt = gguf.GGMLQuantizationType.Q8_0
+        elif out_type == "q8_0":
+            warn(f"{op['g']}: row {row} not multiple of 32, keeping F16")
+            continue
+        elif op["g"] in EMBEDDINGS:
+            qt = gguf.GGMLQuantizationType.Q8_0
+        elif op["k"] in ("exps_up", "exps_down"):
+            qt = gguf.GGMLQuantizationType.Q5_0
+        elif row % 256 == 0:
+            qt = gguf.GGMLQuantizationType.Q6_K
+        elif row % 32 == 0:
+            qt = gguf.GGMLQuantizationType.Q5_0
+        else:
+            warn(f"{op['g']}: row {row} not quantizable, keeping F16")
+            continue
+        if op["k"] == "f16":
+            op["k"] = "q"
+        op["q"] = qt
+
+
+# (GGML_QUANT_SIZES) block size and bytes per block
+QUANT_BLOCK = {"Q8_0": (32, 34), "Q5_0": (32, 22), "Q4_0": (32, 18),
+               "Q6_K": (256, 210), "Q4_K": (256, 144)}
 
 SKIP_EXACT = ("vision_model.radio_model.input_conditioner.norm_mean",
               "vision_model.radio_model.input_conditioner.norm_std")
@@ -316,18 +368,19 @@ def _expand_bf16(raw, out):
     return out
 
 
-def materialize(op, sh, qtype):
+def materialize(op, sh):
     """Build the exact final tensor for one op (mmap -> transform -> dtype)."""
     if op["k"] in ("exps_up", "exps_down"):
         leaf = "up_proj.weight" if op["k"] == "exps_up" else "down_proj.weight"
         n_exp = op["s"][0]
-        if qtype is not None:
+        qt = op.get("q")
+        if qt is not None:
             buf = bytearray()
             for e in range(n_exp):
                 raw, dt, shp = sh.raw(f"{op['h']}.{e}.{leaf}")
                 a32 = _expand_bf16(raw, np.empty(raw.size, np.float32)).reshape(shp) \
                     if dt == "BF16" else raw.astype(np.float32)
-                buf += _lib.quantize(np.ascontiguousarray(a32), qtype).tobytes()
+                buf += _lib.quantize(np.ascontiguousarray(a32), qt).tobytes()
                 del a32
             return np.frombuffer(bytes(buf), dtype=np.uint8)
         out = np.empty(op["s"], dtype=np.float16)
@@ -364,6 +417,15 @@ def materialize(op, sh, qtype):
         else:
             out[:] = raw.reshape(-1)
         return out.reshape(op["s"])
+    if op["k"] == "q":                         # per-op quantized matmul operand
+        out = np.empty(raw.size, dtype=np.float32)
+        if dt == "BF16":
+            _expand_bf16(raw, out)
+        else:
+            out[:] = raw.reshape(-1)
+        blocks = _lib.quantize(np.ascontiguousarray(out.reshape(op["s"])), op["q"])
+        del out
+        return blocks
     if op["k"] in ("a", "d"):                  # ssm_a / ssm_d, F32, [heads, 1]
         out = np.empty(raw.size, dtype=np.float32)
         if dt == "BF16":
@@ -378,7 +440,7 @@ def materialize(op, sh, qtype):
 
 # ---------------------------------------------------------------- metadata
 def write_metadata(gw, cfg, outtype, rope_mode):
-    qtype, ftype = OUTTYPES[outtype]
+    ftype = OUTTYPES[outtype][1]
     gw.add_name("Nemotron-3-Nano-Omni-30B-A3B")
     gw.add_file_type(ftype)
     gw.add_uint32("general.quantization_version", 2)
@@ -454,27 +516,28 @@ def peak_rss_mib():
     return -1.0
 
 
-def op_decl(op, qtype):
+def op_decl(op):
     """(shape_for_info, np_dtype, nbytes, raw_dtype) of the final tensor."""
-    if op["k"] == "q" or (op["k"] in ("exps_up", "exps_down") and qtype is not None):
+    qt = op.get("q")
+    if op["k"] == "q" or (op["k"] in ("exps_up", "exps_down") and qt is not None):
         # info takes the BYTE shape and stores the logical shape after
         # quant_shape_from_byte_shape; nbytes is the byte count
-        per_row = {"Q8_0": 34, "Q4_K": 144}[qtype.name]
-        byte_shape = (*op["s"][:-1], op["s"][-1] // 32 * per_row)
-        return byte_shape, np.dtype("uint8"), int(np.prod(byte_shape)), qtype
+        blk, tsz = QUANT_BLOCK[qt.name]
+        byte_shape = (*op["s"][:-1], op["s"][-1] // blk * tsz)
+        return byte_shape, np.dtype("uint8"), int(np.prod(byte_shape)), qt
     dt = np.dtype("float32") if op["k"] not in ("f16", "exps_up", "exps_down") \
         else np.dtype("float16")
     return op["s"], dt, int(np.prod(op["s"])) * dt.itemsize, None
 
 
-def write_gguf(out, cfg, ops, sh, qtype, outtype, rope_mode, quiet=True):
+def write_gguf(out, cfg, ops, sh, outtype, rope_mode, quiet=True):
     """Pre-declare every tensor (offsets are assigned sequentially), then
     stream the data one op at a time -- nothing big is ever held twice."""
     t0 = time.time()
     gw = gguf.GGUFWriter(out, ARCH)
     write_metadata(gw, cfg, outtype, rope_mode)
     for op in ops:
-        shape, dt, nbytes, raw = op_decl(op, qtype)
+        shape, dt, nbytes, raw = op_decl(op)
         gw.add_tensor_info(op["g"], shape, dt, nbytes, raw_dtype=raw)
     gw.write_header_to_file()
     gw.write_kv_data_to_file()
@@ -482,12 +545,12 @@ def write_gguf(out, cfg, ops, sh, qtype, outtype, rope_mode, quiet=True):
 
     done = 0
     for op in ops:
-        arr = materialize(op, sh, qtype)
+        arr = materialize(op, sh)
         try:
             gw.write_tensor_data(np.ascontiguousarray(arr))
         except AssertionError:
             fail(f"{op['g']}: produced {arr.nbytes} bytes, header declared "
-                 f"{op_decl(op, qtype)[2]} (kind {op['k']}, shape {op['s']})")
+                 f"{op_decl(op)[2]} (kind {op['k']}, shape {op['s']})")
         del arr
         done += 1
         if not quiet and (done % 128 == 0 or done == len(ops)):
@@ -527,15 +590,17 @@ def main():
     log(f"source: {src} ({len(files)} shards, {len(weight_map)} tensors)")
 
     cfg = read_config(src)
-    qtype = OUTTYPES[args.out_type][0]
-    row = QUANT_ROW.get(qtype, 32)
     ops = build_ops(cfg)
-    if qtype is not None:
-        for op in ops:      # quantizable matmul operands; 1-D stays F32
-            if op["k"] == "f16" and op["s"][-1] % row:
-                warn(f"{op['g']}: row {op['s'][-1]} not multiple of {row}, keeping F16")
-            elif op["k"] == "f16":
-                op["k"] = "q"
+    quant_policy(ops, args.out_type)
+    n_q = sum(1 for op in ops if op.get("q"))
+    if n_q:
+        by_type = {}
+        for op in ops:
+            if op.get("q"):
+                by_type[op["q"].name] = by_type.get(op["q"].name, 0) + 1
+        log("quant policy [" + args.out_type + "]: " +
+            ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) +
+            f", f16/f32={len(ops) - n_q}")
 
     sh = Shards(src, weight_map)
     consumed = set()
@@ -565,7 +630,7 @@ def main():
     out = args.out or os.path.join(DEFAULT_OUT_DIR, f"{ARCH}-{args.out_type}.gguf")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
-    elapsed = write_gguf(out, cfg, ops, sh, qtype, args.out_type, args.rope, args.quiet)
+    elapsed = write_gguf(out, cfg, ops, sh, args.out_type, args.rope, args.quiet)
     sh.close()
 
     size = os.path.getsize(out)

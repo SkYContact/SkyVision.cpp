@@ -136,6 +136,9 @@ const SpecRow kSpecs[] = {
       false, false, false, false, "models/Nemotron-3.5-Parse", "",
       "document parsing: --mode raw|markdown|json|text renders the control-token "
       "answer; one page per call, needs a large --max-tokens" },
+    { "nemotronomni", "", "image audio text", "ask",
+      false, false, false, false, "models/nemotron3omni", "",
+      "English only; thinking on by default; 256k ctx; text output only (no talker)" },
 };
 
 ArchSpec row_to_spec(const SpecRow & r) {

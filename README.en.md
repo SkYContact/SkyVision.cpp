@@ -47,6 +47,7 @@ Full per-backend details are in the hand-maintained table below:
 | `qwen3omni` | `qwen3_omni` | image + audio + text | ask | — | speech output |
 | `janus` | `janus_pro` | image + text | ask | — | — |
 | `nemotron_parse` | `nemotron-parse` | image + text | ask | — | — |
+| `nemotronomni` | — | image + audio + text | ask | — | — |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | Backend | Architecture tag | Input | Notes |
@@ -67,6 +68,7 @@ Full per-backend details are in the hand-maintained table below:
 | **Qwen3-Omni (30B-A3B-Instruct)** | `qwen3omni` | image + audio in, text + speech out | first ggml implementation (no such arch in llama.cpp): thinker = plain Qwen3 full-attention + MoE trunk (48 layers, 128 experts with 8 active, interleaved MRoPE 24/20/20) + Qwen3-VL vision tower (DeepStack, shared `qwen3vl_tower` block) + a Qwen3-ASR-family audio tower → **Talker** (20-layer MoE with a sigmoid-gated shared expert; only role==user tokens are forwarded; each step input is the sum of 16 embedding rows) → **code predictor** (5-layer dense; per-group tables AND heads are independent checkpoint weights - no tying, same for codec_head) → **code2wav** (8-layer windowed transformer + upsampling ConvNeXt + snake/transconv decoder, **the whole vocoder is a single ggml graph**: F32 im2col+mul_mat convs, conv_transpose_1d, sin/sqr snake; 50-100x the host loops it replaced). Speech via `--speak` (24 kHz, `--speaker chelsie|ethan|aiden`, `--max-codes`); all three input modalities and the speech output are stage-by-stage verified against HF transformers 5.20 (corr 0.996-0.9999, ASR-verifiable speech).
 | **Janus-Pro-1B** | `janus` (`janus_pro`) | image | DeepSeek's decoupled understanding/generation VLM, **understanding side only** (the VQ generation decoder is out of engine scope): timm-flavour SigLIP-large-384 tower (24 layers, d=1024, patch 16, fused qkv with full biases, **GELU(erf)**, no cls token, select_layer=-1 + final LN) + 2-layer MLP aligner (1024→2048 GELU(erf) →2048) + a plain llama 1.5B trunk (24 layers, 16:16 heads, theta 1e4, untied 102400 vocab). Official preprocessing: bicubic to longest-edge 384 → expand2square pad (127,127,127); 576 `<image_placeholder>` tokens per image, deepseek sft template. Adds the `DeepSeekBpe` tokenizer mode (isolated Split sequence — latin/punct with one leading space, contiguous CJK blocks, per-digit numbers; id-identical to HF). 3.9 GB f16 / 2.1 GB q8_0; parity vs the fp32 official stack: logits corr 0.9999, verbatim outputs. Converts via `convert/convert_janus.py`; prebuilt weights: `modelscope download --model SkyContact/Janus-Pro-1B-GGUF` (same name on HF) |
 | **Nemotron-3.5-Parse (0.63B)** | `nemotron_parse` (`nemotron-parse`) | image (document page) | NVIDIA's document parser: **C-RADIOv4-SO400M tower** (27 layers, patch 16, d=1152, ten class tokens in front of the sequence, learned 128×128 position table resampled onto the content area, no rope, GELU(erf), no norm at the end of the tower) + a **conv neck** (1×1 Conv1d → LN → width 4:1 Conv2d → LN; class tokens 0/1 become one summary token appended at the end) + a **10-layer mBART-style prefix decoder** (d=1024, 16/8 GQA, pre-LN, `√d` embedding scale, tied lm_head, **no positional encoding at all**, the visual features being the KV prefix). The answer is a **control-token stream carrying layout classes and normalised boxes**; `--mode markdown/json` renders it into markdown (LaTeX `tabular`→HTML table) or blocks with bboxes. Parity: position field 2.7e-7, all 159 greedy tokens of a page identical to the official stack. Converts via `convert/convert_nemotron_parse.py`; MCP tool `parse_document` |
+| **Nemotron-3-Nano-Omni-30B-A3B (Reasoning)** | `nemotronomni` | image + audio | NVIDIA's 30B-A3B omni reasoning MoE: a **52-layer Mamba2/Attention/MoE hybrid trunk** (23 Mamba2 + 6 NoPE attention + 23 MoE; sigmoid ×2.5 router with e_score_correction_bias, relu² non-gated 1856 experts, one 3712 shared expert) + a C-RADIOv4-H vision tower (32 blocks, d=1280, 10 register tokens dropped after the trunk, learned 128×128 position table, T=2 tubelet video patching) + a Parakeet/FastConformer audio tower (BatchNorm folded engine-side). English only, **thinking on by default**, 256k ctx, **text output only** (no talker). Parity: greedy argmax 100% identical to the official stack, audio transcription verbatim, RoPE ruled NoPE (partial84 corrupts the media path at step 0). Per-tensor hybrid quantization: %256-wide towers/trunk at Q6_K + experts Q5_0 + embeddings Q8_0 (row widths 2688/1856/3712 are not multiples of 256, so a plain k-quant tier covers only 5% of the bytes - there is no pure Q4_K/Q6_K tier). Converts via `convert/convert_nemotronomni.py`; prebuilt: `modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF` (same name on HF, tokenizer included) |
 | **SmolVLM (256M, Idefics3)** | `smolvlm` | image | the smallest usable backend here: SigLIP-base tower (12 layers, patch 16, 512², learned positions, LN/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30 layers, no bias, GQA 9:3, rope 1e5). Official Idefics3 preprocessing: longest edge **2048** → pad to multiples of 512 → **512² tiles** (row-major) + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8 |
 | **EmbeddingGemma-2 (740M)** | `embgemma2` | image + video + audio + text (embeddings) | multimodal embedding model (no text generation): Gemma3 text tower (24 layers, d=512, GQA 4:1, interleaved SWA/full, **per-layer PLE**) + Gemma4 ViT (16 layers, patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / **chunked local attention with Transformer-XL relative position bias**, ClippableLinear clamps throughout). `--embed` emits 768-d vectors (Matryoshka truncation to 512/256/128/64), `--embed-preset` official task prefixes, `--embed-file` batch JSONL. All four modalities vs the fp32 HF reference: **0.99999+** |
 | **Keye-VL-2.0 (30B-A3B)** | `keye-vl2` | image + video | Kwai's Keye-VL-2.0-30B-A3B: Qwen3-style **MoE text trunk** (48 layers, 128 routed experts with top-8 norm-topk softmax routing, mRoPE 16/24/24 theta 1e7, per-head qk-norm) + a per-layer **DSA lightning indexer** for sparse attention (16 heads x 64 dims, Walsh-Hadamard rotated MQA indexer keys, top-2048 KV sparse mask, separate indexer K cache) + a SigLIP-so400m lineage tower (27 layers patch 14, in-ViT 2D mRoPE, bilinearly interpolated 729-entry learned position table, post-LN, 2x2 merge + GELU projector). Video encodes frames independently with `<|frame|><hh:mm:ss>` markers; image mRoPE follows the (t=base, y=base+row, x=base+col) layout; image pads are injected as ids, not through a text round-trip (the Qwen tokenizer drops the piece). **Official GGUF runs as-is** (`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` plus its tokenizer.json; the mmproj sibling is auto-discovered). Three placements for the 19 GB checkpoint on a 12 GB card: default auto-fallback to pure CPU (~28 tok/s decode); `VQA_SPLIT=1` dense weights on GPU + experts in host RAM (ggml_backend_sched routes by weight location); `KEYE_EXPERTCACHE=1` **expert-granularity GPU residency cache** (ExpertCache: LRU + async prefetch + slot-table mul_mat_id batching that hits the CUDA backend's fused mul_mat_id+GLU pass, ~19 tok/s decode on 12 GB) |
@@ -789,6 +791,60 @@ normalised to `- ` and soft hyphens are dropped in text roles. The reading order
 (upstream's `merge.py` is a different feature — it merges a direct prediction with a separate
 detector/crop prediction and needs a second model). One page per call (loop in the caller for
 multi-page documents).
+
+### Nemotron-3-Nano-Omni-30B-A3B (omni reasoning)
+
+33B total / ~3B active per token, image/audio/text in and text out (no talker). The full pipeline
+in this engine: a **52-layer Mamba2/Attention/MoE hybrid trunk** + the C-RADIOv4-H vision tower +
+the Parakeet audio tower + expert residency (`NEMOTRONOMNI_EXPERTCACHE=1`), verified against the
+transformers 5.21 official stack as oracle. The RoPE ruling experiment concluded **NoPE** (config
+and HF code agree; the rope 84/128 metadata in llama.cpp GGUF headers is family-template residue —
+the partial84 alternative path drops to cos 0.85 at media step 0 and loses the transcription).
+Mamba2 dt uses an inverse-softplus pre-compensation (ggml_ssm_scan applies its own softplus and
+has no clamp; the wrap moves HF's `clamp(min=1e-3)` semantics into the kernel exactly).
+
+```bash
+# prebuilt: modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF
+#           --local-dir models/Nemotron3-Omni-GGUF (same name on HF; tokenizer.json included)
+pip install -r convert/requirements.txt
+hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 --local-dir models/nemotron3omni
+python convert/convert_nemotronomni.py --out-type f16         # 66 GB (parity baseline)
+python convert/convert_nemotronomni.py --out-type q8_0        # 35.2 GB (full-compat tier)
+python convert/convert_nemotronomni.py --out-type q6k_mixed   # 23.3 GB (hybrid tier, below)
+python convert/check_nemotronomni.py --gguf <file> [--hash]   # self-check, no model load
+
+vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
+        --image photo.jpg --ask "What is in this picture?"
+vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
+        --audio clip.wav --ask "Transcribe this audio."
+```
+
+Quantization (why there is no plain Q4_K/Q6_K tier): the trunk row widths 2688/1856/3712 are not
+multiples of 256, so k-quants (%256) can only cover 5% of the bytes — a uniform Q4_K_M/Q6_K tier
+is meaningless; it is a per-tensor hybrid:
+
+| tier | size | per-tensor types |
+|---|---|---|
+| `q8_0` | 35.2 GB | every %32 matmul operand at Q8_0 (full-compat baseline) |
+| `q6k_mixed` | 23.3 GB | token_embd/lm_head Q8_0 + expert stacks Q5_0 + %256-wide (towers/trunk/out_proj) Q6_K + remaining %32 rows Q5_0; host-read tails (4-tap ssm conv, 4D audio subsampling convs) stay F16 (fold-path hard constraint, guarded engine-side) |
+
+Parity (oracle = the transformers 5.21 official BF16 stack): text prompt A/B greedy argmax **100%
+identical**; audio transcription **verbatim** vs the official stack; expert-cache `NEMO_XCHK`
+logits maxdiff **0.00000**, 104/104 layer outputs bit-identical.
+
+Performance (CPU 16 threads / CUDA on a 5070 Ti Laptop 12GB, EC split, 156 slots):
+
+| | F16 | q8_0 | q6k_mixed |
+|---|---|---|---|
+| CPU decode | 0.33 tok/s | 0.95 tok/s | 3.39 tok/s |
+| CUDA EC split decode | 0.14-0.19 tok/s | 2.3 tok/s | 3.1 tok/s |
+
+At F16 the 66 GB of weights page in from disk against 31 GB of RAM (~350 MB/s wall; swap-wait is
+95% of the CUDA EC step). Quantization shrinks the per-step expert stream from ~2 GB to ~1 GB
+(Q8_0) / ~0.7 GB (q6k_mixed) — that is the usability threshold. CUDA slot-budget
+note: the default 2 GB reserve thrashes at Q8_0 (236/519 slots, 14 s/step);
+`NEMO_EC_RESERVE=4e9` keeps all 276 per-step slots resident and settles at
+427 ms/step (2.3 tok/s) after one warmup pass.
 
 ## Why a standalone engine?
 

@@ -98,6 +98,18 @@ jobs:
           cmake --build build --target np_markup_test
           ./build/np_markup_test
 
+      # Nemotron-Omni text-chain segments: synthetic-weight graphs through the
+      # real ggml ops (Mamba2 SSD with the inverse-softplus dt clamp, NoPE GQA,
+      # sigmoid x2.5 router) compared against the numpy reference. Reproducible
+      # by construction - seeded RNG, no model download; numpy is the only
+      # extra dependency.
+      - name: Nemotron-Omni segment parity
+        run: |
+          cmake --build build --target nemotronomni-seg-test
+          ./build/nemotronomni-seg-test "$PWD/nemo_seg_dump"
+          python3 -m pip install --quiet --break-system-packages numpy
+          python3 scripts/parity_nemotronomni_seg.py "$PWD/nemo_seg_dump"
+
       # content assertion: parse the JSON, not just the exit code
       - name: Capability spec table must be complete
         run: |
@@ -107,11 +119,12 @@ jobs:
           specs = json.load(open('specs.json'))
           assert isinstance(specs, list) and specs, 'specs must be a non-empty JSON list'
           archs = [s['arch'] for s in specs]
-          # expected set as of the nemotron_parse row (21st arch; keep this set
+          # expected set as of the nemotronomni row (22nd arch; keep this set
           # in sync with vqa_spec.cpp)
           expected = {
               'embgemma2', 'gemma4', 'janus', 'keye-vl2', 'mage_vl', 'marlin',
-              'minicpmv47', 'moondream3', 'moss_vl', 'nemotron_parse', 'qwen25omni',
+              'minicpmv47', 'moondream3', 'moss_vl', 'nemotronomni',
+              'nemotron_parse', 'qwen25omni',
               'qwen2vl', 'qwen3_5', 'qwen3omni', 'qwen3vl', 'siglip', 'smolvlm',
               'videochat3', 'videojev', 'videomae', 'vjepa2',
           }

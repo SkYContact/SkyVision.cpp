@@ -74,17 +74,18 @@ def expand(raw, dt):
     return out
 
 
-def expected_bytes(op, sh, qtype):
+def expected_bytes(op, sh):
     """Independent recomputation of the tensor bytes (same math as the
     converter's materialize, written out longhand so a shared bug shows)."""
+    qt = op.get("q")
     if op["k"] in ("exps_up", "exps_down"):
         leaf = "up_proj.weight" if op["k"] == "exps_up" else "down_proj.weight"
         chunks = []
         for e in range(op["s"][0]):
             raw, dt, _ = sh.raw(f"{op['h']}.{e}.{leaf}")
             a32 = expand(raw, dt)
-            if qtype is not None:
-                chunks.append(_lib_quant(a32, qtype))
+            if qt is not None:
+                chunks.append(_lib_quant(a32, qt))
             else:
                 chunks.append(a32.astype(np.float16).tobytes())
             del a32
@@ -106,6 +107,8 @@ def expected_bytes(op, sh, qtype):
     w = w.reshape(op["s"])
     if op["k"] == "a":
         w = -np.exp(w)
+    if op["k"] == "q":
+        return _lib_quant(w, qt)
     if op["k"] == "f16":
         return np.ascontiguousarray(w, dtype=np.float16).tobytes()
     return np.ascontiguousarray(w, dtype=np.float32).tobytes()
@@ -116,10 +119,22 @@ def _lib_quant(a32, qtype):
     return _lib.quantize(np.ascontiguousarray(a32), qtype).tobytes()
 
 
+def op_decl_row_bytes(op):
+    """Bytes of one row (last ne dim) in the stored layout."""
+    qt = op.get("q")
+    if qt is not None and (op["k"] == "q" or op["k"].startswith("exps_")):
+        blk, tsz = C.QUANT_BLOCK[qt.name]
+        return op["s"][-1] // blk * tsz
+    return op["s"][-1] * (2 if op["k"] in ("f16", "exps_up", "exps_down") else 4)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gguf", default=os.path.join(C.DEFAULT_OUT_DIR, f"{C.ARCH}-f16.gguf"))
     ap.add_argument("--src", default=os.environ.get("NEMOTRONOMNI_SRC", C.DEFAULT_SRC))
+    ap.add_argument("--out-type", default=None, choices=sorted(C.OUTTYPES) + [None],
+                    help="quant tier the file was written with (default: inferred "
+                         "from the -f16/-q8_0/-q6k_mixed filename suffix)")
     ap.add_argument("--hash", action="store_true", help="stream a sha256 of the file")
     ap.add_argument("--sample", default=None,
                     help="comma list of extra tensor names to round-trip")
@@ -137,19 +152,11 @@ def main():
     sh = C.Shards(args.src, weight_map)
 
     reader = gguf.GGUFReader(args.gguf)
-    # infer the quantization from what is actually in the file
-    types = {t.tensor_type for t in reader.tensors}
-    if gguf.GGMLQuantizationType.Q8_0 in types:
-        qtype = gguf.GGMLQuantizationType.Q8_0
-    elif gguf.GGMLQuantizationType.Q4_K in types:
-        qtype = gguf.GGMLQuantizationType.Q4_K
-    else:
-        qtype = None
-    if qtype is not None:
-        row = C.QUANT_ROW[qtype]
-        for op in ops:
-            if op["k"] == "f16" and op["s"][-1] % row == 0:
-                op["k"] = "q"
+    out_type = args.out_type
+    if out_type is None:
+        suffix = os.path.splitext(args.gguf)[0].rsplit("-", 1)[-1]
+        out_type = suffix if suffix in C.OUTTYPES else "f16"
+    C.quant_policy(ops, out_type)
     plan = {op["g"]: op for op in ops}
     names = [t.name for t in reader.tensors]
     tmap = {t.name: t for t in reader.tensors}
@@ -189,7 +196,7 @@ def main():
         op = plan.get(t.name)
         if op is None:
             continue
-        shape, dt, nbytes, raw = C.op_decl(op, qtype)
+        shape, dt, nbytes, raw = C.op_decl(op)
         ne = tuple(int(x) for x in reversed(np.asarray(op["s"])))  # gguf ne
         got_ne = tuple(int(x) for x in t.shape)
         if got_ne != ne:
@@ -277,7 +284,7 @@ def main():
             continue
         op = plan[g]
         t = tmap[g]
-        want = expected_bytes(op, sh, qtype)
+        want = expected_bytes(op, sh)
         flat = t.data.view(np.uint8).reshape(-1)   # byte view of the mmap data
         if t.n_bytes < (64 << 20):
             if bytes(flat) != want:
@@ -297,8 +304,8 @@ def main():
     for g, rows in (("token_embd.weight", (0, 1, 65535, 131071)),
                     ("lm_head.weight", (0, 65535, 131071))):
         op = plan[g]
-        want_full = expected_bytes(op, sh, qtype)   # f16 bytes, row-major
-        row_bytes = op["s"][1] * 2
+        want_full = expected_bytes(op, sh)   # row-major in stored dtype
+        row_bytes = op_decl_row_bytes(op)
         for r_i in rows:
             sl = slice(r_i * row_bytes, (r_i + 1) * row_bytes)
             if bytes(tmap[g].data.view(np.uint8).reshape(-1)[sl]) != want_full[sl]:

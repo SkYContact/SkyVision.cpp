@@ -44,6 +44,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | `qwen3omni` | `qwen3_omni` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
 | `janus` | `janus_pro` | 图像 + 文本 | ask | — | — |
 | `nemotron_parse` | `nemotron-parse` | 图像 + 文本 | ask | — | — |
+| `nemotronomni` | — | 图像 + 音频 + 文本 | ask | — | — |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | 后端 | 架构标签 | 输入 | 说明 |
@@ -64,6 +65,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Qwen3-Omni（30B-A3B-Instruct）** | `qwen3omni` | 图像 + 音频输入，文本 + 语音输出 | **首个 ggml 实现**（llama.cpp 无此架构）：thinker=标准 Qwen3 全注意力 + MoE 文本主干（48 层、128 专家激活 8、interleaved MRoPE 24/20/20 逐轴整支 128 维）+ Qwen3-VL 视觉塔（deepstack 三抽头，与 `qwen3vl` 共享 `qwen3vl_tower` 积木）+ Qwen3-ASR 同族音频塔（128 mel、chunk 500、窗 800）→ **Talker**（20 层 MoE + sigmoid 门控共享专家；用户段只喂 role==user token；step 输入=16 个嵌入行求和）→ **code predictor**（5 层 dense，15 组独立嵌入表/头——**头未 tie，checkpoint 独立权重**，与 codec_head 同理）→ **code2wav**（8 层窗注意力 transformer + 上采样 ConvNeXt + snake/transconv 解码器，**整条声码器是单张 ggml 图**：F32 im2col+mul_mat 卷积、conv_transpose_1d、sin/sqr snake，比宿主循环快 50-100×）。语音出 `--speak`（24 kHz，`--speaker chelsie|ethan|aiden` 选音色、`--max-codes` 限帧）；三模态理解与语音输出全部对 HF transformers 5.20 逐段对拍（corr 0.996-0.9999，ASR 逐字验收）。
 | **Janus-Pro-1B** | `janus`（`janus_pro`） | 图像 |  DeepSeek 解耦式理解/生成 VLM 的**理解侧**（VQ 生成解码器不属于本引擎）：timm 风味 SigLIP-large-384 视觉塔（24 层、d=1024、patch16、fused qkv+全 bias、**GELU(erf)**、无 cls token、select_layer=-1 全层 + 终端 LN）+ 2 层 MLP aligner（1024→2048 GELU(erf) →2048）+ 纯 llama 1.5B 文本主干（24 层、16:16 头、theta 1e4、untied 102400 vocab）。预处理官方口径：bicubic 保比缩到长边 384 → expand2square 填充 (127,127,127) → /255 归一化；一图 576 个 `<image_placeholder>` token，deepseek sft 模板（`<\|User\|>:` 开头，问题后换行接 576 个占位符，再空行后以 `<\|Assistant\|>:` 收尾）。分词器新增 `DeepSeekBpe` 模式（isolated Split 序：拉丁/标点各带一个前导空格、CJK 大块连写、数字逐位——与 HF 官方逐 id 一致）。f16 3.9 GB / q8_0 ≈ 2.1 GB；对拍：与 fp32 官方栈 logits corr 0.9999、输出逐字一致。转换 `convert/convert_janus.py`。预置权重：`modelscope download --model SkyContact/Janus-Pro-1B-GGUF`（f16/q8_0/q4_0 + tokenizer，HF 同名 `hf download SkyContact/Janus-Pro-1B-GGUF`） |
 | **Nemotron-3.5-Parse（0.63B）** | `nemotron_parse`（`nemotron-parse`） | 图像（文档页） | NVIDIA 文档解析模型：**C-RADIOv4-SO400M 视觉塔**（27 层、patch16、d=1152、10 个 class token 排在最前、学出来的 128×128 位置表按内容区插值、无 rope、GELU(erf)、塔末无 norm）+ 卷积 **neck**（1×1 Conv1d → LN → 宽度 4 合 1 的 Conv2d → LN；前两个 class token 投影成 1 个 summary token 追加在末尾）+ **10 层 mBART 式前缀解码器**（d=1024、16/8 GQA、pre-LN、`√d` 嵌入缩放、tied lm_head、**没有任何位置编码**，视觉特征即 KV 前缀）。输出是带版面类别与归一化框的**控制 token 流**，`--mode markdown/json` 渲染成 markdown（LaTeX `tabular`→HTML 表）或带 bbox 的 blocks。对拍：位置场 2.7e-7、整页 159 步贪心与官方逐 token 相同。转换 `convert/convert_nemotron_parse.py`，MCP 工具 `parse_document` |
+| **Nemotron-3-Nano-Omni-30B-A3B（Reasoning）** | `nemotronomni` | 图像 + 音频 | NVIDIA 30B-A3B 全模态 MoE 推理模型：**52 层 Mamba2/Attention/MoE 混合主干**（23 Mamba2 + 6 NoPE attention + 23 MoE；sigmoid ×2.5 路由带 e_score_correction_bias、relu² 非门控专家 1856、1 个 3712 共享专家）+ C-RADIOv4-H 视觉塔（32 层 d=1280、10 个 register token 前置后整块丢弃、学出的 128×128 位置表、T=2 tubelet 视频嵌入已转换）+ Parakeet/FastConformer 音频塔（BatchNorm 引擎侧折叠）。英文 only、**thinking 默认开**、256k ctx、**纯文本输出**（无 talker）。对拍：文本贪心 argmax 与官方栈 100% 一致、音频转写逐字一致、RoPE 判决=NoPE（partial84 媒体路径 step0 即 cos 0.85 语义损坏）。逐张量混合量化：%256 宽的塔/主干 Q6_K + 专家 Q5_0 + 嵌入 Q8_0（行宽 2688/1856/3712 非 256 倍数，裸 k-quant 档只能覆盖 5% 字节，故无纯 Q4_K/Q6_K 档）。转换 `convert/convert_nemotronomni.py`。预置权重：`modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF`（HF 同名，含 tokenizer） |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 | **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
 | **Keye-VL-2.0（30B-A3B）** | `keye-vl2` | 图像 + 视频 | 快手 Keye-VL-2.0-30B-A3B：Qwen3 式 **MoE 文本主干**（48 层、128 路由专家激活 8、norm-topk softmax 路由、mRoPE 16/24/24 theta 1e7、per-head qk-norm）+ 每层 **DSA lightning indexer 稀疏注意力**（16 头×64 维、Walsh-Hadamard 旋转 MQA indexer、top-2048 KV 稀疏掩码、独立 indexer K 缓存）+ SigLIP-so400m 系视觉塔（27 层 patch14、ViT 内 2D mRoPE、729 学习式位置表双线性插值、post-LN、2×2 merge + GELU 投影）。视频=官方默认逐帧路径（mRoPE 官方 get_rope_index 逐位对齐；官方 packing 表在该路径为死代码；opt-in fast 双流未实现）+ `<|frame|><hh:mm:ss>` 时间戳标记；图像 mRoPE 为 (t=base, y=base+row, x=base+col) 布局；image_pad 按 id 注入不走文本往返（Qwen 分词器会吞掉该 piece）。**官方 GGUF 直接用**（`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` + 同仓 tokenizer.json；mmproj 姊妹文件自动发现）。19GB 检查点放不进 12GB 显卡时有三种放置：默认自动回退纯 CPU（decode ~28 tok/s）；`VQA_SPLIT=1` 稠密权重上 GPU + 专家留内存（`ggml_backend_sched` 按权重归属分流）；`KEYE_EXPERTCACHE=1` **专家粒度 GPU 驻留缓存**（ExpertCache：LRU + 异步预取 + slot 表 `mul_mat_id` 批处理，命中 CUDA 后端 mul_mat_id+GLU 融合，12GB 卡 decode ~19 tok/s） |
@@ -110,6 +112,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | EmbeddingGemma-2 四模态嵌入 | ✅ 文本 0.9999999 / 图像 0.99999 / 音频 0.99999 / 视频 0.9999998（fp32 HF 参考，f16 权重）。音频塔逐层 hook 对拍修复 5 个图实现 bug（漏乘 attention 输出投影、content 项与 rel-bias 布局互为转置、rel-bias 行视图跨度、头合并 cont_2d 乱序、GLU 切分/残差/clamp）；视频逐帧跑 B=1 视觉图（注意力不跨帧，视频预处理用 video 预算 140 soft/帧） |
 | V-JEPA 2 特征 / 分类 / 掩码预测 | ✅ ViT-L（326M + predictor 25M，f16 653MB）：64 帧 → 短边 292（双线性）→ 裁 256 → **8192 token 全时空注意力 ×24 层** → 1024 维特征；SSv2 微调版（16 帧）再走 **3 层 attentive pooler + 174 类线性头**，`--mode 5` 直出标签；`--mode predict` 跑 12 层 masked-latent predictor。**对拍已验证**（transformers 5.x）：同输入下 24 层全长 cos **1.000000**（max 0.065）；端到端（各自预处理）pooled cos **0.9994**、SSv2 top-1 标签一致（0.916 vs 0.921，概率最大差 4.5e-3）、predictor cos **0.998**。CPU 单 clip（8192 token）约 25 s，SSv2（2048 token）约 5 s |
 | Nemotron-3.5-Parse 文档解析 | ✅ 端到端 + 官方 torch 参考逐级对拍（`scripts/ref_nemotron_parse.py` → `convert/compare_dumps.py`）：位置场 **2.7e-7**、patch 嵌入 2.8e-3、首 token logits top8 **8/8**、**整页 159 步贪心输出与官方逐 token 相同**。CPU（19 线程）一页 ≈ 19 s（视觉 16.3 s + prefill 0.8 s + 158 token decode），CUDA（4070 SUPER）≈ 0.9 s（0.64 s + 0.019 s + 0.25 s）；CUDA 上 7/7 block 正文一致，坐标末位有 f16 舍入漂移 |
+| Nemotron-3-Nano-Omni-30B-A3B 文本/图像/音频 | ✅ 端到端 + 官方栈对拍（BF16 17 分片做 oracle）：文本 prompt A/B 贪心 argmax **100% 一致**、音频转写与官方逐字一致（"The sound of putting the knife on the chopping board."）；RoPE 判决=**NoPE**（partial84 媒体路径 step0 即 cos 0.85、丢失转写内容）；Mamba2 数值双锚（逐步递推 vs HF chunk-SSD 交叉验证）、EC 专家驻留 XCHK logits maxdiff 0.00000、104/104 层输出位级一致。量化两档（Q8_0 35.2GB / q6k_mixed 23.3GB）贪心流与 F16 基线一致（见下）。F16 性能：CPU 16 线程 decode 0.33 tok/s / prefill 7.8 tok/s（66GB mmap 缺页墙 ~350MB/s）、CUDA（5070 Ti Laptop 12GB）EC split 0.14-0.19 tok/s（swap-wait 占 95%）——**量化是可用性必需**，量化后数字见"模型转换"章节 |
 
 ## 快速开始
 
@@ -789,6 +792,54 @@ vqa-cli ...  --mode json          # blocks + 归一化/像素 bbox
 ≤0.03、唯一最近）并入该图表的标题；`List-item` 的行首符号归一成 `- `、文本角色里的软连字符会去掉。
 阅读顺序就是模型给的顺序（上游 `merge.py` 是另一件事——把 direct 预测和 detector/crop 预测两路合并，
 需要第二个模型）。一次一页（多页由调用方循环）。
+
+### Nemotron-3-Nano-Omni-30B-A3B（全模态 Reasoning）
+
+33B 总参 / 每 token 激活 ~3B 的全模态推理模型：图/音频/文本进、纯文本出（无 talker）。本引擎的
+一条龙：**52 层 Mamba2/Attention/MoE 混合主干** + C-RADIOv4-H 视觉塔 + Parakeet 音频塔 + EC 专家
+驻留（`NEMOTRONOMNI_EXPERTCACHE=1`），transformers 5.21 官方栈做 oracle。RoPE 判决实验的结论是
+**NoPE**（config 与 HF 代码一致，llama.cpp GGUF 头里的 rope 84/128 元数据是家族模板残留；
+partial84 替代路径在媒体注入 step0 即 cos 0.85、完全丢失转写内容）。Mamba2 的 dt 走
+inverse-softplus 预补偿（ggml_ssm_scan 内部自带 softplus 无 clamp，包一层把 HF 的
+`clamp(min=1e-3)` 语义精确搬进 kernel）。
+
+```bash
+# 预转好的：modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF
+#          --local-dir models/Nemotron3-Omni-GGUF（HF 同名；含 tokenizer.json）
+pip install -r convert/requirements.txt
+hf download nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 --local-dir models/nemotron3omni
+python convert/convert_nemotronomni.py --out-type f16         # 66 GB（对拍基线）
+python convert/convert_nemotronomni.py --out-type q8_0        # 35.2 GB（全兼容基准档）
+python convert/convert_nemotronomni.py --out-type q6k_mixed   # 23.3 GB（混合档，见下）
+python convert/check_nemotronomni.py --gguf <产物> [--hash]    # 转换后自检（不加载模型）
+
+vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
+        --image photo.jpg --ask "What is in this picture?"
+vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
+        --audio clip.wav --ask "Transcribe this audio."
+```
+
+量化（为什么没有纯 Q4_K/Q6_K 档）：本模型行宽 2688/1856/3712 都不是 256 的倍数，k-quant
+（%256）只能覆盖 5% 的字节，**裸 Q4_K_M/Q6_K 档无意义**；所以是逐张量混合：
+
+| 档 | 大小 | 逐张量类型 |
+|---|---|---|
+| `q8_0` | 35.2 GB | 全部 %32 matmul 操作数 Q8_0（全兼容基准） |
+| `q6k_mixed` | 23.3 GB | token_embd/lm_head Q8_0 + 专家堆叠 Q5_0 + %256 宽（塔/主干/out_proj 等）Q6_K + 其余 %32 宽 Q5_0；4-tap ssm conv、4D 音频子采样卷积等宿主直读尾巴保持 F16（fold 路径硬约束，引擎有类型守卫） |
+
+对拍（oracle = transformers 5.21 官方栈 BF16）：文本 prompt A/B 贪心 argmax **100% 一致**；
+音频转写与官方**逐字一致**（F16）；EC 专家驻留 `NEMO_XCHK` logits maxdiff **0.00000**、104/104 层输出
+位级一致。量化档在两 prompt 上的贪心流与 F16 基线一致性见下表。
+
+性能（CPU 16 线程 / CUDA 5070 Ti Laptop 12GB EC split，156 slot）：
+
+| | F16 | q8_0 | q6k_mixed |
+|---|---|---|---|
+| CPU decode | 0.33 tok/s | 0.95 tok/s | 3.39 tok/s |
+| CUDA EC split decode | 0.14-0.19 tok/s | 2.3 tok/s | 3.1 tok/s |
+
+F16 下 66GB 权重对 31GB 内存全靠 mmap 缺页（墙 ~350MB/s，CUDA EC split 的 swap-wait 占 95%）；
+量化把每步专家流从 ~2GB 压到 ~1GB（Q8_0）/ ~0.7GB（q6k_mixed），是可用性的分水岭。CUDA 档注意 slot 预算：默认 2GB 在 Q8_0 下只剩 236/519 slot 会抖动（14s/step），`NEMO_EC_RESERVE=4e9` 让 276 个逐步 slot 全驻留后 warmup 一次即 427ms/步（2.3 tok/s）。
 
 ## 为什么做独立引擎？
 

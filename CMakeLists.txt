@@ -378,9 +378,9 @@ add_executable(qwen3omni-c2w-test tools/qwen3omni_c2w_test.cpp
 target_include_directories(qwen3omni-c2w-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3omni)
 target_link_libraries(qwen3omni-c2w-test PRIVATE ggml ggml-cpu)
 
-# --- Nemotron-3-Nano-Omni text-chain unit parity (wave 3a): seeded synthetic
-#     weights through the three branch builders; the numpy comparison lives in
-#     nemotron3omni-port/3a/parity_nemotronomni_seg.py (outside the repo) ---
+# --- Nemotron-3-Nano-Omni text-chain unit parity (wave 3a; L0 step): seeded
+#     synthetic weights through the three branch builders; the numpy reference
+#     is scripts/parity_nemotronomni_seg.py (repo-side copy, CI-run) ---
 add_executable(nemotronomni-seg-test tools/nemotronomni_seg_test.cpp
     src/core/media/resample.cpp
     src/models/nemotronomni/nemotronomni_vision.cpp

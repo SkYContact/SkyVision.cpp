@@ -48,7 +48,17 @@ bool ParakeetTower::fold_bn(ggml_backend_t backend) {
     std::vector<ggml_fp16_t> dwh(dw.size());
     for (int il = 0; il < n_layer; il++) {
         ParakeetBlk & L = al[(size_t)il];
-        // conv.dw is F16 on disk (mul_mat operand dtype); the BN stats are F32
+        // conv.dw is F16 on disk (mul_mat operand dtype); the BN stats are F32.
+        // Guard, don't probe: a quantized conv.dw would make tensor_get read
+        // past the (smaller) quantized buffer - the converter's quant tiers
+        // keep row-9 tensors F16 (quant-compat §6), this fails cleanly if a
+        // future tier breaks that contract.
+        if (L.conv_dw_raw->type != GGML_TYPE_F16) {
+            fprintf(stderr, "nemotronomni: audio fold expects F16 conv.dw"
+                            " (got %d) - quant tier must keep it raw\n",
+                    (int)L.conv_dw_raw->type);
+            return false;
+        }
         ggml_backend_tensor_get(L.conv_dw_raw, dwh.data(), 0, sizeof(ggml_fp16_t) * dwh.size());
         for (size_t i = 0; i < dwh.size(); i++) dw[i] = ggml_fp16_to_fp32(dwh[i]);
         ggml_backend_tensor_get(L.bn_w, gw.data(), 0, sizeof(float) * d_model);
