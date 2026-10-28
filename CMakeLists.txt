@@ -264,6 +264,12 @@ set(QWEN3OMNI_SRC
 set(NEMOTRON_PARSE_SRC
     src/models/nemotron_parse/nemotron_parse_model.cpp)
 
+#   src/models/nemotronomni/ NVIDIA Nemotron-3-Nano-Omni-30B-A3B (Mamba2/NoPE
+#                           GQA/MoE hybrid trunk; text chain first, vision and
+#                           audio towers staged)
+set(NEMOTRONOMNI_SRC
+    src/models/nemotronomni/nemotronomni_model.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -290,7 +296,8 @@ add_executable(vqa-cli
     ${SIGLIP_SRC}
     ${KEYE_VL_SRC}
     ${QWEN3OMNI_SRC}
-    ${NEMOTRON_PARSE_SRC})
+    ${NEMOTRON_PARSE_SRC}
+    ${NEMOTRONOMNI_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 # expert_cache.cpp (CUDA async prefetch) includes cuda_runtime.h and calls the
 # CUDA runtime directly, so vqa-cli needs the toolkit headers/libs too
@@ -368,3 +375,14 @@ add_executable(qwen3omni-c2w-test tools/qwen3omni_c2w_test.cpp
     src/core/util/mmap.cpp)
 target_include_directories(qwen3omni-c2w-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3omni)
 target_link_libraries(qwen3omni-c2w-test PRIVATE ggml ggml-cpu)
+
+# --- Nemotron-3-Nano-Omni text-chain unit parity (wave 3a): seeded synthetic
+#     weights through the three branch builders; the numpy comparison lives in
+#     nemotron3omni-port/3a/parity_nemotronomni_seg.py (outside the repo) ---
+add_executable(nemotronomni-seg-test tools/nemotronomni_seg_test.cpp
+    src/models/nemotronomni/nemotronomni_model.cpp
+    src/core/engine/backend.cpp
+    src/core/text/tokenizer.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(nemotronomni-seg-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/nemotronomni)
+target_link_libraries(nemotronomni-seg-test PRIVATE ggml ggml-cpu)

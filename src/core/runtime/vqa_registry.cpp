@@ -149,6 +149,12 @@ const ArchEntry kArchs[] = {
     // added coordinate/class tokens, which the decode path must keep verbatim.
     { { "nemotron_parse", "nemotron-parse", nullptr }, create_nemotron_parse,
       TokenizerMode::Gpt2Regex, "models/Nemotron-3.5-Parse", 72512, false, false, "" },
+    // NVIDIA Nemotron-3-Nano-Omni-30B-A3B: 52 layer Mamba2/NoPE-GQA/MoE hybrid
+    // trunk, text-only for now (vision+audio towers staged). The checkpoint
+    // ships the Mistral/Pixtral 131072 byte-BPE tokenizer; the Qwen2Regex
+    // pre-tokenizer reproduces its ids (wave-3b gate 1, oracle parity).
+    { { "nemotronomni", nullptr }, create_nemotronomni,
+      TokenizerMode::Qwen2Regex, "models/nemotron3omni", 131072, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

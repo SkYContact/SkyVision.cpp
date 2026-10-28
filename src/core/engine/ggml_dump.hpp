@@ -140,8 +140,11 @@ inline void write_tensor(ggml_tensor * t, const char * dir, const char * name) {
         std::vector<ggml_fp16_t> h((size_t)ggml_nelements(t));
         ggml_backend_tensor_get(t, h.data(), 0, sizeof(ggml_fp16_t) * h.size());
         tmp.resize(h.size());
-        src = (const uint8_t *)h.data();
+        // convert FIRST, then point src at the f32 buffer - pointing it at the
+        // f16 array wrote raw f16 bytes misread as f32 (F16 KV dumps were
+        // unreadable garbage; found by the nemotronomni wave-3a parity)
         for (size_t i = 0; i < h.size(); i++) tmp[i] = ggml_fp16_to_fp32(h[i]);
+        src = (const uint8_t *)tmp.data();
     } else {
         const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
         tmp.resize((size_t)ggml_nelements(t));

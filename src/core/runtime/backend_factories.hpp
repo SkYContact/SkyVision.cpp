@@ -27,5 +27,6 @@ Model * create_janus();
 Model * create_keye_vl();
 Model * create_qwen3omni();
 Model * create_nemotron_parse();
+Model * create_nemotronomni();
 
 }  // namespace vqa
