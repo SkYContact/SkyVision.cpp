@@ -32,6 +32,23 @@
 // generator; MINICPMO_VOC_MEL_LOAD=<mel.f32> bypasses flow (vocoder-only
 // parity); MINICPMO_VOC_DUMP=<prefix> dumps spk/mel/f0/pcm as raw f32;
 // MINICPMO_VOC_SEED=<n> seeds the engine HiFT RNG (default 0).
+// MINICPMO_VOC_EST_DUMP=<prefix> dumps the first estimator call inputs;
+// MINICPMO_VOC_EULER_DUMP=<prefix> dumps the per-step euler states;
+// MINICPMO_VOC_FE_DBG=<prefix> dumps flow-encoder stage outputs.
+//
+// Gate status (F32 vocoder gguf, oracle codes, official RNG dir):
+//   encoder mu  vs official mu.npy      cos 1.000000000000  max 3.1e-6
+//   (all 14 encoder stages - embed/la/b0..b5/up/upembed/u0..u3/an - exact)
+//   same-noise mel vs official flow_mel cos 0.999999986  max 7.7e-3
+//     (euler trajectory cos >= 0.999999992 at every step; residual driven
+//      by the campplus spk fp32 residual -> spk80 5.8e-4 -> dphi 3.8e-3)
+//   decode control (official mel): pcm cos 0.99999882 (hift exact)
+//   same-noise wav vs official hift float pcm: cos 0.9724  SNR 12.6 dB
+//     (7.7e-3 mel residual amplified by the decoder + f0 phase; tts_ref.wav
+//      uses a DIFFERENT HiFT sine RNG draw and is not waveform-comparable)
+//   full-chain: the CFM z is a Token2wav init-time buffer, not reproducible
+//     by seeding (torch.manual_seed(0) randn != captured z) - parity is
+//     carried by the same-noise gate above.
 #include "minicpmo.hpp"
 
 #include "ggml-alloc.h"
@@ -259,6 +276,8 @@ struct Vocoder::impl {
     ggml_gallocr_t allocr_f0 = nullptr;
     ggml_gallocr_t allocr_dec = nullptr;
     ggml_backend_buffer_t dec_buf = nullptr;   // NO_GALLOCR decode alloc
+    ggml_context * mask_ctx = nullptr;     // DiT all-visible mask (own
+    ggml_backend_buffer_t mask_buf = nullptr;  // buffer: never gallocr-recycled)
     vqa::MMap mm;
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
@@ -308,6 +327,8 @@ struct Vocoder::impl {
         cf_ctx = fe_ctx = dit_ctx = f0_ctx = dec_ctx = nullptr;
     }
     ~impl() {
+        if (mask_buf) ggml_backend_buffer_free(mask_buf);
+        if (mask_ctx) ggml_free(mask_ctx);
         free_graphs();
         if (wbuf) ggml_backend_buffer_free(wbuf);
         if (wctx) ggml_free(wctx);
@@ -1209,6 +1230,13 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
 
 
         const float xscale = std::sqrt((float)D);
+        const bool fe_dbg = getenv("MINICPMO_VOC_FE_DBG") != nullptr;
+        auto fe_sink = [&](ggml_tensor * t, const char * nm) {
+            ggml_tensor * s = ggml_dup(c, t);
+            ggml_set_name(s, nm);
+            ggml_set_output(s);
+            ggml_build_forward_expand(gf, s);
+        };
         // rel-pos attention over the espnet pe table pos [512, P]
         auto conf_attn = [&](ggml_context * cc, ggml_tensor * l,
                              const ConfLayer & L, ggml_tensor * pos,
@@ -1242,14 +1270,16 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
             if (getenv("MINICPMO_VOC_DEBUG"))
                 fprintf(stderr, "vocoder fe: bd ok\n");
             // rel_shift: out[q, k] = bd[k - q + Tq - 1]; front-pad one key
-            // slot and read the (P-1)-strided diagonal (espnet skew trick)
+            // slot and read the Pl-strided diagonal (espnet skew trick).
+            // required flat read m = Tq + k + q*Pl in the bdf rows, head via
+            // the (Pl+1)*Tq batch stride (verified vs torch rel_shift).
             ggml_tensor * zero = ggml_fill(cc, ggml_new_tensor_3d(
                 cc, GGML_TYPE_F32, 1, Tq, NH), 0.0f);
             ggml_tensor * bdp = ggml_concat(cc, zero, bd, 0);      // [P+1, Tq, NH]
             ggml_tensor * bdf = ggml_reshape_2d(cc, bdp, (Pl + 1) * Tq, NH);
             ggml_tensor * bds = ggml_view_3d(cc, bdf, Tq, Tq, NH,
-                                             (Pl - 1) * bdf->nb[0],
-                                             (size_t)Pl * Tq * bdf->nb[0],
+                                             (size_t)Pl * bdf->nb[0],
+                                             (size_t)(Pl + 1) * Tq * bdf->nb[0],
                                              (size_t)Tq * bdf->nb[0]);
             ggml_tensor * scores = ggml_scale(cc, ggml_add(cc, ac, bds),
                                               1.0f / std::sqrt((float)HD));
@@ -1259,7 +1289,8 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
             ggml_tensor * attn = ggml_mul_mat(cc, v_t, probs);     // [64, Tq, NH]
             attn = ggml_cont(cc, ggml_permute(cc, attn, 0, 2, 1, 3));
             attn = ggml_reshape_2d(cc, attn, D, Tq);
-            return ggml_add(cc, ggml_mul_mat(cc, L.wo, attn), L.bo);
+            ggml_tensor * o = ggml_add(cc, ggml_mul_mat(cc, L.wo, attn), L.bo);
+            return o;
         };
         auto conf_layer = [&](ggml_context * cc, ggml_tensor * xdf,
                               const ConfLayer & L, ggml_tensor * pos,
@@ -1279,6 +1310,7 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
             return ggml_add(cc, xdf, f);
         };
 
+        std::vector<std::pair<ggml_tensor *, const char *>> fe_stages;
         ggml_tensor * x = ggml_get_rows(c, input_emb, tok);        // [512, T]
         x = ggml_mul_mat(c, embed_w, x);
         x = ggml_add(c, x, embed_b);
@@ -1286,6 +1318,7 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
         x = ggml_mul(c, x, embed_ln_w);
         x = ggml_add(c, x, embed_ln_b);
         x = ggml_scale(c, x, xscale);
+        fe_stages.push_back({ x, "fe_embed" });
         // pre-lookahead (planar convs)
         ggml_tensor * xl = to_planar(c, x);
         xl = ggml_concat(c, xl, ggml_new_tensor_2d(c, GGML_TYPE_F32, 3, D), 0);
@@ -1294,64 +1327,92 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
         xl = pad_left(c, xl, 2);
         xl = conv1(c, la_conv2_w, la_conv2_b, xl, 1, 0, 1);
         x = ggml_add(c, to_dfast(c, xl), x);                        // residual
-        for (int i = 0; i < n_cfm; i++)
+        fe_stages.push_back({ x, "fe_la" });
+        for (int i = 0; i < n_cfm; i++) {
             x = conf_layer(c, x, cl[i], pos1, T);
+            fe_stages.push_back({ x, "fe_b" });   // name fixed up below
+        }
         // upsample: nearest x2, left-pad 4, conv k5
         ggml_tensor * xu = to_planar(c, x);
         xu = ggml_interpolate(c, xu, T * 2, D, 1, 1, GGML_SCALE_MODE_NEAREST);
         xu = pad_left(c, xu, 4);
         xu = conv1(c, up_conv_w, up_conv_b, xu, 1, 0, 1);
         x = to_dfast(c, xu);
+        fe_stages.push_back({ x, "fe_up" });
         x = ggml_mul_mat(c, up_embed_w, x);
         x = ggml_add(c, x, up_embed_b);
         x = ggml_norm(c, x, embed_ln_eps);
         x = ggml_mul(c, x, up_embed_ln_w);
         x = ggml_add(c, x, up_embed_ln_b);
         x = ggml_scale(c, x, xscale);
-        for (int i = 0; i < n_cfm_up; i++)
+        fe_stages.push_back({ x, "fe_upembed" });
+        for (int i = 0; i < n_cfm_up; i++) {
             x = conf_layer(c, x, cul[i], pos2, T2);
+            fe_stages.push_back({ x, "fe_u" });
+        }
         x = ggml_norm(c, x, embed_ln_eps);
         x = ggml_mul(c, x, after_norm_w);
         x = ggml_add(c, x, after_norm_b);
+        fe_stages.push_back({ x, "fe_an" });
         ggml_tensor * mu = ggml_mul_mat(c, proj_w, x);
         mu = ggml_add(c, mu, proj_b);                               // [80, T2]
         ggml_set_name(mu, "fe_mu");
         p->fe_mu = mu;
         ggml_build_forward_expand(gf, mu);
+        if (fe_dbg) {                          // per-stage dup sinks
+            int nb = 0, nu = 0;
+            for (auto & st : fe_stages) {
+                char nm[32];
+                const char * s = st.second;
+                if (!strcmp(s, "fe_b")) snprintf(nm, sizeof(nm), "fe_b%d", nb++);
+                else if (!strcmp(s, "fe_u")) snprintf(nm, sizeof(nm), "fe_u%d", nu++);
+                else snprintf(nm, sizeof(nm), "%s", s);
+                ggml_tensor * sn = ggml_dup(c, st.first);
+                ggml_set_name(sn, nm);
+                ggml_set_output(sn);
+                ggml_build_forward_expand(gf, sn);
+            }
+        }
         if (!ggml_gallocr_alloc_graph(p->allocr_fe, gf)) {
             fprintf(stderr, "vocoder: flow encoder alloc failed\n");
             return false;
         }
-        // uploads: tokens = prompt ++ codes
+        // uploads: tokens = prompt ++ codes. prompt_tokens is I32: read into
+        // an int buffer (a float reinterpret-cast turns every small token id
+        // into a denormal float and (int) rounds it to 0).
         std::vector<int> toks((size_t)T);
-        flat.resize((size_t)n_prompt_tokens);
-        ggml_backend_tensor_get(prompt_tokens, flat.data(), 0,
-                                flat.size() * sizeof(float));
-        for (int i = 0; i < n_prompt_tokens; i++)
-            toks[(size_t)i] = (int)flat[(size_t)i];
+        {
+            std::vector<int32_t> pt((size_t)n_prompt_tokens);
+            ggml_backend_tensor_get(prompt_tokens, pt.data(), 0,
+                                    pt.size() * sizeof(int32_t));
+            for (int i = 0; i < n_prompt_tokens; i++)
+                toks[(size_t)i] = (int)pt[(size_t)i];
+        }
         for (int i = 0; i < n_gen; i++) toks[(size_t)(n_prompt_tokens + i)] = codes[(size_t)i];
         ggml_backend_tensor_set(tok, toks.data(), 0, sizeof(int) * T);
         // espnet pe tables
         auto build_pe = [&](std::vector<float> & out, int len) {
             const int P = 2 * len - 1;
             out.assign((size_t)D * P, 0.f);
-            // pe_positive flipped + negative, d-fast [512, P]
+            // pe_positive flipped + negative; pos ne = [D, P], element (d, p)
+            // at d + D*p. torch div_term
+            // = exp(arange(0, 512, 2) * -ln(10000)/512): ONE frequency per
+            // (sin, cos) pair, exponent scaling with the even dim 2k.
+            const float c = -(float)std::log(10000.0) / (float)D;
             for (int i = 0; i < len; i++) {          // positive (flipped rows)
                 int row = len - 1 - i;               // flip
-                for (int d = 0; d < D; d++) {
-                    float pos_i = (float)i;
-                    float div = std::exp(-(float)std::log(10000.0) * (float)((d >> 1)) / (float)D);
-                    float val = (d % 2 == 0) ? std::sin(pos_i * div) : std::cos(pos_i * div);
-                    out[(size_t)d * P + row] = val;
+                for (int k = 0; k < D / 2; k++) {
+                    float div = std::exp((float)(2 * k) * c);
+                    out[(size_t)(2 * k) + (size_t)D * row] = std::sin((float)i * div);
+                    out[(size_t)(2 * k + 1) + (size_t)D * row] = std::cos((float)i * div);
                 }
             }
             for (int i = 1; i < len; i++) {          // negative rows
                 int row = len - 1 + i;
-                for (int d = 0; d < D; d++) {
-                    float pos_i = -(float)i;
-                    float div = std::exp(-(float)std::log(10000.0) * (float)((d >> 1)) / (float)D);
-                    float val = (d % 2 == 0) ? std::sin(pos_i * div) : std::cos(pos_i * div);
-                    out[(size_t)d * P + row] = val;
+                for (int k = 0; k < D / 2; k++) {
+                    float div = std::exp((float)(2 * k) * c);
+                    out[(size_t)(2 * k) + (size_t)D * row] = std::sin(-(float)i * div);
+                    out[(size_t)(2 * k + 1) + (size_t)D * row] = std::cos(-(float)i * div);
                 }
             }
         };
@@ -1367,6 +1428,22 @@ fprintf(stderr, "vocoder stage: %s\n", "campplus");
         fprintf(stderr, "vocoder: flow encoder compute failed\n");
         return false;
     }
+    if (getenv("MINICPMO_VOC_FE_DBG")) {      // dump fe stage sinks
+        const int nn = ggml_graph_n_nodes(p->fe_gf);
+        for (int ni = 0; ni < nn; ni++) {
+            ggml_tensor * t = ggml_graph_node(p->fe_gf, ni);
+            if (!t) continue;
+            const char * nm = ggml_get_name(t);
+            if (strncmp(nm, "fe", 2) != 0) continue;
+            std::vector<float> v((size_t)ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * 4);
+            char fp[512];
+            snprintf(fp, sizeof(fp), "%s_%s.f32",
+                     getenv("MINICPMO_VOC_FE_DBG"), nm);
+            FILE * f = fopen(fp, "wb");
+            if (f) { fwrite(v.data(), 4, v.size(), f); fclose(f); }
+        }
+    }
 fprintf(stderr, "vocoder stage: %s\n", "flow enc");
     std::vector<float> mu((size_t)n_mel * T2);
     ggml_backend_tensor_get(p->fe_mu, mu.data(), 0, mu.size() * sizeof(float));
@@ -1378,10 +1455,11 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
         ggml_backend_tensor_get(prompt_mels, flat.data(), 0, flat.size() * sizeof(float));
         for (int m = 0; m < n_mel; m++)
             for (int t = 0; t < T2p; t++)
-                conds[(size_t)m * T2 + t] = flat[(size_t)t * n_mel + m];
+                conds[(size_t)m + (size_t)n_mel * t] = flat[(size_t)t * n_mel + m];
     }
     // spk80 = affine(L2(spk))
     std::vector<float> spk80(n_mel);
+    std::vector<float> spk_rep((size_t)n_mel * T2, 0.f);   // spks repeated over t (ggml [80, T2])
     {
         std::vector<float> w, bw;
         host_f32(spk_proj_w, w);
@@ -1395,6 +1473,9 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
                 acc += w[(size_t)m * 192 + j] * p->spk[(size_t)j] * inv;
             spk80[(size_t)m] = acc + bw[(size_t)m];
         }
+        for (int m = 0; m < n_mel; m++)
+            for (int t = 0; t < T2; t++)
+                spk_rep[(size_t)m + (size_t)n_mel * t] = spk80[(size_t)m];
     }
 
     // ============================ CFM (DiT x euler) ========================
@@ -1415,7 +1496,14 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
         p->d_cond = in2("d_cond", n_mel, T2);
         p->d_t = in2("d_t", dit_d, 1);
         // all-visible F16 mask for flash attention
-        p->d_mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, T2, T2);
+        {   // the all-visible F16 mask lives in its own buffer: as a
+        // graph leaf it would otherwise be recycled by gallocr and its
+        // zeros clobbered between computes (FA then emits NaNs)
+            struct ggml_init_params mp = { 8ull * 1024 * 1024, NULL, true };
+            p->mask_ctx = ggml_init(mp);
+            p->d_mask = ggml_new_tensor_2d(p->mask_ctx, GGML_TYPE_F16, T2, T2);
+            p->mask_buf = ggml_backend_alloc_ctx_tensors(p->mask_ctx, B);
+        }
         ggml_tensor * cat = p->d_x;
         cat = ggml_concat(c, cat, p->d_mu, 0);
         cat = ggml_concat(c, cat, p->d_spk, 0);
@@ -1536,7 +1624,7 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
             ggml_backend_tensor_get(rand_noise, buf.data(), 0, buf.size() * sizeof(float));
             for (int m = 0; m < n_mel; m++)
                 for (int t = 0; t < T2; t++)
-                    x[(size_t)m * T2 + t] = buf[(size_t)m * n_rand + t];
+                    x[(size_t)m + (size_t)n_mel * t] = buf[(size_t)m * n_rand + t];
         }
         std::vector<float> dphi((size_t)n_mel * T2), dout((size_t)n_mel * T2);
         std::vector<float> zeros3((size_t)n_mel * T2, 0.f);
@@ -1610,7 +1698,7 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
         float t = t_span[0], dt = t_span[1] - t_span[0];
         const char * edump = getenv("MINICPMO_VOC_EULER_DUMP");
         for (int step = 1; step <= n_timesteps; step++) {
-            if (!eval_at(mu, spk80, conds, t, dphi)) return false;
+            if (!eval_at(mu, spk_rep, conds, t, dphi)) return false;
             if (!eval_at(zeros3, zeros3, zeros3, t, dout)) return false;
             if (edump) {                    // parity: per-step dphi cond/uncond
                 char fp[512];
@@ -1636,7 +1724,7 @@ fprintf(stderr, "vocoder stage: %s\n", "flow enc");
         p->mel.assign((size_t)n_mel * Tmel, 0.f);
         for (int m = 0; m < n_mel; m++)
             for (int t2 = 0; t2 < Tmel; t2++)
-                p->mel[(size_t)m * Tmel + t2] = x[(size_t)m * T2 + T2p + t2];
+                p->mel[(size_t)m * Tmel + t2] = x[(size_t)m + (size_t)n_mel * (T2p + t2)];
         if (const char * dp = getenv("MINICPMO_VOC_DUMP")) {
             std::string fp = std::string(dp) + "_mel.f32";
             FILE * f = fopen(fp.c_str(), "wb");
