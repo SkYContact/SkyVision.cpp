@@ -272,6 +272,17 @@ set(NEMOTRONOMNI_SRC
     src/models/nemotronomni/nemotronomni_vision.cpp
     src/models/nemotronomni/nemotronomni_audio.cpp)
 
+#   src/models/minicpmo/     OpenBMB MiniCPM-o 4.5 (Qwen3-8B trunk + SigLIP
+#                           NaFiT 9-slice tower + 64-query resampler +
+#                           whisper-medium audio + tk.* TTS sub-tower)
+set(MINICPMO_SRC
+    src/models/minicpmo/minicpmo_model.cpp
+    src/models/minicpmo/minicpmo_llm.cpp
+    src/models/minicpmo/minicpmo_vision.cpp
+    src/models/minicpmo/minicpmo_audio.cpp
+    src/models/minicpmo/minicpmo_talker.cpp
+    src/models/minicpmo/minicpmo_vocoder.cpp)
+
 # --- unified VQA front end (every backend in one binary) ---
 add_executable(vqa-cli
     src/cli/vqa_cli.cpp
@@ -299,7 +310,8 @@ add_executable(vqa-cli
     ${KEYE_VL_SRC}
     ${QWEN3OMNI_SRC}
     ${NEMOTRON_PARSE_SRC}
-    ${NEMOTRONOMNI_SRC})
+    ${NEMOTRONOMNI_SRC}
+    ${MINICPMO_SRC})
 target_link_libraries(vqa-cli PRIVATE ggml ggml-cpu)
 # expert_cache.cpp (CUDA async prefetch) includes cuda_runtime.h and calls the
 # CUDA runtime directly, so vqa-cli needs the toolkit headers/libs too
@@ -308,7 +320,7 @@ if (TARGET ggml-cuda)
     target_include_directories(vqa-cli PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(vqa-cli PRIVATE CUDA::cudart)
 endif()
-target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse ${CMAKE_SOURCE_DIR}/src/models/nemotronomni)
+target_include_directories(vqa-cli PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${MD_INC} ${VC3_INC} ${MV_INC} ${VM_INC} ${MAGE_INC} ${QO_INC} ${CMAKE_SOURCE_DIR}/src/models/qwen3vl ${CMAKE_SOURCE_DIR}/src/models/nemotron_parse ${CMAKE_SOURCE_DIR}/src/models/nemotronomni ${CMAKE_SOURCE_DIR}/src/models/minicpmo)
 if (VQA_HAVE_LIBJPEG)
     target_compile_definitions(vqa-cli PRIVATE VQA_HAVE_LIBJPEG)
     target_link_libraries(vqa-cli PRIVATE jpeg-static)
@@ -394,3 +406,33 @@ add_executable(nemotronomni-seg-test tools/nemotronomni_seg_test.cpp
     src/core/util/mmap.cpp)
 target_include_directories(nemotronomni-seg-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/nemotronomni)
 target_link_libraries(nemotronomni-seg-test PRIVATE ggml ggml-cpu)
+
+# --- MiniCPM-o 4.5 component parity (resampler / slice-grid / whisper chunk
+#     mask / tk. sub-tower step / one Qwen3 layer): seeded synthetic weights
+#     through the real branch builders; numpy reference is
+#     scripts/parity_minicpmo_seg.py ---
+add_executable(minicpmo-seg-test tools/minicpmo_seg_test.cpp
+    src/core/media/resample.cpp
+    src/models/minicpmo/minicpmo_llm.cpp
+    src/models/minicpmo/minicpmo_vision.cpp
+    src/models/minicpmo/minicpmo_audio.cpp
+    src/models/minicpmo/minicpmo_talker.cpp
+    src/models/minicpmo/minicpmo_vocoder.cpp
+    src/core/engine/backend.cpp
+    src/core/engine/expert_cache.cpp
+    src/core/engine/moe_compute.cpp
+    src/core/engine/step_graph.cpp
+    src/core/text/tokenizer.cpp src/core/text/utf8.cpp src/core/text/json_scan.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(minicpmo-seg-test PRIVATE ${GGML_INC} ${STB_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/minicpmo)
+target_link_libraries(minicpmo-seg-test PRIVATE ggml ggml-cpu)
+
+#   tools/minicpmo_vocoder_test.cpp --- token2wav vocoder parity driver
+#   (loads only minicpmo-vocoder.gguf; gates against the official
+#   token2wav dumps in D:/S2TT/minicpmo45-port/4vocoder)
+add_executable(minicpmo-vocoder-test tools/minicpmo_vocoder_test.cpp
+    src/models/minicpmo/minicpmo_vocoder.cpp
+    src/core/engine/backend.cpp
+    src/core/util/mmap.cpp)
+target_include_directories(minicpmo-vocoder-test PRIVATE ${GGML_INC} ${SRC_INC} ${CMAKE_SOURCE_DIR}/src/models/minicpmo)
+target_link_libraries(minicpmo-vocoder-test PRIVATE ggml ggml-cpu)

@@ -155,6 +155,12 @@ const ArchEntry kArchs[] = {
     // pre-tokenizer reproduces its ids (wave-3b gate 1, oracle parity).
     { { "nemotronomni", nullptr }, create_nemotronomni,
       TokenizerMode::Qwen2Regex, "models/nemotron3omni", 131072, false, false, "" },
+    // OpenBMB MiniCPM-o 4.5: Qwen3-8B trunk + SigLIP NaFiT 9-slice tower +
+    // 64-query resampler + whisper-medium audio + the tk.* TTS sub-tower
+    // (codebook ids; the CosyVoice2 token2wav vocoder ships separately). The
+    // checkpoint ships the Qwen3 151748-vocab tokenizer (Qwen2 BPE family).
+    { { "minicpmo", "minicpm_o", nullptr }, create_minicpmo,
+      TokenizerMode::Qwen2Regex, "models/minicpmo45", 151748, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {
