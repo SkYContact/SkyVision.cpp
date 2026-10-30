@@ -20,27 +20,10 @@
 #include <utility>
 #include <vector>
 
-// minimal work-stealing parallel-for for the host-side vocoder loops; the
-// per-index writes are disjoint in every call site (channels or positions)
-template <typename F>
-static void par_for(int n, F f) {
-    unsigned nt = std::thread::hardware_concurrency();
-    if (nt > 16) nt = 16;
-    if (n <= 1 || nt <= 1) {
-        for (int i = 0; i < n; i++) f(i);
-        return;
-    }
-    std::atomic<int> next{0};
-    std::vector<std::thread> pool;
-    pool.reserve(nt);
-    for (unsigned t = 0; t < nt; t++)
-        pool.emplace_back([&] {
-            int i;
-            while ((i = next.fetch_add(1)) < n) f(i);
-        });
-    for (auto & th : pool) th.join();
-}
 #include "qwen25omni_talker.hpp"
+
+#include "core/audio/codec_dsp.hpp"
+#include "core/audio/codec_graph.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -64,198 +47,18 @@ namespace qwen25omni {
 
 namespace {
 
-// backend-aware host copy of a bound weight tensor (works on CPU and GPU)
-void host_vec(ggml_tensor * t, std::vector<float> & out) {
-    const size_t n = (size_t)ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-    } else {
-        std::vector<ggml_fp16_t> raw(n);
-        ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < n; i++) out[i] = ggml_fp16_to_fp32(raw[i]);
-    }
-}
-
-}  // namespace
-
-namespace {
-
-// ---- host conv helpers (x laid out [C][T], weights torch [oc][ic][k]) -----
-
-void conv1d_full(const float * x, int ic, int T, const float * w, const float * b,
-                 int oc, int kw, int dil, int pad, float * y, int Ty) {
-    par_for(oc, [&](int o) {
-        float * yo = y + (size_t)o * Ty;
-        for (int n = 0; n < Ty; n++) yo[n] = b ? b[(size_t)o] : 0.0f;
-        for (int i = 0; i < ic; i++) {
-            const float * xc = x + (size_t)i * T;
-            const float * wo = w + ((size_t)o * ic + i) * kw;
-            for (int kk = 0; kk < kw; kk++) {
-                // torch conv1d is correlation: out[n] += w[k] * x[n + k - pad]
-                const int off = kk * dil - pad;
-                const float * wk = wo + kk;
-                for (int n = 0; n < Ty; n++) {
-                    const int idx = n + off;   // output stride is 1; dilation
-                    if (idx >= 0 && idx < T)   // only spreads the kernel taps
-                        yo[n] += wk[0] * xc[idx];
-                }
-            }
-        }
-    });
-}
-
-void conv_transpose1d_full(const float * x, int ic, int T, const float * w, const float * b,
-                           int oc, int kw, int stride, int pad, float * y, int Ty) {
-    std::fill(y, y + (size_t)oc * Ty, 0.0f);
-    par_for(oc, [&](int o) {
-        float * yrow = y + (size_t)o * Ty;
-        for (int i = 0; i < ic; i++) {
-            const float * xc = x + (size_t)i * T;
-            const float * wo = w + ((size_t)i * oc) * kw;
-            for (int n = 0; n < T; n++) {
-                const float xv = xc[n];
-                for (int kk = 0; kk < kw; kk++) {
-                    const int idx = n * stride - pad + kk;
-                    if (idx >= 0 && idx < Ty) yrow[idx] += wo[(size_t)o * kw + kk] * xv;
-                }
-            }
-        }
-    });
-    if (b)
-        for (int o = 0; o < oc; o++) {
-            float * yo = y + (size_t)o * Ty;
-            for (int n = 0; n < Ty; n++) yo[n] += b[o];
-        }
-}
-
-float bessel_i0(float x) {
-    float s = 1.0f, t = 1.0f;
-    const float h = x * x / 4.0f;
-    for (int m = 1; m < 40; m++) {
-        t *= h / ((float)m * (float)m);
-        s += t;
-        if (t < 1e-10f * s) break;
-    }
-    return s;
-}
-
-// transformers' kaiser_sinc_filter1d (even kernels)
-std::vector<float> kaiser_sinc_filter1d(int kernel, float cutoff, float half_width) {
-    const int half = kernel / 2;
-    const float delta_f = 4 * half_width;
-    const float atten = 2.285f * (half - 1) * (float)M_PI * delta_f + 7.95f;
-    float beta = 0.0f;
-    if (atten > 50.0f) beta = 0.1102f * (atten - 8.7f);
-    else if (atten >= 21.0f)
-        beta = 0.5842f * powf(atten - 21.0f, 0.4f) + 0.07886f * (atten - 21.0f);
-    const float i0b = bessel_i0(beta);
-    std::vector<float> f((size_t)kernel);
-    for (int n = 0; n < kernel; n++) {
-        const float r = ((float)n - (float)(kernel - 1) / 2.0f) / ((float)(kernel - 1) / 2.0f);
-        const float kwin = bessel_i0(beta * sqrtf(std::max(0.0f, 1.0f - r * r))) / i0b;
-        const float t = (float)(n - half) + 0.5f;
-        // torch.sinc(2*cutoff*t) * 2*cutoff, then normalized to sum 1 (HF)
-        const float a = 2.0f * (float)M_PI * cutoff * t;
-        const float v = (t == 0.0f) ? 1.0f : sinf(a) / a;
-        f[(size_t)n] = 2.0f * cutoff * v * kwin;
-    }
-    double sum = 0.0;
-    for (float v : f) sum += v;
-    if (sum != 0.0)
-        for (auto & v : f) v = (float)(v / sum);
-    return f;
-}
-
-// anti-aliased activation resampler: replicate pad, depthwise filter, crop
-// (UpSample1d: ratio*x transposed-conv; DownSample1d: strided conv)
-void aa_resample(const float * x, int C, int T, const std::vector<float> & filter,
-                 int kernel, int ratio, bool up, float * y, int Ty) {
-    const int pad = kernel / ratio - 1;
-    const int Tp = T + 2 * pad;
-    std::vector<float> xp((size_t)C * Tp);
-    for (int c = 0; c < C; c++) {
-        const float * xc = x + (size_t)c * T;
-        float * dst = xp.data() + (size_t)c * Tp;
-        for (int i = 0; i < pad; i++) dst[i] = xc[0];
-        memcpy(dst + pad, xc, (size_t)T * sizeof(float));
-        for (int i = 0; i < pad; i++) dst[T + pad + i] = xc[T - 1];
-    }
-    std::fill(y, y + (size_t)C * Ty, 0.0f);
-    if (up) {
-        for (int c = 0; c < C; c++) {
-            const float * xc = xp.data() + (size_t)c * Tp;
-            float * yc = y + (size_t)c * Ty;
-            for (int n = 0; n < Tp; n++) {
-                const float xv = xc[n];
-                for (int kk = 0; kk < kernel; kk++) {
-                    const int idx = n * ratio + kk - (kernel - ratio) / 2;
-                    if (idx >= 0 && idx < Ty) yc[idx] += ratio * filter[(size_t)kk] * xv;
-                }
-            }
-        }
-    } else {
-        conv1d_full(xp.data(), C, Tp, filter.data(), nullptr, C, kernel, ratio, 0, y, Ty);
-    }
-}
-
-// anti-aliased SnakeBeta: up2 (replicate pad 5, transposed-conv scatter,
-// crop 15/16) -> snake -> down2 (replicate pad 5/6, strided conv), all with
-// the 12-tap kaiser filter - exactly HF's AntiAliasedActivation1d
-static const std::vector<float> aa_filter = kaiser_sinc_filter1d(12, 0.25f, 0.3f);
-
-void aa_snake_act(const float * x, int C, int T, const std::vector<float> & alpha,
-                  const std::vector<float> & beta, const std::vector<float> & filter,
-                  float * y) {
-    const int K = (int)filter.size();          // 12
-    const int pad = K / 2 - 1;                 // 5
-    const int pad_l = pad * 2 + (K - 2) / 2;   // 15
-    const int pad_r = pad * 2 + (K - 2 + 1) / 2;  // 16
-    const int Tu = 2 * T - 1;
-    std::vector<float> up((size_t)C * Tu);
-    par_for(C, [&](int c) {   // C is small late in the stack; the inner loops
-                              // are long enough that channel-level split works
-        const float * xc = x + (size_t)c * T;
-        float * yu = up.data() + (size_t)c * Tu;
-        auto at = [&](int i) { return xc[i < 0 ? 0 : (i >= T ? T - 1 : i)]; };
-        for (int n = -pad; n < T + pad; n++) {          // padded input positions
-            const float xv = at(n);
-            for (int kk = 0; kk < K; kk++) {
-                const int idx = (n + pad) * 2 + kk;      // full transposed-conv index
-                const int o = idx - pad_l;
-                if (o >= 0 && o < Tu) yu[o] += 2.0f * filter[(size_t)kk] * xv;
-            }
-        }
-        // snake on the upsampled grid
-        const float a = expf(alpha[(size_t)c]);
-        const float b = expf(beta[(size_t)c]) + 1e-9f;
-        float * xu = up.data() + (size_t)c * Tu;
-        for (int n = 0; n < Tu; n++) xu[n] += sinf(xu[n] * a) * sinf(xu[n] * a) / b;
-        // down2: replicate pad left 5 / right 6, strided depthwise conv
-        const int dl = K / 2 - 1, dr = K / 2;
-        float * yc = y + (size_t)c * T;
-        auto at2 = [&](int i) { return xu[i < 0 ? 0 : (i >= Tu ? Tu - 1 : i)]; };
-        for (int n = 0; n < T; n++) {
-            float sm = 0.0f;
-            for (int kk = 0; kk < K; kk++) sm += filter[(size_t)kk] * at2(n * 2 - dl + kk);
-            yc[n] = sm;
-        }
-    });
-}
-
-void snake_act(const float * x, int C, int T, const std::vector<float> & alpha,
-               const std::vector<float> & beta, float * y) {
-    for (int c = 0; c < C; c++) {
-        const float a = expf(alpha[(size_t)c]);
-        const float b = expf(beta[(size_t)c]) + 1e-9f;
-        const float * xc = x + (size_t)c * T;
-        float * yc = y + (size_t)c * T;
-        for (int n = 0; n < T; n++) {
-            const float s = sinf(xc[n] * a);
-            yc[n] = xc[n] + s * s / b;
-        }
-    }
-}
+// the host vocoder DSP (par_for, host weight reads, plain/transposed conv
+// loops, kaiser-sinc filter + aa-snake machinery) lives in
+// core/audio/codec_dsp.hpp now - verbatim move, the T2W_HOST=1 oracle path
+// and the campplus host loops keep their call sites through these aliases
+using vqa::codec::aa_filter;
+using vqa::codec::aa_resample;
+using vqa::codec::aa_snake_act;
+using vqa::codec::conv1d_full;
+using vqa::codec::conv_transpose1d_full;
+using vqa::codec::host_f32;
+using vqa::codec::par_for;
+using vqa::codec::snake_act;
 
 // host GEMV for the small time-embedding MLPs: y[o] = b + W[o][:] . x
 void linear_host(const std::vector<float> & w, const std::vector<float> & b, int in, int out,
@@ -326,7 +129,7 @@ bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
         ggml_tensor * t = gt(n);
         if (!t) return false;
         out.resize((size_t)ggml_nelements(t));
-        host_vec(t, out);
+        host_f32(t, out);
         return true;
     };
     gf("bg.conv_pre.weight", bg_pre_w);
@@ -342,7 +145,7 @@ bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
         snprintf(b, sizeof(b), "bg.up.%d.weight", u);
         ggml_tensor * t = gt(b);
         ups[(size_t)u].w.resize((size_t)ggml_nelements(t));
-        host_vec(t, ups[(size_t)u].w);
+        host_f32(t, ups[(size_t)u].w);
         snprintf(b, sizeof(b), "bg.up.%d.bias", u);
         gf(b, ups[(size_t)u].b);
         ups[(size_t)u].k = up_k[u];
@@ -360,7 +163,7 @@ bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
                 ggml_tensor * t = gt(b);
                 Conv1D c;
                 c.w.resize((size_t)ggml_nelements(t));
-                host_vec(t, c.w);
+                host_f32(t, c.w);
                 snprintf(b, sizeof(b), "bg.rb.%d.c1.%d.bias", r, kk);
                 gf(b, c.b);
                 R.c1.push_back(std::move(c));
@@ -370,7 +173,7 @@ bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
                 ggml_tensor * t = gt(b);
                 Conv1D c;
                 c.w.resize((size_t)ggml_nelements(t));
-                host_vec(t, c.w);
+                host_f32(t, c.w);
                 snprintf(b, sizeof(b), "bg.rb.%d.c2.%d.bias", r, kk);
                 gf(b, c.b);
                 R.c2.push_back(std::move(c));
@@ -402,7 +205,7 @@ bool Token2Wav::load(ggml_backend_t backend_, struct ggml_context * wctx) {
 // speaker embedding of a reference mel [80 x T]; runs once per turn
 bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) {
     std::vector<float> w0, b0;
-    host_vec(spk_tdnn0_w, w0); host_vec(spk_tdnn0_b, b0);
+    host_f32(spk_tdnn0_w, w0); host_f32(spk_tdnn0_b, b0);
     std::vector<float> cur((size_t)80 * T);
     memcpy(cur.data(), mel, (size_t)80 * T * sizeof(float));
     int cc = 80;
@@ -437,7 +240,7 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
     };
     auto bias_vec = [&](ggml_tensor * t) {
         std::vector<float> v;
-        host_vec(t, v);
+        host_f32(t, v);
         return v;
     };
     conv(cur, cc, w0.data(), bias_vec(spk_tdnn0_b), 256,
@@ -455,11 +258,11 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
     for (int bi = 0; bi < 3; bi++) {
         const SpkBlock & B = spk_blocks[(size_t)bi];
         std::vector<float> w1, b1, w2, b2, wr, br, se1w, se1b, se2w, se2b;
-        host_vec(B.tdnn1_w, w1); host_vec(B.tdnn1_b, b1);
-        host_vec(B.tdnn2_w, w2); host_vec(B.tdnn2_b, b2);
-        host_vec(B.res2net_w[0], wr); host_vec(B.res2net_b[0], br);
-        host_vec(B.se1_w, se1w); host_vec(B.se1_b, se1b);
-        host_vec(B.se2_w, se2w); host_vec(B.se2_b, se2b);
+        host_f32(B.tdnn1_w, w1); host_f32(B.tdnn1_b, b1);
+        host_f32(B.tdnn2_w, w2); host_f32(B.tdnn2_b, b2);
+        host_f32(B.res2net_w[0], wr); host_f32(B.res2net_b[0], br);
+        host_f32(B.se1_w, se1w); host_f32(B.se1_b, se1b);
+        host_f32(B.se2_w, se2w); host_f32(B.se2_b, se2b);
         const int dil = bi + 2;   // enc_dilations 1,2,3,4 for blocks 0..3
         // kernel widths from the actual checkpoint (this CampPlus variant uses
         // 1x1 convs in the SE-Res2Net blocks despite the config table)
@@ -533,7 +336,7 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
         memcpy(mfa_in.data() + (size_t)bi * cc * T, block_outs[(size_t)bi].data(),
                (size_t)cc * T * sizeof(float));
     std::vector<float> wmfa, bmfa;
-    host_vec(spk_mfa_w, wmfa); host_vec(spk_mfa_b, bmfa);
+    host_f32(spk_mfa_w, wmfa); host_f32(spk_mfa_b, bmfa);
     conv(mfa_in, cc * 3, wmfa.data(), bmfa, 768, 1, 1);
     if (getenv("T2W_DEBUG")) {
         bool nan = false;
@@ -542,9 +345,9 @@ bool Token2Wav::ecapa_embed(const float * mel, int T, std::vector<float> & out) 
     }
     // attentive statistics pooling
     std::vector<float> wattn, battn, wconv, bconv, wfc, bfc;
-    host_vec(spk_asp_tdnn_w, wattn); host_vec(spk_asp_tdnn_b, battn);
-    host_vec(spk_asp_conv_w, wconv); host_vec(spk_asp_conv_b, bconv);
-    host_vec(spk_fc_w, wfc); host_vec(spk_fc_b, bfc);
+    host_f32(spk_asp_tdnn_w, wattn); host_f32(spk_asp_tdnn_b, battn);
+    host_f32(spk_asp_conv_w, wconv); host_f32(spk_asp_conv_b, bconv);
+    host_f32(spk_fc_w, wfc); host_f32(spk_fc_b, bfc);
     const int ac = 64;   // enc_attention_channels
     std::vector<float> att((size_t)768 * T);
     {
@@ -778,8 +581,8 @@ bool Token2Wav::dit_eval(const float * x, int T0h, float t, const float * codec_
     const int T = T0 * 2;   // CFG batch
     // host time embedding: sinus(256) -> mlp0 -> silu -> mlp1 -> [d_dim]
     static std::vector<float> w0, b0, w1, b1;
-    if (w0.empty()) { host_vec(time_mlp0_w, w0); host_vec(time_mlp0_b, b0);
-                      host_vec(time_mlp1_w, w1); host_vec(time_mlp1_b, b1); }
+    if (w0.empty()) { host_f32(time_mlp0_w, w0); host_f32(time_mlp0_b, b0);
+                      host_f32(time_mlp1_w, w1); host_f32(time_mlp1_b, b1); }
     std::vector<float> te((size_t)256), th((size_t)d_dim);
     for (int i = 0; i < 128; i++) {
         const float f = expf(-logf(10000.0f) * (float)i / 127.0f);
@@ -1339,13 +1142,11 @@ bool Token2Wav::build_bg_graph(int L0) {
         return yc;
     };
     // depthwise conv with an F32 im2col, same reasoning
+    // depthwise conv with an F32 im2col (shared core with the qwen3omni c2w
+    // stack; dil is 1 here - the aa filter is not dilated)
     auto conv_dw_f32 = [&](ggml_tensor * k /*[K,1,C] F32*/, ggml_tensor * in /*[T,C]*/,
                            int st, int pad) {
-        ggml_tensor * nb4 = ggml_reshape_4d(bctx, in, in->ne[0], 1, in->ne[1], 1);
-        ggml_tensor * im = ggml_im2col(bctx, k, nb4, st, 0, pad, 0, 1, 0, false,
-                                       GGML_TYPE_F32);              // [K, OW, C]
-        ggml_tensor * r = ggml_mul_mat(bctx, im, k);                // [OW, 1, C]
-        return ggml_reshape_3d(bctx, r, r->ne[0], r->ne[2], 1);     // [OW, C]
+        return vqa::codec::conv_dw_cols(bctx, k, in, st, pad, 1);
     };
     // scalar constant broadcastable anywhere
     auto fconst = [&](float v) {
@@ -1436,7 +1237,7 @@ bool Token2Wav::build_bg_graph(int L0) {
         char wn[64];
         snprintf(wn, sizeof(wn), "bg.up.%d.weight", u);
         std::vector<float> uw;
-        host_vec(gt(wn), uw);
+        host_f32(gt(wn), uw);
         snprintf(wn, sizeof(wn), "bg.up.%d.bias", u);
         ggml_tensor * ub = gt(wn);
         const int64_t uw_ne[3] = { up_k[u], OC, (int64_t)Cc };

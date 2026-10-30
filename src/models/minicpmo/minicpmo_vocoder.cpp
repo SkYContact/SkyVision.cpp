@@ -56,6 +56,8 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "core/audio/codec_dsp.hpp"
+#include "core/audio/codec_graph.hpp"
 #include "core/engine/gguf_util.hpp"
 #include "core/engine/weight_load.hpp"
 #include "core/util/mmap.hpp"
@@ -97,172 +99,21 @@ struct Vocrng {
     }
 };
 
-void host_f32(ggml_tensor * t, std::vector<float> & out) {
-    const size_t n = (size_t)ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-        return;
-    }
-    std::vector<ggml_fp16_t> raw(n);
-    ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_fp16_t));
-    for (size_t i = 0; i < n; i++) out[i] = ggml_fp16_to_fp32(raw[i]);
-}
+// planar layout, zero pads, im2col conv1d and the HiFT snake live in
+// core/audio/codec_graph.hpp now (verbatim move; the per-tap dilation path
+// and its tap-dump statics went with it)
+using vqa::codec::host_f32;
+using vqa::codec::to_dfast;
+using vqa::codec::to_planar;
+using vqa::codec::pad_left;
+using vqa::codec::pad_sym;
 
-// planar helpers
-ggml_tensor * to_planar(ggml_context * c, ggml_tensor * x) {   // [D, T]->[T, D]
-    return ggml_cont(c, ggml_transpose(c, x));
-}
-ggml_tensor * to_dfast(ggml_context * c, ggml_tensor * x) {    // [T, D]->[D, T]
-    return ggml_cont(c, ggml_transpose(c, x));
-}
-// left-pad a planar [T, C] tensor with t0 zero frames (causal convs)
-ggml_tensor * pad_left(ggml_context * c, ggml_tensor * x, int t0) {
-    ggml_tensor * z = ggml_fill(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, t0,
-                                                      x->ne[1]), 0.0f);
-    return ggml_concat(c, z, x, 0);
-}
-// symmetric zero pad of a planar [T, C] tensor (ggml_pad's kernel is not
-// usable here - it corrupted rows in this graph)
-ggml_tensor * pad_sym(ggml_context * c, ggml_tensor * x, int t) {
-    ggml_tensor * z = ggml_fill(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, t,
-                                                      x->ne[1]), 0.0f);
-    return ggml_concat(c, ggml_concat(c, z, x, 0), z, 0);
-}
-// conv1d via ggml_im2col + one mul_mat. The stored kernel is 2-D
-// [IC*K, OC]: rows are (ic, k) ic-major, exactly matching the im2col column
-// order (verified: [0, x[0,0], x[1,0], 0, x[0,1], x[1,1], ...] for k3 p1),
-// so ONE mul_mat computes the conv. The kernel passed to ggml_im2col is a
-// shape-only fake (im2col reads only its ne for the output geometry; its
-// data comes from b).
-static ggml_tensor * g_conv1_cols = nullptr;   // debug: last conv1 cols
-static ggml_tensor * g_conv1_y = nullptr;      // debug: raw mulmat out
-static ggml_tensor * g_conv1_pl = nullptr;     // debug: planar out
-static ggml_cgraph * gf_dbg = nullptr;         // debug: graph for tap sinks
-// lazy (k, ic)-reordered copies of conv kernels for the per-tap conv path
-static std::map<const void *, ggml_tensor *> g_reord;
-static int ntap = 0;                           // debug: per-tap conv counter
-static ggml_backend_t g_voc_backend = nullptr;
-static ggml_tensor * voc_reordered_kernel(ggml_tensor * w, int IC, int K) {
-    auto it = g_reord.find(w->data);
-    if (it != g_reord.end()) return it->second;
-    struct ggml_init_params ip = { 8ull * 1024 * 1024, NULL, true };
-    ggml_context * rc = ggml_init(ip);
-    ggml_tensor * dst = ggml_new_tensor_2d(rc, GGML_TYPE_F32,
-                                           w->ne[0], w->ne[1]);
-    ggml_backend_buffer_t bbuf = ggml_backend_alloc_ctx_tensors(rc, g_voc_backend);
-    std::vector<float> in_((size_t)w->ne[0] * w->ne[1]);
-    ggml_backend_tensor_get(w, in_.data(), 0, in_.size() * 4);
-    std::vector<float> out_(in_.size());
-    const size_t R = (size_t)w->ne[0];
-    for (size_t oc = 0; oc < (size_t)w->ne[1]; oc++)
-        for (int ic = 0; ic < IC; ic++)
-            for (int k = 0; k < K; k++)
-                out_[(size_t)(k * IC + ic) + oc * R] =
-                    in_[(size_t)(ic * K + k) + oc * R];
-    ggml_backend_tensor_set(dst, out_.data(), 0, out_.size() * 4);
-    (void)bbuf;   // buffer owns the data; intentionally leaked with the map
-    g_reord.emplace(w->data, dst);
-    // idempotence: a kernel that is ALREADY (k, ic)-ordered (the load-time
-    // reorder slots rb/srb c1[1]/c1[2]) must map to itself, or the second
-    // reorder would swap it back to (ic, k) and desync the per-tap gather.
-    g_reord.emplace(dst->data, dst);
-    return dst;
-}
 ggml_tensor * conv1(ggml_context * c, ggml_tensor * w, ggml_tensor * b,
                     ggml_tensor * x, int s, int p, int d) {
-    if (ggml_n_dims(w) == 3)   // 3-D stored kernel (cam_ll/tdnn): gguf
-        w = ggml_reshape_2d(c, w, w->ne[0] * w->ne[1], w->ne[2]);  // [K*IC, OC]
-    ggml_tensor * xp = (p > 0) ? pad_sym(c, x, p) : x;
-    const int IC = (int)x->ne[1];
-    const int OC = (int)w->ne[1];
-    const int K = (int)(w->ne[0] / IC);
-    const int T = (int)xp->ne[0];
-    const int T2 = (T - d * (K - 1) - 1) / s + 1;
-    ggml_tensor * fake = ggml_new_tensor_3d(c, GGML_TYPE_F32, K, IC, OC);
-    ggml_tensor * y;
-    if (s == 1) {
-        // ggml_im2col mis-samples for dilation > 2: gather the taps
-        // explicitly. cols rows are (k, ic) - k outer, ic inner - so the
-        // kernel must be the (k, ic)-reordered copy built at load.
-        // NOTE: materialize the transposed layout FIRST (dup over the
-        // transpose tensor itself, which carries the real nb), then
-        // row-slice the dense copy. A VIEW of a transposed tensor loses
-        // nb[0] (ggml views reset it to type_size), so ops on it silently
-        // read row-major - do not cont/view through such a view.
-        ggml_tensor * xpv = ggml_cont(c, ggml_transpose(c, xp)); // [IC, T] dense
-        // per-tap mul_mat accumulation (this ggml's concat along dim0 is
-        // unreliable at conv scales - it scrambled blocks of correct inputs).
-        // IMPORTANT: never cont a view with a nonzero byte offset (the CPU
-        // dup scrambles it here). Slice xp as a contiguous-row view first
-        // (row-copy dup path, exact), then transpose that dense copy
-        // (to_planar pattern, exact); same for the kernel slices.
-        const int conv_id = ++ntap;
-        const bool tap_full = (IC == 256 && OC == 256 && K == 7
-                               && getenv("MINICPMO_VOC_TAPDUMP")
-                               && conv_id <= 8);
-        ggml_tensor * acc = nullptr;
-        for (int k = 0; k < K; k++) {
-            ggml_tensor * x_kp = ggml_cont(c, ggml_view_2d(c, xp, T2, IC,
-                                               xp->nb[1], (size_t)k * d * 4));
-            ggml_tensor * x_k = ggml_cont(c, ggml_transpose(c, x_kp));
-            ggml_tensor * w_r = voc_reordered_kernel(w, IC, K);
-            ggml_tensor * w_k = ggml_cont(c, ggml_view_2d(c, w_r, IC, OC,
-                                              (size_t)IC * K * 4,
-                                              (size_t)k * IC * 4));
-            ggml_tensor * zz = ggml_mul_mat(c, w_k, x_k);           // [OC, T2]
-            if (tap_full) {
-                char nm[32];
-                snprintf(nm, sizeof(nm), "tap_z%d_%d", conv_id, k);
-                ggml_tensor * tz = ggml_cont(c, zz);
-                ggml_set_name(tz, nm);
-                ggml_set_output(tz);
-                ggml_build_forward_expand(gf_dbg, tz);
-            }
-            acc = acc ? ggml_add(c, acc, zz) : zz;
-        }
-        y = acc;
-        if (tap_full) {
-            auto dump_sink = [&](ggml_tensor * t, const char * nm) {
-                ggml_tensor * tc = ggml_cont(c, t);
-                ggml_set_name(tc, nm);
-                ggml_set_output(tc);
-                ggml_build_forward_expand(gf_dbg, tc);
-            };
-            dump_sink(x, "tap_x");
-            dump_sink(xpv, "tap_xpv");
-            dump_sink(acc, "tap_acc");
-            dump_sink(y, "tap_y");
-        }
-    } else if (s > 2) {
-        // ggml_im2col mis-samples for stride > 2; run the FULL stride-1
-        // conv (verified exact) and decimate: conv stride s out[t] ==
-        // full[s*t], a strided view of the [OC, Mf] output.
-        const int Mf = T - K + 1;                       // stride-1 length
-        ggml_tensor * cols1 = ggml_im2col(c, fake, xp, 1, 0, 0, 0, 1,
-                                          0, false, GGML_TYPE_F32);
-        ggml_tensor * yf = ggml_mul_mat(c, w,
-            ggml_reshape_2d(c, cols1, IC * K, Mf));     // [OC, Mf]
-        y = ggml_view_2d(c, yf, OC, T2, yf->nb[1] * s, 0);
-    } else {
-        ggml_tensor * cols = ggml_im2col(c, fake, xp, s, 0, 0, 0, d, 0, false,
-                                         GGML_TYPE_F32);  // [IC*K, OW]
-        g_conv1_cols = cols;
-        y = ggml_mul_mat(c, w,
-            ggml_reshape_2d(c, cols, IC * K, T2));
-    }
-    g_conv1_y = y;
-    y = to_planar(c, y);                             // [T, OC]
-    g_conv1_pl = y;
-    if (b) {   // planar [T, C]: the bias must broadcast on channels ([1, C])
-        y = ggml_add(c, y, ggml_reshape_2d(c, b, 1, b->ne[0]));
-    }
-    return y;
+    return vqa::codec::conv1_planar(c, w, b, x, s, p, d);
 }
 ggml_tensor * snake(ggml_context * c, ggml_tensor * x, ggml_tensor * alpha) {
-    // x + sin(alpha*x)^2 / alpha  (alpha [1, C] view, alpha_logscale false)
-    ggml_tensor * s = ggml_sin(c, ggml_mul(c, x, alpha));
-    return ggml_add(c, x, ggml_div(c, ggml_mul(c, s, s), alpha));
+    return vqa::codec::snake_hift(c, x, alpha);
 }
 
 }  // namespace
@@ -343,7 +194,7 @@ struct Vocoder::impl {
 // ---------------------------------------------------------------- load
 bool Vocoder::load(ggml_backend_t backend_, const char * path) {
     backend = backend_;
-    g_voc_backend = backend_;
+    vqa::codec::g_voc_backend = backend_;
     if (!p) p = new impl;
     p->allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     p->allocr_cf = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
@@ -683,7 +534,7 @@ bool Vocoder::load(ggml_backend_t backend_, const char * path) {
             // register the pre-reordered copy as ALREADY (k, ic)-ordered, or
             // voc_reordered_kernel would treat it as a stored (ic, k) kernel
             // and swap it back (double reorder -> per-tap gather desyncs)
-            g_reord.emplace((*j.dst)->data, *j.dst);
+            vqa::codec::g_reord.emplace((*j.dst)->data, *j.dst);
         }
     }
     dense_w = gt("spk.dense.weight"); dense_b = gt("spk.dense.bias");
@@ -1943,8 +1794,8 @@ fprintf(stderr, "vocoder stage: %s\n", "sine");
         p->dec_ctx = ggml_init(ip);
         ggml_context * c = p->dec_ctx;
         ggml_cgraph * gf = ggml_new_graph_custom(c, 32768, false);
-        gf_dbg = gf;    // debug: per-tap sinks attach to this graph
-        ntap = 0;       // debug: restart per-tap conv numbering at the decode
+        vqa::codec::gf_dbg = gf;    // debug: per-tap sinks attach to this graph
+        vqa::codec::ntap = 0;       // debug: restart per-tap conv numbering at the decode
         ggml_tensor * mel_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, Tm, n_mel);
         ggml_set_input(mel_in); ggml_set_name(mel_in, "dec_mel");
         ggml_tensor * sstft_in = ggml_new_tensor_2d(c, GGML_TYPE_F32,
@@ -2064,7 +1915,7 @@ fprintf(stderr, "vocoder stage: %s\n", "sine");
             ggml_tensor * si = (u > 1)
                 ? conv1(c, sdown[i].w, sdown[i].b, sstft_in, u, u / 2, 1)
                 : conv1(c, sdown[i].w, sdown[i].b, sstft_in, 1, 0, 1);
-            if (dbg && i == 0) dec_sink(g_conv1_y, "d_yraw0");
+            if (dbg && i == 0) dec_sink(vqa::codec::g_conv1_y, "d_yraw0");
             if (dbg && i == 0) dec_sink(si, "d_sdown0");
             si = resblock(si, srb[i]);
             if (dbg && i == 0) dec_sink(si, "d_si0");

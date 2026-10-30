@@ -1,6 +1,8 @@
 // qwen3omni_talker.cpp - see qwen3omni_talker.hpp for the protocol contract.
 #include "qwen3omni_talker.hpp"
 
+#include "core/audio/codec_graph.hpp"
+
 #include "core/util/mmap.hpp"
 #include "core/util/aligned_buf.hpp"
 #include "core/engine/weight_load.hpp"
@@ -737,73 +739,31 @@ static bool c2w_vocoder_graph(Talker * t, C2wGraph & G, int N) {
         const int64_t ne[1] = { (int64_t)v.size() };
         return new_in(ne, 1, v.data(), v.size() * 4);
     };
-    auto zeros_ct = [&](int C, int T) {
-        std::vector<float> z((size_t)C * T, 0.0f);
-        const int64_t ne[2] = { C, T };
-        return new_in(ne, 2, z.data(), z.size() * 4);
-    };
     auto toCT = [&](ggml_tensor * x) { return ggml_cont(c, ggml_transpose(c, x)); };
-
+    // shared codec cores (core/audio/codec_graph.hpp) with the per-build F32
+    // upload front end injected; the causal zero pad rides the same upload
+    // path the hand-written lambdas used
+    auto upload_in = [&](const int64_t * ne, int nd, const void * data, size_t nb) {
+        return new_in(ne, nd, data, nb);
+    };
     // dense causal conv: CT in -> CT out (stride 1, dilation d, groups=1)
     auto conv_causal = [&](const C2wConv & cc, ggml_tensor * x) {
-        const int Ci = (int)x->ne[0];
-        const int pad_left = (cc.k - 1) * cc.dilation;
-        ggml_tensor * xp = x;
-        if (pad_left > 0) xp = ggml_concat(c, zeros_ct(Ci, pad_left), x, 1);
-        // host bytes are [OC, IC, K] k-fastest == ggml [K, IC, OC]
-        const int64_t wne[3] = { cc.k, (int64_t)cc.ci, (int64_t)cc.co };
-        ggml_tensor * w = new_in(wne, 3, cc.w.data(), cc.w.size() * 4);
-        ggml_tensor * in = ggml_cont(c, ggml_transpose(c, xp));         // [T+pad, Ci]
-        ggml_tensor * im = ggml_im2col(c, w, in, 1, 0, 0, 0, cc.dilation, 0, false, GGML_TYPE_F32);
-        ggml_tensor * y = ggml_mul_mat(c,
-            ggml_reshape_2d(c, im, im->ne[0], im->ne[2] * im->ne[1]),
-            ggml_reshape_2d(c, w, w->ne[0] * w->ne[1], w->ne[2]));      // [T, OC]
-        ggml_tensor * yc = toCT(y);
-        if (cc.has_bias) yc = ggml_add(c, yc, vec_in(cc.b));
-        return yc;
+        return vqa::codec::conv_causal(c, upload_in, cc.w, cc.b, cc.has_bias,
+                                       cc.k, cc.ci, cc.co, cc.dilation, x);
     };
     // depthwise causal conv (groups=C): CT in -> CT out
     auto dw_causal = [&](const C2wConv & cc, ggml_tensor * x) {
-        const int Ci = (int)x->ne[0];
-        const int pad_left = (cc.k - 1) * cc.dilation;
-        ggml_tensor * xp = x;
-        if (pad_left > 0) xp = ggml_concat(c, zeros_ct(Ci, pad_left), x, 1);
-        const int64_t kne[3] = { cc.k, 1, (int64_t)cc.co };
-        ggml_tensor * k = new_in(kne, 3, cc.w.data(), cc.w.size() * 4);
-        ggml_tensor * in = ggml_cont(c, ggml_transpose(c, xp));          // [T+pad, C]
-        ggml_tensor * nb4 = ggml_reshape_4d(c, in, in->ne[0], 1, in->ne[1], 1);
-        ggml_tensor * im = ggml_im2col(c, k, nb4, 1, 0, 0, 0, cc.dilation, 0, false, GGML_TYPE_F32);
-        ggml_tensor * r = ggml_mul_mat(c, im, k);                        // [OW, 1, C]
-        ggml_tensor * y3 = ggml_reshape_3d(c, r, r->ne[0], r->ne[2], 1);  // [T, C]
-        ggml_tensor * yc = toCT(y3);
-        if (cc.has_bias) yc = ggml_add(c, yc, vec_in(cc.b));
-        return yc;
+        return vqa::codec::dw_causal(c, upload_in, cc.w, cc.b, cc.has_bias,
+                                     cc.k, cc.co, cc.dilation, x);
     };
     // transposed conv: CT in -> CT out, trim (k-s) at BOTH ends (HF TransConvNet)
     auto transconv = [&](const C2wConv & cc, ggml_tensor * x) {
-        const int r = cc.stride, k = cc.k;
-        const int OC = cc.co;
-        const int raw = ((int)x->ne[1] - 1) * r + k;
-        const int trim = k - r, to = raw - 2 * trim;
-        const int64_t wne[3] = { k, OC, (int64_t)cc.ci };                // [K, OC, IC] bytes
-        ggml_tensor * w = new_in(wne, 3, cc.w.data(), cc.w.size() * 4);
-        ggml_tensor * in = ggml_cont(c, ggml_transpose(c, x));           // [T, IC]
-        ggml_tensor * yt = ggml_conv_transpose_1d(c, w, in, r, 0, 1);  // [raw, OC]
-        ggml_tensor * yc = ggml_cont(c, ggml_view_2d(c, yt, to, OC, yt->nb[1],
-                                                     (size_t)trim * yt->nb[0]));
-        yc = toCT(yc);
-        if (cc.has_bias) yc = ggml_add(c, yc, vec_in(cc.b));
-        return yc;
+        return vqa::codec::transconv(c, upload_in, cc.w, cc.b, cc.has_bias,
+                                     cc.k, cc.ci, cc.co, cc.stride, x);
     };
     // snake: x + sin(exp(a) x)^2  // (exp(b) + 1e-9), per channel
     auto snake_g = [&](const std::vector<float> & alpha, const std::vector<float> & beta, ggml_tensor * x) {
-        std::vector<float> a(alpha.size()), ib(alpha.size());
-        for (size_t i = 0; i < alpha.size(); i++) {
-            a[i] = std::exp(alpha[i]);
-            ib[i] = 1.0f / (std::exp(beta[i]) + 1e-9f);
-        }
-        ggml_tensor * sg = ggml_sin(c, ggml_mul(c, x, vec_in(a)));
-        return ggml_add(c, x, ggml_mul(c, ggml_sqr(c, sg), vec_in(ib)));
+        return vqa::codec::snake_exp(c, upload_in, alpha, beta, x);
     };
     // LayerNorm over channels (ne0), eps 1e-6
     auto ln_g = [&](const std::vector<float> & w, const std::vector<float> & b, ggml_tensor * x) {
