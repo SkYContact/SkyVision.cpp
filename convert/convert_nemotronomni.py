@@ -85,7 +85,6 @@ regardless of --out-type. Tiers:
              bit-exact against the engine dequantizer.
 """
 import argparse
-import ctypes
 import json
 import os
 import sys
@@ -95,7 +94,10 @@ import numpy as np
 import gguf
 
 import _lib
+import _plan
 from _lib import log, warn, fail, progress
+from _plan import (QUANT_BLOCK, Shards, expand_bf16 as _expand_bf16,
+                   peak_rss_mib)
 
 _lib.torch = None   # numpy bf16 decode path: exact and proven (convert_qwen3omni)
 
@@ -150,10 +152,6 @@ def quant_policy(ops, out_type):
             op["k"] = "q"
         op["q"] = qt
 
-
-# (GGML_QUANT_SIZES) block size and bytes per block
-QUANT_BLOCK = {"Q8_0": (32, 34), "Q5_0": (32, 22), "Q4_0": (32, 18),
-               "Q6_K": (256, 210), "Q4_K": (256, 144)}
 
 SKIP_EXACT = ("vision_model.radio_model.input_conditioner.norm_mean",
               "vision_model.radio_model.input_conditioner.norm_std")
@@ -316,58 +314,6 @@ def build_ops(cfg):
     return ops
 
 
-# ------------------------------------------------------------- shard access
-class Shards:
-    """Lazy mmap'd safetensors shard set; raw dtype views without full copies."""
-
-    _DT = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
-
-    def __init__(self, src, weight_map):
-        self.dir = src
-        self.map = weight_map
-        self.handles = {}
-
-    def handle(self, fname):
-        if fname not in self.handles:
-            import mmap, struct
-            f = open(os.path.join(self.dir, fname), "rb")
-            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            n = struct.unpack("<Q", m[:8])[0]
-            meta = json.loads(m[8:8 + n])
-            base = 8 + n
-            self.handles[fname] = (f, m, meta, base)
-        return self.handles[fname]
-
-    def meta(self, hf_name):
-        e = self.handle(self.map[hf_name])[2][hf_name]
-        return e["dtype"], e["shape"]
-
-    def raw(self, hf_name):
-        """Raw numpy view over the mmap: uint16 for BF16 (decode at use)."""
-        fname = self.map[hf_name]
-        f, m, meta, base = self.handle(fname)
-        e = meta[hf_name]
-        dt, (s, t) = e["dtype"], e["data_offsets"]
-        arr = np.frombuffer(m[base + s:base + t], dtype=self._DT[dt])
-        return arr.reshape(e["shape"]) if dt != "BF16" else arr.reshape(-1), dt, e["shape"]
-
-    def close(self):
-        for f, m, _, _ in self.handles.values():
-            m.close()
-            f.close()
-
-
-def _expand_bf16(raw, out):
-    """BF16 uint16 -> float32/float16, chunked so the f32 copy stays bounded."""
-    raw = raw.reshape(-1)
-    step = 64 << 20
-    flat = out.reshape(-1)
-    for i in range(0, raw.size, step):
-        c = raw[i:i + step].astype(np.uint32) << np.uint32(16)
-        flat[i:i + step] = c.view(np.float32)
-    return out
-
-
 def materialize(op, sh):
     """Build the exact final tensor for one op (mmap -> transform -> dtype)."""
     if op["k"] in ("exps_up", "exps_down"):
@@ -493,71 +439,21 @@ def write_metadata(gw, cfg, outtype, rope_mode):
     gw.add_uint32(f"{ARCH}.audio.num_mel_bins", cfg["a_mel"])
 
 
-def peak_rss_mib():
-    """Windows peak working set, MiB (psutil, falling back to raw ctypes)."""
-    try:
-        import psutil
-        return psutil.Process().memory_info().peak_wset / (1 << 20)
-    except Exception:
-        pass
-    class PMC(ctypes.Structure):
-        _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32)] + \
-                   [(n, ctypes.c_size_t) for n in
-                    ("PeakWorkingSetSize", "WorkingSetSize",
-                     "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
-                     "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
-                     "PagefileUsage", "PeakPagefileUsage")]
-    pmc = PMC()
-    pmc.cb = ctypes.sizeof(PMC)
-    if ctypes.windll.kernel32.K32GetProcessMemoryInfo(
-            ctypes.c_void_p(ctypes.windll.kernel32.GetCurrentProcess()),
-            ctypes.byref(pmc), pmc.cb):
-        return pmc.PeakWorkingSetSize / (1 << 20)
-    return -1.0
-
-
 def op_decl(op):
     """(shape_for_info, np_dtype, nbytes, raw_dtype) of the final tensor."""
-    qt = op.get("q")
-    if op["k"] == "q" or (op["k"] in ("exps_up", "exps_down") and qt is not None):
-        # info takes the BYTE shape and stores the logical shape after
-        # quant_shape_from_byte_shape; nbytes is the byte count
-        blk, tsz = QUANT_BLOCK[qt.name]
-        byte_shape = (*op["s"][:-1], op["s"][-1] // blk * tsz)
-        return byte_shape, np.dtype("uint8"), int(np.prod(byte_shape)), qt
-    dt = np.dtype("float32") if op["k"] not in ("f16", "exps_up", "exps_down") \
-        else np.dtype("float16")
-    return op["s"], dt, int(np.prod(op["s"])) * dt.itemsize, None
+    # quantizable kinds: the expert stacks keep their kind once the tier
+    # assigns Q5_0; the float16-dt kinds are the f16 matmul operands and the
+    # non-quantized expert stacks
+    return _plan.op_decl(op, quant_kinds=("exps_up", "exps_down"),
+                         f16_kinds=("f16", "exps_up", "exps_down"))
 
 
 def write_gguf(out, cfg, ops, sh, outtype, rope_mode, quiet=True):
-    """Pre-declare every tensor (offsets are assigned sequentially), then
-    stream the data one op at a time -- nothing big is ever held twice."""
-    t0 = time.time()
-    gw = gguf.GGUFWriter(out, ARCH)
-    write_metadata(gw, cfg, outtype, rope_mode)
-    for op in ops:
-        shape, dt, nbytes, raw = op_decl(op)
-        gw.add_tensor_info(op["g"], shape, dt, nbytes, raw_dtype=raw)
-    gw.write_header_to_file()
-    gw.write_kv_data_to_file()
-    gw.write_ti_data_to_file()
-
-    done = 0
-    for op in ops:
-        arr = materialize(op, sh)
-        try:
-            gw.write_tensor_data(np.ascontiguousarray(arr))
-        except AssertionError:
-            fail(f"{op['g']}: produced {arr.nbytes} bytes, header declared "
-                 f"{op_decl(op)[2]} (kind {op['k']}, shape {op['s']})")
-        del arr
-        done += 1
-        if not quiet and (done % 128 == 0 or done == len(ops)):
-            log(f"  {done}/{len(ops)} tensors, peak RSS {peak_rss_mib():.0f} MiB, "
-                f"{time.time() - t0:.0f}s")
-    gw.close()
-    return time.time() - t0
+    """Stream the GGUF through the shared skeleton (pre-declared header, then
+    the data section one op at a time); metadata + materialize stay here."""
+    return _plan.write_gguf(out, ARCH, ops, sh,
+                            lambda gw: write_metadata(gw, cfg, outtype, rope_mode),
+                            op_decl, materialize, quiet=quiet)
 
 
 # --------------------------------------------------------------------- main
@@ -592,38 +488,18 @@ def main():
     cfg = read_config(src)
     ops = build_ops(cfg)
     quant_policy(ops, args.out_type)
-    n_q = sum(1 for op in ops if op.get("q"))
-    if n_q:
-        by_type = {}
-        for op in ops:
-            if op.get("q"):
-                by_type[op["q"].name] = by_type.get(op["q"].name, 0) + 1
-        log("quant policy [" + args.out_type + "]: " +
-            ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) +
-            f", f16/f32={len(ops) - n_q}")
+    _plan.log_quant_policy(ops, args.out_type)
 
     sh = Shards(src, weight_map)
-    consumed = set()
-    for op in ops:
+
+    def exps_names(op):
         if op["k"] in ("exps_up", "exps_down"):
             leaf = "up_proj.weight" if op["k"] == "exps_up" else "down_proj.weight"
-            names = [f"{op['h']}.{e}.{leaf}" for e in range(op["s"][0])]
-        else:
-            names = [op["h"]]
-        for n in names:
-            if n not in weight_map:
-                fail(f"checkpoint has no tensor '{n}' (stale plan?)")
-            dt, shape = sh.meta(n)
-            if dt not in Shards._DT:
-                fail(f"{n}: unsupported dtype {dt}")
-            consumed.add(n)
-    skipped = [n for n in weight_map
-               if n not in consumed and (n in SKIP_EXACT
-                                         or n.endswith(SKIP_SUFFIX))]
-    extra = sorted(set(weight_map) - consumed - set(skipped))
-    if extra:
-        fail(f"{len(extra)} checkpoint tensors are not covered by the mapping "
-             f"(contract violation), e.g. {extra[:5]}")
+            return [f"{op['h']}.{e}.{leaf}" for e in range(op["s"][0])]
+        return [op["h"]]
+
+    consumed, skipped = _plan.check_coverage(ops, weight_map, sh, exps_names,
+                                             SKIP_EXACT, SKIP_SUFFIX)
     log(f"plan: {len(ops)} GGUF tensors <- {len(consumed)} HF tensors "
         f"({len(skipped)} skipped: 2 input_conditioner + 24 num_batches_tracked)")
 
