@@ -1392,12 +1392,22 @@ bool NemotronOmni::generate(const std::vector<int> & ids, const vqa::GenParams &
         }
         if (step + 1 >= max_new) break;
         const int p = n_past;
+        // NEMOTRONOMNI_STEP_TIME: in-process per-step wall time (the
+        // STEP_DUMP-mtime trick is unusable on NTFS - timestamps batch,
+        // negative deltas observed)
+        const bool step_time = getenv("NEMOTRONOMNI_STEP_TIME") != nullptr;
+        const auto tst = step_time ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point();
         if (ec_enabled && ec_ok && !getenv("NEMOTRONOMNI_EC_OFF")) {
             // dynamic expert-cache decode path (the moe_decode driver's third
             // consumer); ec_decode_step does not advance n_past (run_text does)
             if (!ec_decode_step(cur, p, logits)) return false;
             n_past = p + 1;
         } else if (!run_text(g, { cur }, { p }, logits)) return false;
+        if (step_time)
+            fprintf(stderr, "step %d pos %d: %.2f ms\n", step, p,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tst).count());
         cur = sample(logits, gp);
     }
     if (ec_enabled && ec_ok && ec_st.steps > 0) {
