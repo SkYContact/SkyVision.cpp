@@ -843,6 +843,8 @@ vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
 F16 下 66GB 权重对 31GB 内存全靠 mmap 缺页（墙 ~350MB/s，CUDA EC split 的 swap-wait 占 95%）；
 量化把每步专家流从 ~2GB 压到 ~1GB（Q8_0）/ ~0.7GB（q6k_mixed），是可用性的分水岭。CUDA 档注意 slot 预算：默认 2GB 在 Q8_0 下只剩 236/519 slot 会抖动（14s/step），`NEMO_EC_RESERVE=4e9` 让 276 个逐步 slot 全驻留后 warmup 一次即 427ms/步（2.3 tok/s）。
 
+性能提示：EC 路径设 `VQA_POLL=100`（CPU 线程 spin 轮询，免掉每 op 唤醒同步）可再提速——NVMe 上实测 1.86×，`NEMO_XCHK` 逐位一致；权重大于内存时**权重放 NVMe 本地盘**（同一份权重 USB 外接盘 vs NVMe 实测差 4.8×）。单步耗时可用 `NEMOTRONOMNI_STEP_TIME=1` 在进程内打点（stderr）；专家内核吞吐上限可用 `tools/moe_cpu_bench` 免模型单独测。
+
 ### MiniCPM-o 4.5（全模态 + 语音输出）
 
 OpenBMB 的 8B 级全模态模型（图/音/文进、**文本出 + 可选语音出**）：**Qwen3-8B 稠密主干**
@@ -914,6 +916,9 @@ wav SNR 12.6dB（AR 采样 RNG 对齐不可行，parity 口径=同噪声门）�
 |---|---|---|
 | CPU decode | 7.25 tok/s | 9.17 tok/s |
 | CUDA decode | 62.5 tok/s | 52.6 tok/s |
+
+视觉 prefill 已优化：重采样器 `x @ proj` 从宿主单线程循环移入计算图（载入期做 F32 `[in,out]`
+转置副本），3 tile 图像端到端 prefill 12972 -> 11586 ms（−10.7%），~10 tile 图像约省 3.4 s。
 
 ## 为什么做独立引擎？
 

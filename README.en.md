@@ -848,6 +848,13 @@ note: the default 2 GB reserve thrashes at Q8_0 (236/519 slots, 14 s/step);
 `NEMO_EC_RESERVE=4e9` keeps all 276 per-step slots resident and settles at
 427 ms/step (2.3 tok/s) after one warmup pass.
 
+Performance tips: on the EC path set `VQA_POLL=100` (CPU threads spin-wait for work instead of
+paying a wake-up sync per op) for a further speedup — 1.86x measured on NVMe, `NEMO_XCHK` still
+bit-identical; when the weights exceed RAM, **keep them on a local NVMe drive** (the same
+weights measured 4.8x slower from a USB external drive). `NEMOTRONOMNI_STEP_TIME=1` prints
+per-step wall time to stderr; `tools/moe_cpu_bench` profiles the MoE kernel throughput without
+a model file.
+
 ### MiniCPM-o 4.5 (omni + speech output)
 
 OpenBMB's 8B omni model (image/audio/text in, **text out + optional speech out**): a Qwen3-8B
@@ -906,6 +913,10 @@ Performance (CPU 16 threads / CUDA 5070 Ti Laptop 12GB, whole model on card):
 |---|---|---|
 | CPU decode | 7.25 tok/s | 9.17 tok/s |
 | CUDA decode | 62.5 tok/s | 52.6 tok/s |
+
+Vision prefill is optimized: the resampler `x @ proj` moved from a single-thread host loop into
+the graph (load-time F32 `[in,out]` transposed replica) — end-to-end 3-tile image prefill
+12972 -> 11586 ms (−10.7%), ~10-tile images save ~3.4 s.
 
 ## Why a standalone engine?
 
