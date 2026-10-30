@@ -110,6 +110,18 @@ jobs:
           python3 -m pip install --quiet --break-system-packages numpy
           python3 scripts/parity_nemotronomni_seg.py "$PWD/nemo_seg_dump"
 
+      # MiniCPM-o 4.5 text-chain segments through the real builders (NaFiT
+      # slicing, whisper chunked attention, tk. weight_norm reassembly, Qwen3
+      # q-k-norm); same zero-download recipe as the Nemotron-Omni step. The
+      # dump dir MUST be passed explicitly - the parity script's default is a
+      # local dev path.
+      - name: MiniCPM-o segment parity
+        run: |
+          cmake --build build --target minicpmo-seg-test
+          ./build/minicpmo-seg-test "$PWD/minicpmo_seg_dump"
+          python3 -m pip install --quiet --break-system-packages numpy
+          python3 scripts/parity_minicpmo_seg.py "$PWD/minicpmo_seg_dump"
+
       # content assertion: parse the JSON, not just the exit code
       - name: Capability spec table must be complete
         run: |

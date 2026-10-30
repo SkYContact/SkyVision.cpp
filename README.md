@@ -45,6 +45,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | `janus` | `janus_pro` | 图像 + 文本 | ask | — | — |
 | `nemotron_parse` | `nemotron-parse` | 图像 + 文本 | ask | — | — |
 | `nemotronomni` | — | 图像 + 音频 + 文本 | ask | — | — |
+| `minicpmo` | `minicpm_o` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | 后端 | 架构标签 | 输入 | 说明 |
@@ -66,6 +67,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Janus-Pro-1B** | `janus`（`janus_pro`） | 图像 |  DeepSeek 解耦式理解/生成 VLM 的**理解侧**（VQ 生成解码器不属于本引擎）：timm 风味 SigLIP-large-384 视觉塔（24 层、d=1024、patch16、fused qkv+全 bias、**GELU(erf)**、无 cls token、select_layer=-1 全层 + 终端 LN）+ 2 层 MLP aligner（1024→2048 GELU(erf) →2048）+ 纯 llama 1.5B 文本主干（24 层、16:16 头、theta 1e4、untied 102400 vocab）。预处理官方口径：bicubic 保比缩到长边 384 → expand2square 填充 (127,127,127) → /255 归一化；一图 576 个 `<image_placeholder>` token，deepseek sft 模板（`<\|User\|>:` 开头，问题后换行接 576 个占位符，再空行后以 `<\|Assistant\|>:` 收尾）。分词器新增 `DeepSeekBpe` 模式（isolated Split 序：拉丁/标点各带一个前导空格、CJK 大块连写、数字逐位——与 HF 官方逐 id 一致）。f16 3.9 GB / q8_0 ≈ 2.1 GB；对拍：与 fp32 官方栈 logits corr 0.9999、输出逐字一致。转换 `convert/convert_janus.py`。预置权重：`modelscope download --model SkyContact/Janus-Pro-1B-GGUF`（f16/q8_0/q4_0 + tokenizer，HF 同名 `hf download SkyContact/Janus-Pro-1B-GGUF`） |
 | **Nemotron-3.5-Parse（0.63B）** | `nemotron_parse`（`nemotron-parse`） | 图像（文档页） | NVIDIA 文档解析模型：**C-RADIOv4-SO400M 视觉塔**（27 层、patch16、d=1152、10 个 class token 排在最前、学出来的 128×128 位置表按内容区插值、无 rope、GELU(erf)、塔末无 norm）+ 卷积 **neck**（1×1 Conv1d → LN → 宽度 4 合 1 的 Conv2d → LN；前两个 class token 投影成 1 个 summary token 追加在末尾）+ **10 层 mBART 式前缀解码器**（d=1024、16/8 GQA、pre-LN、`√d` 嵌入缩放、tied lm_head、**没有任何位置编码**，视觉特征即 KV 前缀）。输出是带版面类别与归一化框的**控制 token 流**，`--mode markdown/json` 渲染成 markdown（LaTeX `tabular`→HTML 表）或带 bbox 的 blocks。对拍：位置场 2.7e-7、整页 159 步贪心与官方逐 token 相同。转换 `convert/convert_nemotron_parse.py`，MCP 工具 `parse_document` |
 | **Nemotron-3-Nano-Omni-30B-A3B（Reasoning）** | `nemotronomni` | 图像 + 音频 | NVIDIA 30B-A3B 全模态 MoE 推理模型：**52 层 Mamba2/Attention/MoE 混合主干**（23 Mamba2 + 6 NoPE attention + 23 MoE；sigmoid ×2.5 路由带 e_score_correction_bias、relu² 非门控专家 1856、1 个 3712 共享专家）+ C-RADIOv4-H 视觉塔（32 层 d=1280、10 个 register token 前置后整块丢弃、学出的 128×128 位置表、T=2 tubelet 视频嵌入已转换）+ Parakeet/FastConformer 音频塔（BatchNorm 引擎侧折叠）。英文 only、**thinking 默认开**、256k ctx、**纯文本输出**（无 talker）。对拍：文本贪心 argmax 与官方栈 100% 一致、音频转写逐字一致、RoPE 判决=NoPE（partial84 媒体路径 step0 即 cos 0.85 语义损坏）。逐张量混合量化：%256 宽的塔/主干 Q6_K + 专家 Q5_0 + 嵌入 Q8_0（行宽 2688/1856/3712 非 256 倍数，裸 k-quant 档只能覆盖 5% 字节，故无纯 Q4_K/Q6_K 档）。转换 `convert/convert_nemotronomni.py`。预置权重：`modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF`（HF 同名，含 tokenizer） |
+| **MiniCPM-o 4.5** | `minicpmo`（`minicpm_o`） | 图像 + 音频 | OpenBMB 8B 级全模态（官方 Qwen3-8B 稠密底座）：36 层 d=4096 GQA 32:8 主干（词表 151748、ctx 40960、q/k 逐 head RMSNorm）+ SigLIP NaFiT 视觉塔（27 层 d=1152 @448px，学出的 70×70 位置表按图动态多瓦片切片）+ 64-query Perceiver 重采样器 + Whisper-medium 音频塔（24 层、80 mel、1s 块对角掩码）+ Llama-768×20L TTS 副塔（6562 码本）+ CosyVoice2 token2wav 声码器（兄弟 GGUF，同目录自动发现）；文本出 + `--speak` 24kHz 语音出。**TTS 必须官方采样参数**（贪心会码塌缩）。对拍：文本贪心 "Paris" 与官方一致、视觉重采样 cos 0.99994、音频投影 cos 0.9999980、同噪声声码器门 mel cos 0.999999986。量化两档：q8_0 10.09GB（仅视觉 fc2×27 保 F16）+ q6k_mixed 8.19GB（1152 系×136+fc2 F16）。转换 `convert/convert_minicpmo45.py`。预置权重：`modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF`（HF 同名，含 tokenizer 与声码器） |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 | **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
 | **Keye-VL-2.0（30B-A3B）** | `keye-vl2` | 图像 + 视频 | 快手 Keye-VL-2.0-30B-A3B：Qwen3 式 **MoE 文本主干**（48 层、128 路由专家激活 8、norm-topk softmax 路由、mRoPE 16/24/24 theta 1e7、per-head qk-norm）+ 每层 **DSA lightning indexer 稀疏注意力**（16 头×64 维、Walsh-Hadamard 旋转 MQA indexer、top-2048 KV 稀疏掩码、独立 indexer K 缓存）+ SigLIP-so400m 系视觉塔（27 层 patch14、ViT 内 2D mRoPE、729 学习式位置表双线性插值、post-LN、2×2 merge + GELU 投影）。视频=官方默认逐帧路径（mRoPE 官方 get_rope_index 逐位对齐；官方 packing 表在该路径为死代码；opt-in fast 双流未实现）+ `<|frame|><hh:mm:ss>` 时间戳标记；图像 mRoPE 为 (t=base, y=base+row, x=base+col) 布局；image_pad 按 id 注入不走文本往返（Qwen 分词器会吞掉该 piece）。**官方 GGUF 直接用**（`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` + 同仓 tokenizer.json；mmproj 姊妹文件自动发现）。19GB 检查点放不进 12GB 显卡时有三种放置：默认自动回退纯 CPU（decode ~28 tok/s）；`VQA_SPLIT=1` 稠密权重上 GPU + 专家留内存（`ggml_backend_sched` 按权重归属分流）；`KEYE_EXPERTCACHE=1` **专家粒度 GPU 驻留缓存**（ExpertCache：LRU + 异步预取 + slot 表 `mul_mat_id` 批处理，命中 CUDA 后端 mul_mat_id+GLU 融合，12GB 卡 decode ~19 tok/s） |
@@ -840,6 +842,78 @@ vqa-cli --model nemotronomni-q8_0.gguf --tokenizer models/nemotron3omni \
 
 F16 下 66GB 权重对 31GB 内存全靠 mmap 缺页（墙 ~350MB/s，CUDA EC split 的 swap-wait 占 95%）；
 量化把每步专家流从 ~2GB 压到 ~1GB（Q8_0）/ ~0.7GB（q6k_mixed），是可用性的分水岭。CUDA 档注意 slot 预算：默认 2GB 在 Q8_0 下只剩 236/519 slot 会抖动（14s/step），`NEMO_EC_RESERVE=4e9` 让 276 个逐步 slot 全驻留后 warmup 一次即 427ms/步（2.3 tok/s）。
+
+### MiniCPM-o 4.5（全模态 + 语音输出）
+
+OpenBMB 的 8B 级全模态模型（图/音/文进、**文本出 + 可选语音出**）：**Qwen3-8B 稠密主干**
+（36 层 d=4096、GQA 32:8、head_dim 128、theta 1e6、untied lm_head、词表 151748、ctx 40960，
+q/k 逐 head RMSNorm）+ SigLIP-SO400M NaFiT 视觉塔（27 层 d=1152 @448px patch14，**学出的
+70×70 位置表按图动态切片**，slice_image 多瓦片）+ 64-query Perceiver 重采样器（视觉→LLM 投影）
++ Whisper-medium 音频塔（24 层 d=1024、80 mel、1s 块对角注意力掩码、AvgPool1d(5)）+
+**Llama-768×20L TTS 副塔**（6562 码本 speech token，weight_norm head 重组合）+
+CosyVoice2 token2wav 声码器（独立兄弟 GGUF，arch `token2wav`，引擎自动在主模型同目录发现，
+`MINICPMO_VOCODER` 可改路径）。transformers 4.51 官方栈做 oracle。
+
+```bash
+# 预转好的：modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF --local-dir models/MiniCPM-o-GGUF
+#          （HF 同名；含 tokenizer.json + 声码器 GGUF）
+pip install -r convert/requirements.txt
+hf download openbmb/MiniCPM-o-4_5 --local-dir models/minicpmo45      # 4 分片 BF16 + tokenizer
+python convert/convert_minicpmo45.py --out-type f16                  # 18.7 GB（对拍基线）
+python convert/convert_minicpmo45.py --out-type q8_0                 # 10.09 GB（全兼容基准档）
+python convert/convert_minicpmo45.py --out-type q6_k -o minicpmo45-q6k_mixed.gguf   # 8.19 GB（混合档）
+python convert/convert_minicpmo45_vocoder.py                         # -> minicpmo-vocoder.gguf（377 MB，--speak 需要）
+python convert/check_minicpmo45.py --gguf <产物> [--hash]            # 转换后自检（不加载模型）
+
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 \
+        --image photo.jpg --ask "What is in this picture?"
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 \
+        --audio clip.wav --ask "Transcribe this audio."
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 \
+        --ask "用一句话介绍你自己" --speak reply.wav        # TTS 副塔 + 声码器 -> 24kHz wav
+```
+
+能力与口径（转换器/引擎实测）：
+
+- 输入：图像（多瓦片动态分辨率）+ 音频（16k mono）+ 文本；输出文本，`--speak` 追加语音 wav
+- chat 模板 Qwen 风格（im_start/im_end），模板自带空 think 块；eos=151645、bos/pad=151643；
+  TTS 副塔专用 token：audio_bos=151687、text_eos=151692
+- **TTS 不能贪心采样**：temperature→0 且无重复惩罚时 AR 码塌缩成单 token 循环（82 秒噪声）；
+  引擎复刻官方默认采样 temp 0.8 / top_p 0.85 / top_k 25 / rep_pen 1.05
+- 量化：语言/音频/TTS 主干行宽 4096/12288/1024/3072/768 全是 256 倍数，唯视觉塔 d=1152
+  不是（fc2 入宽 4304 连 32 都不整除）——q8_0 档仅 fc2×27 回退 F16，q6k_mixed 档 1152 系
+  ×136 + fc2×27 回退 F16（见下表），norms/biases/位置表/查询向量恒 F32
+
+量化档（转换后自检键数/差集/抽样 byte-exact 全过）：
+
+| 档 | 大小 | 逐张量类型 |
+|---|---|---|
+| `f16` | 18.71 GB | 全部 2-D F16（对拍基线） |
+| `q8_0` | 10.09 GB | 686 个 %32 宽 matmul 操作数 Q8_0；视觉 fc2（4304 宽）×27 张 F16 |
+| `q6k_mixed` | 8.19 GB | 550 个 %256 宽 Q6_K；1152 宽×136 + fc2×27 张 F16 |
+
+对拍（oracle = transformers 4.51 官方栈 BF16，numpy 独立重算判卷）：文本 "What is the capital
+of France?" 贪心输出 **"Paris"**，与官方 chat() 一致（prefill 末位 top1 p=0.9999）；视觉 3 瓦片
+问答语义正确，重采样器输出 **cos_mean 0.99994**；音频投影 **cos_mean 0.9999980**
+（max_abs_diff 0.057）；TTS seed 0 官方采样 102 个语音码 → "你好，我是MiniCPM 3 Omni。很高兴为您服务。"，
+声码器 wav 4.08s @24kHz；**同噪声门**（同一高斯噪声 teacher-force）mel cos **0.999999986** /
+wav SNR 12.6dB（AR 采样 RNG 对齐不可行，parity 口径=同噪声门）。
+
+引擎量化档四门（vs F16 基线，文本 prompt 贪心）：
+
+| 门 | q8_0 | q6k_mixed |
+|---|---|---|
+| 文本 prefill argmax | 25/26（=F16 基线，gen0/gen1 "Paris"+im_end 全对） | 23/26（gen0/gen1 仍全对） |
+| 视觉重采样器 cos | 0.999877 | 0.999961 |
+| 音频投影 cos | 0.999654 | 0.998163 |
+| TTS 语音码 | AR 采样从码 1 起分叉（量化噪声；逐 step logit cos 0.985-0.998），语音正常产出 | 同左（模型自称 Qwen——openbmb 底座即 Qwen3，官方模型同款行为） |
+
+性能（CPU 16 线程 / CUDA 5070 Ti Laptop 12GB 全卡，两档均可整个进卡）：
+
+| | q8_0 | q6k_mixed |
+|---|---|---|
+| CPU decode | 7.25 tok/s | 9.17 tok/s |
+| CUDA decode | 62.5 tok/s | 52.6 tok/s |
 
 ## 为什么做独立引擎？
 

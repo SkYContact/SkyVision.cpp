@@ -48,6 +48,7 @@ Full per-backend details are in the hand-maintained table below:
 | `janus` | `janus_pro` | image + text | ask | — | — |
 | `nemotron_parse` | `nemotron-parse` | image + text | ask | — | — |
 | `nemotronomni` | — | image + audio + text | ask | — | — |
+| `minicpmo` | `minicpm_o` | image + audio + text | ask | — | speech output |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | Backend | Architecture tag | Input | Notes |
@@ -69,6 +70,7 @@ Full per-backend details are in the hand-maintained table below:
 | **Janus-Pro-1B** | `janus` (`janus_pro`) | image | DeepSeek's decoupled understanding/generation VLM, **understanding side only** (the VQ generation decoder is out of engine scope): timm-flavour SigLIP-large-384 tower (24 layers, d=1024, patch 16, fused qkv with full biases, **GELU(erf)**, no cls token, select_layer=-1 + final LN) + 2-layer MLP aligner (1024→2048 GELU(erf) →2048) + a plain llama 1.5B trunk (24 layers, 16:16 heads, theta 1e4, untied 102400 vocab). Official preprocessing: bicubic to longest-edge 384 → expand2square pad (127,127,127); 576 `<image_placeholder>` tokens per image, deepseek sft template. Adds the `DeepSeekBpe` tokenizer mode (isolated Split sequence — latin/punct with one leading space, contiguous CJK blocks, per-digit numbers; id-identical to HF). 3.9 GB f16 / 2.1 GB q8_0; parity vs the fp32 official stack: logits corr 0.9999, verbatim outputs. Converts via `convert/convert_janus.py`; prebuilt weights: `modelscope download --model SkyContact/Janus-Pro-1B-GGUF` (same name on HF) |
 | **Nemotron-3.5-Parse (0.63B)** | `nemotron_parse` (`nemotron-parse`) | image (document page) | NVIDIA's document parser: **C-RADIOv4-SO400M tower** (27 layers, patch 16, d=1152, ten class tokens in front of the sequence, learned 128×128 position table resampled onto the content area, no rope, GELU(erf), no norm at the end of the tower) + a **conv neck** (1×1 Conv1d → LN → width 4:1 Conv2d → LN; class tokens 0/1 become one summary token appended at the end) + a **10-layer mBART-style prefix decoder** (d=1024, 16/8 GQA, pre-LN, `√d` embedding scale, tied lm_head, **no positional encoding at all**, the visual features being the KV prefix). The answer is a **control-token stream carrying layout classes and normalised boxes**; `--mode markdown/json` renders it into markdown (LaTeX `tabular`→HTML table) or blocks with bboxes. Parity: position field 2.7e-7, all 159 greedy tokens of a page identical to the official stack. Converts via `convert/convert_nemotron_parse.py`; MCP tool `parse_document` |
 | **Nemotron-3-Nano-Omni-30B-A3B (Reasoning)** | `nemotronomni` | image + audio | NVIDIA's 30B-A3B omni reasoning MoE: a **52-layer Mamba2/Attention/MoE hybrid trunk** (23 Mamba2 + 6 NoPE attention + 23 MoE; sigmoid ×2.5 router with e_score_correction_bias, relu² non-gated 1856 experts, one 3712 shared expert) + a C-RADIOv4-H vision tower (32 blocks, d=1280, 10 register tokens dropped after the trunk, learned 128×128 position table, T=2 tubelet video patching) + a Parakeet/FastConformer audio tower (BatchNorm folded engine-side). English only, **thinking on by default**, 256k ctx, **text output only** (no talker). Parity: greedy argmax 100% identical to the official stack, audio transcription verbatim, RoPE ruled NoPE (partial84 corrupts the media path at step 0). Per-tensor hybrid quantization: %256-wide towers/trunk at Q6_K + experts Q5_0 + embeddings Q8_0 (row widths 2688/1856/3712 are not multiples of 256, so a plain k-quant tier covers only 5% of the bytes - there is no pure Q4_K/Q6_K tier). Converts via `convert/convert_nemotronomni.py`; prebuilt: `modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF` (same name on HF, tokenizer included) |
+| **MiniCPM-o 4.5** | `minicpmo` (`minicpm_o`) | image + audio | OpenBMB's 8B omni model (official Qwen3-8B dense base): 36L d=4096 GQA 32:8 trunk (vocab 151748, ctx 40960, per-head q/k RMSNorm) + SigLIP NaFiT vision tower (27L d=1152 @448px, learned 70x70 position table, dynamic multi-tile slicing) + 64-query Perceiver resampler + Whisper-medium audio tower (24L, 80 mel, 1s chunk-diagonal mask) + Llama-768x20L TTS sub-tower (6562 codebook) + CosyVoice2 token2wav vocoder (sibling GGUF, auto-discovered); text out + `--speak` 24 kHz speech out. **TTS needs the official sampler params** (greedy collapses the codes). Parity: text greedy "Paris", vision resampler cos 0.99994, audio proj cos 0.9999980, same-noise vocoder gate mel cos 0.999999986. Two quant tiers: q8_0 10.09 GB (only vision fc2 x27 kept F16) + q6k_mixed 8.19 GB (1152-wide x136 + fc2 in F16). Converts via `convert/convert_minicpmo45.py`; prebuilt: `modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF` (same name on HF, tokenizer + vocoder included) |
 | **SmolVLM (256M, Idefics3)** | `smolvlm` | image | the smallest usable backend here: SigLIP-base tower (12 layers, patch 16, 512², learned positions, LN/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30 layers, no bias, GQA 9:3, rope 1e5). Official Idefics3 preprocessing: longest edge **2048** → pad to multiples of 512 → **512² tiles** (row-major) + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8 |
 | **EmbeddingGemma-2 (740M)** | `embgemma2` | image + video + audio + text (embeddings) | multimodal embedding model (no text generation): Gemma3 text tower (24 layers, d=512, GQA 4:1, interleaved SWA/full, **per-layer PLE**) + Gemma4 ViT (16 layers, patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / **chunked local attention with Transformer-XL relative position bias**, ClippableLinear clamps throughout). `--embed` emits 768-d vectors (Matryoshka truncation to 512/256/128/64), `--embed-preset` official task prefixes, `--embed-file` batch JSONL. All four modalities vs the fp32 HF reference: **0.99999+** |
 | **Keye-VL-2.0 (30B-A3B)** | `keye-vl2` | image + video | Kwai's Keye-VL-2.0-30B-A3B: Qwen3-style **MoE text trunk** (48 layers, 128 routed experts with top-8 norm-topk softmax routing, mRoPE 16/24/24 theta 1e7, per-head qk-norm) + a per-layer **DSA lightning indexer** for sparse attention (16 heads x 64 dims, Walsh-Hadamard rotated MQA indexer keys, top-2048 KV sparse mask, separate indexer K cache) + a SigLIP-so400m lineage tower (27 layers patch 14, in-ViT 2D mRoPE, bilinearly interpolated 729-entry learned position table, post-LN, 2x2 merge + GELU projector). Video encodes frames independently with `<|frame|><hh:mm:ss>` markers; image mRoPE follows the (t=base, y=base+row, x=base+col) layout; image pads are injected as ids, not through a text round-trip (the Qwen tokenizer drops the piece). **Official GGUF runs as-is** (`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` plus its tokenizer.json; the mmproj sibling is auto-discovered). Three placements for the 19 GB checkpoint on a 12 GB card: default auto-fallback to pure CPU (~28 tok/s decode); `VQA_SPLIT=1` dense weights on GPU + experts in host RAM (ggml_backend_sched routes by weight location); `KEYE_EXPERTCACHE=1` **expert-granularity GPU residency cache** (ExpertCache: LRU + async prefetch + slot-table mul_mat_id batching that hits the CUDA backend's fused mul_mat_id+GLU pass, ~19 tok/s decode on 12 GB) |
@@ -845,6 +847,65 @@ At F16 the 66 GB of weights page in from disk against 31 GB of RAM (~350 MB/s wa
 note: the default 2 GB reserve thrashes at Q8_0 (236/519 slots, 14 s/step);
 `NEMO_EC_RESERVE=4e9` keeps all 276 per-step slots resident and settles at
 427 ms/step (2.3 tok/s) after one warmup pass.
+
+### MiniCPM-o 4.5 (omni + speech output)
+
+OpenBMB's 8B omni model (image/audio/text in, **text out + optional speech out**): a Qwen3-8B
+dense trunk (36L d=4096, GQA 32:8, head_dim 128, theta 1e6, untied lm_head, vocab 151748,
+ctx 40960, per-head q/k RMSNorm) + a SigLIP-SO400M NaFiT vision tower (27L x 1152 @448px
+patch14, learned 70x70 position table with dynamic per-image tile slicing) + a 64-query
+Perceiver resampler + a Whisper-medium audio encoder (24L x 1024, 80 mel, 1s chunk-diagonal
+attention mask, AvgPool1d(5)) + a Llama-768x20L TTS sub-tower (6562-entry speech codebook,
+weight_norm head reassembly) + the CosyVoice2 token2wav vocoder shipped as a sibling GGUF
+(arch `token2wav`, auto-discovered next to the main file; `MINICPMO_VOCODER` overrides).
+Oracle = the transformers 4.51 official stack.
+
+```bash
+# prebuilt: modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF --local-dir models/MiniCPM-o-GGUF
+#           (same name on HF; tokenizer.json + vocoder GGUF included)
+pip install -r convert/requirements.txt
+hf download openbmb/MiniCPM-o-4_5 --local-dir models/minicpmo45      # 4 BF16 shards + tokenizer
+python convert/convert_minicpmo45.py --out-type f16                  # 18.7 GB (parity baseline)
+python convert/convert_minicpmo45.py --out-type q8_0                 # 10.09 GB (full-compat tier)
+python convert/convert_minicpmo45.py --out-type q6_k -o minicpmo45-q6k_mixed.gguf   # 8.19 GB (hybrid tier)
+python convert/convert_minicpmo45_vocoder.py                         # -> minicpmo-vocoder.gguf (377 MB, needed by --speak)
+python convert/check_minicpmo45.py --gguf <file> [--hash]            # self-check, no model load
+
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 --image photo.jpg --ask "..."
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 --audio clip.wav --ask "..."
+vqa-cli --model minicpmo45-q8_0.gguf --tokenizer models/minicpmo45 --ask "..." --speak reply.wav
+```
+
+- Inputs: image (multi-tile NaViT) + audio (16 kHz mono) + text; output text; `--speak`
+  additionally emits a 24 kHz wav
+- Qwen-style chat template with an empty think block; eos=151645, bos/pad=151643
+- **TTS must not sample greedily** (codes collapse into a single-token loop); the engine
+  ports the official sampler (temp 0.8 / top_p 0.85 / top_k 25 / rep_pen 1.05)
+- Quantization: the LLM/audio/TTS widths (4096/12288/1024/3072/768) are all multiples of 256;
+  only the vision tower (d=1152, fc2 in-width 4304) is not — q8_0 keeps 27 fc2 tensors in F16,
+  q6k_mixed additionally keeps 136 row-1152 tensors in F16; norms/biases/position tables stay F32
+
+| tier | size | per-tensor types |
+|---|---|---|
+| `f16` | 18.71 GB | all 2-D F16 (parity baseline) |
+| `q8_0` | 10.09 GB | 686 %32-wide matmul operands at Q8_0; vision fc2 (4304-wide) x27 in F16 |
+| `q6k_mixed` | 8.19 GB | 550 %256-wide at Q6_K; 1152-wide x136 + fc2 x27 in F16 |
+
+Parity vs the official stack: text greedy **"Paris"** (prefill last-token top1 p=0.9999), vision
+resampler **cos 0.99994**, audio projection **cos 0.9999980**, TTS seed 0 -> 102 speech codes ->
+4.08 s wav; **same-noise vocoder gate** mel cos **0.999999986** / wav SNR 12.6 dB (the AR-sampler
+RNG cannot be aligned, so vocoder parity is defined on identical noise). Quant-tier engine gates
+vs the F16 baseline: text prefill argmax 25/26 (q8_0) / 23/26 (q6k_mixed) with gen tokens
+identical ("Paris"), vision resampler cos 0.999877 / 0.999961, audio proj cos 0.999654 /
+0.998163; the TTS codes diverge from code 1 under quantization (AR sampling; per-step logit cos
+0.985-0.998, speech still produced).
+
+Performance (CPU 16 threads / CUDA 5070 Ti Laptop 12GB, whole model on card):
+
+| | q8_0 | q6k_mixed |
+|---|---|---|
+| CPU decode | 7.25 tok/s | 9.17 tok/s |
+| CUDA decode | 62.5 tok/s | 52.6 tok/s |
 
 ## Why a standalone engine?
 

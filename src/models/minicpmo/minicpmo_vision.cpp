@@ -5,6 +5,7 @@
 #include "minicpmo.hpp"
 
 #include "core/engine/ggml_dump.hpp"
+#include "core/engine/weight_load.hpp"
 #include "core/media/resample.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -476,12 +477,10 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
         ggml_backend_tensor_get(out, feats.data() + off, 0,
                                 sizeof(float) * (size_t)rows * rs_embed);
         if (rs_host_proj.empty()) {
-            // f32 host copy of the proj weight (F16 in the GGUF)
-            const size_t n = (size_t)rs_embed * rs_embed;
-            std::vector<ggml_fp16_t> h(n);
-            ggml_backend_tensor_get(rs.proj, h.data(), 0, sizeof(ggml_fp16_t) * n);
-            rs_host_proj.resize(n);
-            for (size_t i = 0; i < n; i++) rs_host_proj[i] = ggml_fp16_to_fp32(h[i]);
+            // f32 host copy of the proj weight (F16 in the F16 GGUF; Q8_0/Q6_K
+            // in the quantized tiers - a blind F16-sized tensor_get here reads
+            // past the quantized buffer, the nemotronomni rd() bug in miniature)
+            vqa::weights::snapshot_to_f32_host(rs.proj, rs_host_proj);
         }
         // x @ proj: feats rows are tokens [rows, 4096]; proj [in, out] flat
         std::vector<float> src(feats.begin() + off, feats.end());

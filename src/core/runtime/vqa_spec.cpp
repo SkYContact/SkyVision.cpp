@@ -141,9 +141,10 @@ const SpecRow kSpecs[] = {
       "English only; thinking on by default; 256k ctx; text output only (no talker)" },
     { "minicpmo", "minicpm_o", "image audio text", "ask",
       false, false, false, true, "models/minicpmo45", "",
-      "any-to-input (text/image/audio -> text); --speak runs the tk. TTS sub-tower and "
-      "writes the 6562-codebook speech-code ids (<wav>.codes.txt); the CosyVoice2 "
-      "token2wav vocoder is a later wave" },
+      "any-to-input (text/image/audio -> text); --speak runs the tk. TTS sub-tower "
+      "plus the CosyVoice2 token2wav vocoder (sibling minicpmo-vocoder.gguf, "
+      "auto-discovered; MINICPMO_VOCODER overrides) and writes a 24 kHz wav "
+      "(plus <wav>.codes.txt with the 6562-codebook ids as a gate hook)" },
 };
 
 ArchSpec row_to_spec(const SpecRow & r) {
