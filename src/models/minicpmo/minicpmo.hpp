@@ -145,7 +145,14 @@ struct ResamplerW {
     ggml_tensor * ln_q_w = nullptr, * ln_q_b = nullptr;
     ggml_tensor * ln_kv_w = nullptr, * ln_kv_b = nullptr;
     ggml_tensor * ln_post_w = nullptr, * ln_post_b = nullptr;
-    ggml_tensor * proj = nullptr;          // [4096, 4096] - RIGHT multiply
+    ggml_tensor * proj = nullptr;          // [4096, 4096] RIGHT multiply; the
+                                           // gguf bytes are the torch [in,out]
+                                           // parameter o-major (ne0 = out) -
+                                           // snapshot source only, the graph
+                                           // multiplies with proj_f32 below
+    ggml_tensor * proj_f32 = nullptr;      // [in, out] F32 contiguous replica
+                                           // (mul_mat src0, K = in on ne0);
+                                           // built once by VisionTower::encode
 };
 
 // One resampler pass over one tile: x = post- SigLIP hidden [1152, n],
@@ -172,7 +179,12 @@ public:
     ggml_gallocr_t allocr = nullptr;
     const char * dump_dir = "";
     int n_tok = 0;                         // 64 * n_tiles of the last encode
-    std::vector<float> rs_host_proj;       // f32 copy of rs.proj (host multiply)
+    // F32 [in, out] replica of rs.proj for the in-graph right multiply
+    // (the raw F16/quantized weight mis-routes the CPU GEMM - see
+    // resampler_branch; the old workaround was a single-thread host loop)
+    ggml_context * rs_proj_ctx = nullptr;
+    ggml_backend_buffer_t rs_proj_buf = nullptr;
+    ggml_tensor * rs_proj_in = nullptr;    // [in, out] F32 contiguous
 
     // host front end: RGB8 -> tiled patch vectors + per-tile geometry.
     // tiles: one [588, n_patches] F32 block per tile (patch vectors packed

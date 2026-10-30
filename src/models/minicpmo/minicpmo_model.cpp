@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -140,6 +141,8 @@ MiniCPMO::~MiniCPMO() {
     dec_slot.reset();
     kv.free();
     tkv.free();
+    if (vt.rs_proj_buf) ggml_backend_buffer_free(vt.rs_proj_buf);
+    if (vt.rs_proj_ctx) ggml_free(vt.rs_proj_ctx);
     if (wbuf) ggml_backend_buffer_free(wbuf);
     if (wctx) ggml_free(wctx);
     if (allocr) ggml_gallocr_free(allocr);
@@ -710,9 +713,15 @@ bool MiniCPMO::generate(const std::vector<int> & ids, const vqa::GenParams & gp,
     std::vector<float> logits, hidden;
     std::vector<int> pos(ids.size());
     for (size_t i = 0; i < ids.size(); i++) pos[i] = (int)i;
+    const auto pf0 = std::chrono::steady_clock::now();
     if (!run_text(g, ids, pos, logits, tts_text ? &hidden : nullptr,
                   mm_feats, mm_pos))
         return false;
+    if (ids.size() > 1)
+        fprintf(stderr, "minicpmo: llm prefill %.0f ms (%zu tok)\n",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - pf0).count(),
+                ids.size());
     auto last_row = [&]() {
         return std::vector<float>(logits.end() - (size_t)n_vocab, logits.end());
     };
@@ -782,9 +791,14 @@ bool MiniCPMO::ask(const vqa::MediaInput & media, const std::string & prompt,
                     media.sample_rate);
             return false;
         }
+        const auto a0 = std::chrono::steady_clock::now();
         int n_aud = 0;
         if (!at.encode(media.audio.data(), (int)media.audio.size(), afeats, &n_aud))
             return false;
+        const auto a1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "minicpmo: audio encode %.0f ms -> %d tok\n",
+                std::chrono::duration<double, std::milli>(a1 - a0).count(),
+                n_aud);
         aud_tokens = n_aud;
     }
     if (tower_only) {

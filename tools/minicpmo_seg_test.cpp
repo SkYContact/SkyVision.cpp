@@ -169,7 +169,9 @@ static void scenario_rs(ggml_backend_t backend, ggml_gallocr_t allocr,
     ggml_tensor * lnkv_b  = w.make("rs_lnkv_b", D);
     ggml_tensor * lnp_w   = w.make("rs_lnp_w", D);
     ggml_tensor * lnp_b   = w.make("rs_lnp_b", D);
-    ggml_tensor * proj    = w.make("rs_proj", D, D, 1, GGML_TYPE_F16);
+    ggml_tensor * proj    = w.make("rs_proj", D, D);   // F32, mirrors the
+                                                       // production replica;
+                                                       // mul_mat src0
     w.alloc();
     w.fill(query,   rnd((size_t)D * Q, 1.0f));
     w.fill(kv_proj, rnd((size_t)D * IN, 0.2f));
@@ -201,6 +203,7 @@ static void scenario_rs(ggml_backend_t backend, ggml_gallocr_t allocr,
     rw.ln_kv_w = lnkv_w; rw.ln_kv_b = lnkv_b;
     rw.ln_post_w = lnp_w; rw.ln_post_b = lnp_b;
     rw.proj = proj;
+    rw.proj_f32 = proj;   // in-graph right multiply (branch output = x@proj)
 
     // tile input + host sincos (5x8 grid)
     std::vector<float> x = rnd((size_t)IN * N, 1.0f);
@@ -222,7 +225,8 @@ static void scenario_rs(ggml_backend_t backend, ggml_gallocr_t allocr,
     ggml_set_input(pt);
     ggml_tensor * out = minicpmo::resampler_branch(r.ctx, rw, xt, pt, NH, "rs");
     ggml_set_name(out, "rs_out");
-    r.sinks = { "rs_kv", "rs_keys", "rs_iq", "rs_ik", "rs_iv", "rs_fa", "rs_attn", "rs_out" };
+    r.sinks = { "rs_kv", "rs_keys", "rs_iq", "rs_ik", "rs_iv", "rs_fa",
+                "rs_attn", "rs_lout", "rs_out" };
     if (!r.alloc()) exit(1);
     ggml_backend_tensor_set(xt, x.data(), 0, sizeof(float) * x.size());
     ggml_backend_tensor_set(pt, pos.data(), 0, sizeof(float) * pos.size());
@@ -727,7 +731,10 @@ static void scenario_rs_real(ggml_backend_t backend, ggml_gallocr_t allocr,
     ggml_tensor * lnkv_b  = w.make("rr_lnkv_b", D);
     ggml_tensor * lnp_w   = w.make("rr_lnp_w", D);
     ggml_tensor * lnp_b   = w.make("rr_lnp_b", D);
-    ggml_tensor * proj    = w.make("rr_proj", D, D, 1, GGML_TYPE_F16);
+    ggml_tensor * proj    = w.make("rr_proj", D, D);   // F32, mirrors the
+                                                       // production load-time
+                                                       // replica (see
+                                                       // resampler_branch)
     w.alloc();
     {
         std::vector<float> v((size_t)D * Q);
@@ -797,6 +804,7 @@ static void scenario_rs_real(ggml_backend_t backend, ggml_gallocr_t allocr,
     rw.ln_kv_w = lnkv_w; rw.ln_kv_b = lnkv_b;
     rw.ln_post_w = lnp_w; rw.ln_post_b = lnp_b;
     rw.proj = proj;
+    rw.proj_f32 = proj;   // in-graph right multiply (branch output = x@proj)
 
     std::vector<float> x = rnd((size_t)IN * N, 1.0f);
     std::vector<float> pos;

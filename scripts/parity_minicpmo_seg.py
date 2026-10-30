@@ -102,15 +102,16 @@ def scenario_rs(d):
     out = fa_ref
     out = out @ op.T + ob
     out = ln(out, lnp_w, lnp_b)
-    # ggml ne [in, out] flattens to numpy [out, in]; x @ proj_torch == x @ P.T
-    # the branch now returns ln_out (proj runs on the host in production):
-    # the engine dump IS ln_out
-    mine = out                               # [16, D] ln_out rows
+    # the branch ends with the in-graph RIGHT multiply x @ proj (proj_f32
+    # replica). A mul_mat src0's numpy view is (ne1, ne0) = (out, in), so
+    # engine rs_out == ln_out @ P.T; rs_lout is the pre-proj ln_out stage.
+    ok_l = check("rs_lout", out, load(d, "rs_lout").reshape(16, D))
+    mine = out @ proj.T                     # [16, D] ln_out @ P.T == x @ proj
     ok1 = check("rs_out", mine, ref_out)
     ok2 = check("rs_keys", keys, load(d, "rs_keys").reshape(40, D))
     ok3 = check("rs_iq", qp, load(d, "rs_iq").reshape(16, D))
     ok4 = check("rs_kv", kv, load(d, "rs_kv").reshape(40, D))
-    return ok0 and ok1 and ok2 and ok3 and ok4
+    return ok0 and ok1 and ok2 and ok3 and ok4 and ok_l
 
 
 # ------------------------------------------------------------ slice

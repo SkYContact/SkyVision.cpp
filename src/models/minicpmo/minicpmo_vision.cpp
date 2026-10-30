@@ -12,6 +12,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -270,11 +271,16 @@ ggml_tensor * resampler_branch(ggml_context * c, const ResamplerW & w,
     if (dbg) ggml_set_name(out, "rr_o1");
     out = layer_norm(c, out, w.ln_post_w, w.ln_post_b, eps);
     if (dbg) ggml_set_name(out, "rr_lout");
-    // RIGHT multiply x @ proj. NOTE: intentionally done on the HOST by the
-    // caller (this graph ends at ln_post): the in-graph mul_mat(proj, x)
-    // mis-computes here (CPU F16 GEMM path, second [4096,4096] F16 A in one
-    // graph at N=64 - stages verified exact, output scrambled; repro'd in
-    // tools/minicpmo_seg_test.cpp scenario_rs_real)
+    if (dbg && !strcmp(dbg, "rs")) ggml_set_name(out, "rs_lout");
+    // RIGHT multiply x @ proj, IN-GRAPH: mul_mat(P, x)[o, t] sums P[k, o] *
+    // x[k, t] == (x @ proj)[t, o]. P is proj_f32, a load-time F32 [in, out]
+    // contiguous replica (K = in on ne0) - the gguf bytes are o-major and the
+    // raw F16 weight mis-computes in this graph position (CPU F16 GEMM,
+    // second [4096,4096] F16 A in one graph at N=64; repro'd in
+    // tools/minicpmo_seg_test.cpp scenario_rs_real), which is why this used
+    // to run as a single-thread host scalar loop in encode() (~1.07
+    // GMAC/tile, ~0.36 s per tile).
+    if (w.proj_f32) out = ggml_mul_mat(c, w.proj_f32, out);
     if (dbg) ggml_set_name(out, "v_rs_out");
     return out;
 }
@@ -370,7 +376,7 @@ static ggml_tensor * resampler_tile(ggml_context * c, VisionTower & vt,
     ggml_tensor * r = resampler_branch(c, vt.rs, sig, pos, vt.rs_heads,
                                        dbg0 ? "rs" : nullptr);
     if (dbg0) ggml_set_name(r, "v_rs_out");
-    // ln_out rows (tokens x 4096); the proj right-multiply runs on the host
+    // rows (tokens x 4096), already right-multiplied with proj in-graph
     return r;
 }
 
@@ -380,6 +386,39 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
     feats.clear();
     feats.reserve(tiles.size() * (size_t)query_num * rs_embed);
     const bool want_dump = dump_dir && dump_dir[0];
+    using clk = std::chrono::steady_clock;
+    clk::time_point t_all0 = clk::now(), t0, t1;
+    double ms_siglip = 0, ms_rsgraph = 0;
+
+    // One-time F32 [in, out] replica of rs.proj for the in-graph right
+    // multiply: the gguf stores the torch parameter o-major (ne0 = out) and
+    // the raw F16/quantized weight mis-routes the CPU GEMM here, so convert
+    // AND transpose once (mul_mat wants K = in on ne0), upload, and let
+    // every tile's graph consume the same replica.
+    if (!rs_proj_in) {
+        std::vector<float> flat;
+        vqa::weights::snapshot_to_f32_host(rs.proj, flat);   // P[i, o] rows
+        const int64_t E = rs_embed;
+        std::vector<float> rep(flat.size());
+        for (int64_t o = 0; o < E; o++)
+            for (int64_t i = 0; i < E; i++)
+                rep[(size_t)o * E + i] = flat[(size_t)i * E + o];
+        struct ggml_init_params ip = { 2 * ggml_tensor_overhead(), NULL, true };
+        rs_proj_ctx = ggml_init(ip);
+        rs_proj_in = rs_proj_ctx ? ggml_new_tensor_2d(rs_proj_ctx,
+                                                      GGML_TYPE_F32, E, E)
+                                 : nullptr;
+        rs_proj_buf = rs_proj_in
+                          ? ggml_backend_alloc_ctx_tensors(rs_proj_ctx, backend)
+                          : nullptr;
+        if (!rs_proj_buf) {
+            fprintf(stderr, "minicpmo vision: proj f32 replica alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(rs_proj_in, rep.data(), 0,
+                                sizeof(float) * rep.size());
+        rs.proj_f32 = rs_proj_in;
+    }
 
     for (size_t ti = 0; ti < tiles.size(); ti++) {
         const VisionTower::TilePre & t = tiles[ti];
@@ -421,11 +460,14 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "v_pos_ids"),
                                 t.pos_ids.data(), 0,
                                 sizeof(int) * t.pos_ids.size());
+        t0 = clk::now();
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "minicpmo vision: compute failed\n");
             ggml_free(c);
             return false;
         }
+        t1 = clk::now();
+        ms_siglip += std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (want_dump && ti == 0) {
             vqa::dump::write(gf, dump_dir, "v_pix_in");
             fprintf(stderr,
@@ -462,11 +504,14 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "v_rs_pos"),
                                 t.sincos.data(), 0,
                                 sizeof(float) * t.sincos.size());
+        t0 = clk::now();
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "minicpmo vision: resampler compute failed\n");
             ggml_free(c);
             return false;
         }
+        t1 = clk::now();
+        ms_rsgraph += std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (want_dump && ti == 0) {
             vqa::dump::write(gf, dump_dir, "v_rs_pos");
             vqa::dump::write(gf, dump_dir, "v_rs_out");
@@ -476,29 +521,8 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
         feats.resize(off + (size_t)rows * rs_embed);
         ggml_backend_tensor_get(out, feats.data() + off, 0,
                                 sizeof(float) * (size_t)rows * rs_embed);
-        if (rs_host_proj.empty()) {
-            // f32 host copy of the proj weight (F16 in the F16 GGUF; Q8_0/Q6_K
-            // in the quantized tiers - a blind F16-sized tensor_get here reads
-            // past the quantized buffer, the nemotronomni rd() bug in miniature)
-            vqa::weights::snapshot_to_f32_host(rs.proj, rs_host_proj);
-        }
-        // x @ proj: feats rows are tokens [rows, 4096]; proj [in, out] flat
-        std::vector<float> src(feats.begin() + off, feats.end());
-        for (int64_t t = 0; t < rows; t++) {
-            const float * xv = &src[(size_t)t * rs_embed];
-            float * ov = &feats[off + (size_t)t * rs_embed];
-            for (int64_t j = 0; j < rs_embed; j++) ov[j] = 0.0f;
-            // x @ proj: proj flat is [out][in] (o-major), so accumulate
-            // column j over k with the row pointer walking in
-            for (int64_t k = 0; k < rs_embed; k++) {
-                const float xv_k = xv[k];
-                if (xv_k == 0.0f) continue;
-                const float * pr = &rs_host_proj[(size_t)k * rs_embed];
-                for (int64_t j = 0; j < rs_embed; j++) ov[j] += xv_k * pr[j];
-            }
-        }
         if (want_dump && ti == 0) {
-            // parity surface: the tile's final (host-proj'd) resampler rows
+            // parity surface: the tile's final (proj'd) resampler rows
             FILE * fp = fopen(std::string(std::string(dump_dir) +
                                           "/host_feats.bin").c_str(), "wb");
             if (fp) {
@@ -509,6 +533,12 @@ bool VisionTower::encode(std::vector<TilePre> & tiles, std::vector<float> & feat
         ggml_free(c);
         n_tok = (int)(feats.size() / rs_embed);
     }
+    clk::time_point t_all1 = clk::now();
+    fprintf(stderr,
+            "minicpmo: vision encode %.0f ms (%zu tiles: siglip %.0f, "
+            "resampler graph+proj %.0f ms) -> %d tok\n",
+            std::chrono::duration<double, std::milli>(t_all1 - t_all0).count(),
+            tiles.size(), ms_siglip, ms_rsgraph, n_tok);
     return true;
 }
 
