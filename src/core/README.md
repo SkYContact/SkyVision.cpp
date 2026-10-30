@@ -45,6 +45,9 @@ src/core/
     load_util.hpp           LoadOptions -> members, <PREFIX>_DUMP_DIR, special ids
     vram_guard.cpp          device memory probe + requirement estimate
     http_server.hpp         minimal HTTP/1.1 for the embedded Web UI
+  test/                   header-only harnesses for the tools/ test drivers
+    seg_test.hpp            seg-test drivers' shared harness (seeded LCG, weight
+                            workspace, graph runner, cpp_*.bin dump convention)
   util/                   pure helpers, no ggml
     mmap.hpp/.cpp           read-only file map + whole-file read
     aligned_buf.hpp         64-byte aligned byte buffer
