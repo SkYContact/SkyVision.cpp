@@ -1,6 +1,7 @@
 // qwen3omni_audio.cpp - see qwen3omni_audio.hpp for the architecture contract.
 #include "qwen3omni_audio.hpp"
 
+#include "core/audio/whisper_tower.hpp"
 #include "core/media/audio_feats.hpp"
 #include "core/engine/gguf_util.hpp"
 #include "core/engine/ggml_dump.hpp"
@@ -18,6 +19,17 @@ namespace qwen3omni {
 
 static float gelu_erf(float x) {
     return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+// layer-0 parity sinks (a_l0_q / a_l0_attn / a_l0_out): stamped through the
+// shared block's observe-only naming hook, exactly where the hand-written
+// loop named them
+static const char * aud_dbg_name(void *, int il, const char * seg) {
+    if (il != 0) return nullptr;
+    if (!strcmp(seg, "q")) return "a_l0_q";
+    if (!strcmp(seg, "attn")) return "a_l0_attn";
+    if (!strcmp(seg, "out")) return "a_l0_out";
+    return nullptr;
 }
 
 bool AudioTower::encode(const float * pcm, int n_samples, std::vector<float> & feats,
@@ -47,7 +59,7 @@ bool AudioTower::encode(const float * pcm, int n_samples, std::vector<float> & f
     const float *c1w = host_c1w.data(), *c1b = host_c1b.data(),
                 *c2w = host_c2w.data(), *c2b = host_c2b.data(),
                 *c3w = host_c3w.data(), *c3b = host_c3b.data(), *cow = host_cow.data();
-    const int D = n_embd, NH = n_head, HD = D / NH;
+    const int D = n_embd, NH = n_head;
 
     // ---- per-chunk conv stack + conv_out + sinusoid pos --------------------
     // after-cnn length: ((Lc + 1) / 2 + 1) / 2 + 1) / 2 with k3s2p1
@@ -210,34 +222,20 @@ bool AudioTower::encode(const float * pcm, int n_samples, std::vector<float> & f
     ggml_set_name(a_mask, "a_attn_mask");
 
     ggml_tensor * x = a_in;
-    const float scale = 1.0f / sqrtf((float)HD);
+    vqa::whisper::BlockHooks h;
+    h.dbg_name = aud_dbg_name;
     for (int il = 0; il < n_layer; il++) {
         const AudLayer & L = layers[(size_t)il];
-        ggml_tensor * hh = ggml_norm(actx, x, ln_eps);
-        hh = ggml_add(actx, ggml_mul(actx, hh, L.ln1_w), L.ln1_b);
-        ggml_tensor * q = ggml_add(actx, ggml_mul_mat(actx, L.wq, hh), L.bq);
-        ggml_tensor * k = ggml_add(actx, ggml_mul_mat(actx, L.wk, hh), L.bk);
-        ggml_tensor * v = ggml_add(actx, ggml_mul_mat(actx, L.wv, hh), L.bv);
-        if (il == 0) { ggml_set_name(q, "a_l0_q"); }
-        ggml_tensor * q3 = ggml_reshape_3d(actx, q, HD, NH, n_tok);
-        ggml_tensor * k3 = ggml_reshape_3d(actx, k, HD, NH, n_tok);
-        ggml_tensor * v3 = ggml_reshape_3d(actx, v, HD, NH, n_tok);
-        ggml_tensor * qf = ggml_cont(actx, ggml_permute(actx, q3, 0, 2, 1, 3));
-        ggml_tensor * kf = ggml_cont(actx, ggml_permute(actx, k3, 0, 2, 1, 3));
-        ggml_tensor * vf = ggml_cont(actx, ggml_permute(actx, v3, 0, 2, 1, 3));
-        ggml_tensor * fa = ggml_flash_attn_ext(actx, qf, kf, vf, a_mask, scale, 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(actx, ggml_cont(actx, fa), D, n_tok);
-        if (il == 0) ggml_set_name(attn, "a_l0_attn");
-        attn = ggml_add(actx, ggml_mul_mat(actx, L.wo, attn), L.bo);
-        x = ggml_add(actx, x, attn);
-
-        hh = ggml_norm(actx, x, ln_eps);
-        hh = ggml_add(actx, ggml_mul(actx, hh, L.ln2_w), L.ln2_b);
-        ggml_tensor * g = ggml_add(actx, ggml_mul_mat(actx, L.fc1_w, hh), L.fc1_b);
-        g = ggml_gelu_erf(actx, g);
-        g = ggml_add(actx, ggml_mul_mat(actx, L.fc2_w, g), L.fc2_b);
-        x = ggml_add(actx, x, g);
-        if (il == 0) ggml_set_name(x, "a_l0_out");
+        vqa::whisper::LayerW W;
+        W.ln1_w = L.ln1_w; W.ln1_b = L.ln1_b;
+        W.wq = L.wq;       W.bq = L.bq;
+        W.wk = L.wk;       W.bk = L.bk;    // Qwen3-ASR: k_proj carries a bias
+        W.wv = L.wv;       W.bv = L.bv;
+        W.wo = L.wo;       W.bo = L.bo;
+        W.ln2_w = L.ln2_w; W.ln2_b = L.ln2_b;
+        W.ff1_w = L.fc1_w; W.ff1_b = L.fc1_b;
+        W.ff2_w = L.fc2_w; W.ff2_b = L.fc2_b;
+        x = vqa::whisper::block(actx, x, il, W, a_mask, D, NH, n_tok, ln_eps, h);
     }
     ggml_set_name(x, "a_final");
     ggml_tensor * h2 = ggml_norm(actx, x, ln_eps);

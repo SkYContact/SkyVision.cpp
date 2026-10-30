@@ -5,6 +5,7 @@
 // projection + AvgPool1d(5) head. Numerics contract in minicpmo.hpp.
 #include "minicpmo.hpp"
 
+#include "core/audio/whisper_tower.hpp"
 #include "core/media/audio_feats.hpp"
 #include "core/engine/ggml_dump.hpp"
 #include "ggml-alloc.h"
@@ -18,6 +19,15 @@
 #include <cstring>
 
 namespace minicpmo {
+
+// layer-0 parity sinks (a_l0_attn_out / a_l0_out): stamped through the shared
+// block's observe-only naming hook, only when dumping (as before)
+static const char * aud_dbg_name(void * ud, int il, const char * seg) {
+    if (!*static_cast<const bool *>(ud) || il != 0) return nullptr;
+    if (!strcmp(seg, "resid")) return "a_l0_attn_out";
+    if (!strcmp(seg, "out")) return "a_l0_out";
+    return nullptr;
+}
 
 // ---------------------------------------------------------------- mel
 
@@ -96,40 +106,22 @@ bool AudioTower::encode_chunk(const float * mel80, int n_len,
     ggml_set_name(mask, "a_mask");
     ggml_set_input(mask);
 
-    const int HD = d_model / n_head;
+    vqa::whisper::BlockHooks h;
+    h.dbg_name = aud_dbg_name;
+    h.ud = const_cast<bool *>(&want_dump);
     for (int il = 0; il < (int)al.size(); il++) {
         const AudLayer & L = al[(size_t)il];
-        ggml_tensor * h = ggml_norm(c, x, ln_eps);
-        h = ggml_add(c, ggml_mul(c, h, L.attn_ln_w), L.attn_ln_b);
-        ggml_tensor * q = ggml_mul_mat(c, L.wq, h);
-        q = ggml_add(c, q, L.bq);
-        ggml_tensor * k = ggml_mul_mat(c, L.wk, h);   // no bias (whisper)
-        ggml_tensor * v = ggml_mul_mat(c, L.wv, h);
-        v = ggml_add(c, v, L.bv);
-        ggml_tensor * q3 = ggml_reshape_3d(c, q, HD, n_head, T2);
-        ggml_tensor * k3 = ggml_reshape_3d(c, k, HD, n_head, T2);
-        ggml_tensor * v3 = ggml_reshape_3d(c, v, HD, n_head, T2);
-        ggml_tensor * qf = ggml_cont(c, ggml_permute(c, q3, 0, 2, 1, 3));
-        ggml_tensor * kf = ggml_cont(c, ggml_permute(c, k3, 0, 2, 1, 3));
-        ggml_tensor * vf = ggml_cont(c, ggml_permute(c, v3, 0, 2, 1, 3));
-        ggml_tensor * fa = ggml_flash_attn_ext(c, qf, kf, vf, mask,
-                                               1.0f / std::sqrt((float)HD),
-                                               0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(c, ggml_cont(c, fa), d_model, T2);
-        attn = ggml_mul_mat(c, L.wo, attn);
-        attn = ggml_add(c, attn, L.bo);
-        x = ggml_add(c, x, attn);
-        if (want_dump && il == 0) ggml_set_name(x, "a_l0_attn_out");
-
-        h = ggml_norm(c, x, ln_eps);
-        h = ggml_add(c, ggml_mul(c, h, L.ffn_ln_w), L.ffn_ln_b);
-        ggml_tensor * f = ggml_mul_mat(c, L.fc1_w, h);
-        f = ggml_add(c, f, L.fc1_b);
-        f = ggml_gelu_erf(c, f);
-        f = ggml_mul_mat(c, L.fc2_w, f);
-        f = ggml_add(c, f, L.fc2_b);
-        x = ggml_add(c, x, f);
-        if (want_dump && il == 0) ggml_set_name(x, "a_l0_out");
+        vqa::whisper::LayerW W;
+        W.ln1_w = L.attn_ln_w; W.ln1_b = L.attn_ln_b;
+        W.wq = L.wq;           W.bq = L.bq;
+        W.wk = L.wk;           // whisper: k_proj has NO bias
+        W.wv = L.wv;           W.bv = L.bv;
+        W.wo = L.wo;           W.bo = L.bo;
+        W.ln2_w = L.ffn_ln_w;  W.ln2_b = L.ffn_ln_b;
+        W.ff1_w = L.fc1_w;     W.ff1_b = L.fc1_b;
+        W.ff2_w = L.fc2_w;     W.ff2_b = L.fc2_b;
+        x = vqa::whisper::block(c, x, il, W, mask, d_model, n_head, T2,
+                                ln_eps, h);
     }
     x = ggml_norm(c, x, ln_eps);
     x = ggml_mul(c, x, ln_post_w);

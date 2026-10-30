@@ -24,6 +24,7 @@
 // 102 - n_out are gap garbage.
 #include "qwen25omni_model.hpp"
 
+#include "core/audio/whisper_tower.hpp"
 #include "core/media/audio_feats.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -43,6 +44,18 @@
 #endif
 
 namespace qwen25omni {
+
+// layer-0 parity sinks (a_l0_* dumps): stamped through the shared block's
+// observe-only naming hook, exactly where the hand-written loop named them
+static const char * aud_dbg_name(void *, int il, const char * seg) {
+    if (il != 0) return nullptr;
+    if (!strcmp(seg, "q")) return "a_l0_q";
+    if (!strcmp(seg, "k")) return "a_l0_k";
+    if (!strcmp(seg, "attn")) return "a_l0_attn";
+    if (!strcmp(seg, "out")) return "a_l0_out";
+    return nullptr;
+}
+
 
 // ---------------------------------------------------------------- mel
 //
@@ -123,41 +136,21 @@ bool AudioTower::build_graph(const AudioGeometry & geo) {
     x = ggml_add(actx, x, ggml_get_rows(actx, pos_embd, a_pos_idx));
     ggml_set_name(x, "a_embed");
 
-    const float scale = 1.0f / sqrtf((float)(n_embd / n_head));
+    vqa::whisper::BlockHooks hk;
+    hk.dbg_name = aud_dbg_name;
     for (int il = 0; il < n_layer; il++) {
         const AudLayer & L = layers[(size_t)il];
-        ggml_tensor * h = ggml_norm(actx, x, ln_eps);   // LayerNorm, carries bias
-        h = ggml_add(actx, ggml_mul(actx, h, L.ln1_w), L.ln1_b);
-
-        ggml_tensor * q = ggml_mul_mat(actx, L.wq, h);
-        q = ggml_add(actx, q, L.bq);
-        ggml_tensor * k = ggml_mul_mat(actx, L.wk, h);
-        ggml_tensor * v = ggml_mul_mat(actx, L.wv, h);
-        v = ggml_add(actx, v, L.bv);
-        if (il == 0) { ggml_set_name(q, "a_l0_q"); ggml_set_name(k, "a_l0_k"); }
-
-        ggml_tensor * q3 = ggml_reshape_3d(actx, q, n_embd / n_head, n_head, T2);
-        ggml_tensor * k3 = ggml_reshape_3d(actx, k, n_embd / n_head, n_head, T2);
-        ggml_tensor * v3 = ggml_reshape_3d(actx, v, n_embd / n_head, n_head, T2);
-        ggml_tensor * qf = ggml_cont(actx, ggml_permute(actx, q3, 0, 2, 1, 3));
-        ggml_tensor * kf = ggml_cont(actx, ggml_permute(actx, k3, 0, 2, 1, 3));
-        ggml_tensor * vf = ggml_cont(actx, ggml_permute(actx, v3, 0, 2, 1, 3));
-        ggml_tensor * fa = ggml_flash_attn_ext(actx, qf, kf, vf, a_attn_mask, scale, 0.0f, 0.0f);
-        ggml_tensor * attn = ggml_reshape_2d(actx, ggml_cont(actx, fa), n_embd, T2);
-        if (il == 0) ggml_set_name(attn, "a_l0_attn");
-        attn = ggml_mul_mat(actx, L.wo, attn);
-        attn = ggml_add(actx, attn, L.bo);
-        x = ggml_add(actx, x, attn);
-
-        h = ggml_norm(actx, x, ln_eps);
-        h = ggml_add(actx, ggml_mul(actx, h, L.ln2_w), L.ln2_b);
-        ggml_tensor * g = ggml_mul_mat(actx, L.w_gate, h);
-        g = ggml_add(actx, g, L.b_gate);
-        h = ggml_gelu_erf(actx, g);
-        h = ggml_mul_mat(actx, L.w_down, h);
-        h = ggml_add(actx, h, L.b_down);
-        x = ggml_add(actx, x, h);
-        if (il == 0) ggml_set_name(x, "a_l0_out");
+        vqa::whisper::LayerW W;
+        W.ln1_w = L.ln1_w;  W.ln1_b = L.ln1_b;
+        W.wq = L.wq;        W.bq = L.bq;
+        W.wk = L.wk;                       // whisper: k_proj has no bias
+        W.wv = L.wv;        W.bv = L.bv;
+        W.wo = L.wo;        W.bo = L.bo;
+        W.ln2_w = L.ln2_w;  W.ln2_b = L.ln2_b;
+        W.ff1_w = L.w_gate; W.ff1_b = L.b_gate;
+        W.ff2_w = L.w_down; W.ff2_b = L.b_down;
+        x = vqa::whisper::block(actx, x, il, W, a_attn_mask, n_embd, n_head,
+                                T2, ln_eps, hk);
     }
     ggml_set_name(x, "a_final");
 
