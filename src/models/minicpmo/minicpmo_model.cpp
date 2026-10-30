@@ -29,6 +29,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "core/text/tokenizer.hpp"
+#include "core/engine/media_inject.hpp"
 #include "core/engine/attention.hpp"
 #include "core/engine/decode_graph.hpp"
 #include "core/engine/backend.hpp"
@@ -511,15 +512,7 @@ bool MiniCPMO::build_text_graph(TextGraph & g, int T, int S, bool logits_all,
 
     ggml_tensor * x = ggml_get_rows(c, tok_embd, g.tok_in);
     ggml_set_name(x, "emb");
-    if (n_mm > 0) {
-        g.mm_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_mm);
-        ggml_set_name(g.mm_in, "mm_in");
-        ggml_set_input(g.mm_in);
-        g.mm_pos_in = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_mm);
-        ggml_set_name(g.mm_pos_in, "mm_pos_in");
-        ggml_set_input(g.mm_pos_in);
-        x = ggml_set_rows(c, ggml_dup(c, x), g.mm_in, g.mm_pos_in);
-    }
+    x = vqa::engine::inject_media_rows(c, x, &g.mm_in, &g.mm_pos_in, D, n_mm);
 
     for (int il = 0; il < n_layer; il++) {
         const Layer & L = tl[(size_t)il];

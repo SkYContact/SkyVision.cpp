@@ -100,6 +100,7 @@
 #   include "ggml-cuda.h"
 #endif
 #include "core/text/tokenizer.hpp"
+#include "core/engine/media_inject.hpp"
 #include "core/engine/attention.hpp"
 #include "core/engine/decode_graph.hpp"
 #include "core/engine/expert_cache.hpp"
@@ -1105,18 +1106,7 @@ bool NemotronOmni::build_text_graph(TextGraph & g, int T, int S, bool logits_all
 
     ggml_tensor * x = ggml_get_rows(c, tok_embd, g.tok_in);           // [D, T]
     ggml_set_name(x, "emb");
-    if (n_mm > 0) {
-        // media rows (vision/audio tower embeddings) scattered onto their
-        // placeholder positions before the trunk; decode (n_mm == 0) never
-        // builds these, keeping the bucketed decode graph bit-identical
-        g.mm_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_mm);
-        ggml_set_name(g.mm_in, "mm_in");
-        ggml_set_input(g.mm_in);
-        g.mm_pos_in = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_mm);
-        ggml_set_name(g.mm_pos_in, "mm_pos_in");
-        ggml_set_input(g.mm_pos_in);
-        x = ggml_set_rows(c, ggml_dup(c, x), g.mm_in, g.mm_pos_in);
-    }
+    x = vqa::engine::inject_media_rows(c, x, &g.mm_in, &g.mm_pos_in, D, n_mm);
     ggml_tensor * pos_slot = g.pos_in;   // KV slot == absolute position
     ggml_tensor * pos_rope = rope_partial84 ? g.pos_in : nullptr;   // NoPE when null
 
