@@ -341,8 +341,32 @@ inline bool moe_expert_pred(const char * name) {
 struct SplitBound {
     ggml_backend_buffer_t dev_buf = nullptr;    // device weights (owned, free it)
     ggml_backend_buffer_t host_buf = nullptr;   // mmap wrap for host tensors (from_ptr)
+    std::vector<ggml_backend_buffer_t> host_block_bufs;   // wraps of promoted host f32 blocks
     std::vector<ggml_tensor *> host_tensors;    // tensors kept in host memory
     bool ok = false;
+
+    // One wrap per host block, mirroring bind_to_backend (a per-tensor wrap would
+    // allocate one buffer per norm tensor and leak all of them).
+    ggml_backend_buffer_t block_buf(const HostBlock & h) {
+        for (size_t i = 0; i < host_blocks.size(); i++)
+            if (host_blocks[i].data == h.data && host_blocks[i].size == h.size)
+                return host_block_bufs[i];
+        ggml_backend_buffer_t b = ggml_backend_cpu_buffer_from_ptr((void *) h.data, h.size);
+        host_blocks.push_back(h);
+        host_block_bufs.push_back(b);
+        return b;
+    }
+
+    void release() {
+        for (ggml_backend_buffer_t b : host_block_bufs) if (b) ggml_backend_buffer_free(b);
+        host_block_bufs.clear();
+        host_blocks.clear();
+        if (host_buf) { ggml_backend_buffer_free(host_buf); host_buf = nullptr; }
+        if (dev_buf) { ggml_backend_buffer_free(dev_buf); dev_buf = nullptr; }
+    }
+
+private:
+    std::vector<HostBlock> host_blocks;
 };
 
 // Split placement for one no_alloc weight context: predicate(name) == true
@@ -370,25 +394,35 @@ inline SplitBound split_bind_to_backends(ggml_context * wctx, ggml_backend_t dev
             dev_total += ggml_nbytes(t);
         }
     }
-    if (dev_tensors.empty()) { out.ok = true; return out; }
-
-    // host side: wrap the mmap so the CPU backend can compute on it in place
-    out.host_buf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
-    if (!out.host_buf) { fprintf(stderr, "split: host buffer failed\n"); return out; }
-    for (ggml_tensor * t : out.host_tensors) {
-        t->buffer = out.host_buf;
-        // promoted f32 blocks live in their own host allocations
-        const char * p = (const char *) t->data;
-        for (const HostBlock & h : hosts) {
-            if (!h.data || h.size == 0) continue;
-            if (p >= (const char *) h.data && p < (const char *) h.data + h.size) {
-                // best effort: wrap the block too (rare path - experts are
-                // quantized 2D/3D, never promoted)
-                ggml_backend_buffer_t b = ggml_backend_cpu_buffer_from_ptr((void *) h.data, h.size);
-                if (b) t->buffer = b;
-                break;
+    // host side first: wrap the mmap so the CPU backend can compute on it in place.
+    // This must happen even when nothing goes to the device (all-host placement),
+    // otherwise the host tensors keep a null buffer and every graph reading them
+    // is invalid.
+    if (!out.host_tensors.empty()) {
+        out.host_buf = ggml_backend_cpu_buffer_from_ptr(mm.ptr, mm.size);
+        if (!out.host_buf) { fprintf(stderr, "split: host buffer failed\n"); return out; }
+        for (ggml_tensor * t : out.host_tensors) {
+            t->buffer = out.host_buf;
+            // promoted f32 blocks live in their own host allocations
+            const char * p = (const char *) t->data;
+            for (const HostBlock & h : hosts) {
+                if (!h.data || h.size == 0) continue;
+                if (p >= (const char *) h.data && p < (const char *) h.data + h.size) {
+                    // promoted host f32 blocks (norms / biases) are not part of the
+                    // mmap, so they need their own wrap - one per block, shared by
+                    // every tensor that points into it
+                    ggml_backend_buffer_t b = out.block_buf(h);
+                    if (b) t->buffer = b;
+                    break;
+                }
             }
         }
+    }
+    if (dev_tensors.empty()) {
+        fprintf(stderr, "split weights: %.2f GB all in host mmap (%zu tensors)\n",
+                host_total / 1e9, out.host_tensors.size());
+        out.ok = true;
+        return out;
     }
 
     // device side: allocate just the dev subset and upload

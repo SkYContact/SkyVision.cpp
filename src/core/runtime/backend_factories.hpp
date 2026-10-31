@@ -29,5 +29,6 @@ Model * create_qwen3omni();
 Model * create_nemotron_parse();
 Model * create_nemotronomni();
 Model * create_minicpmo();
+Model * create_diffusiongemma();
 
 }  // namespace vqa

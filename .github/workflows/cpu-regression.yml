@@ -131,12 +131,12 @@ jobs:
           specs = json.load(open('specs.json'))
           assert isinstance(specs, list) and specs, 'specs must be a non-empty JSON list'
           archs = [s['arch'] for s in specs]
-          # expected set as of the minicpmo row (23rd arch; keep this set
+          # expected set as of the diffusiongemma row (24th arch; keep this set
           # in sync with vqa_spec.cpp)
           expected = {
-              'embgemma2', 'gemma4', 'janus', 'keye-vl2', 'mage_vl', 'marlin',
-              'minicpmo', 'minicpmv47', 'moondream3', 'moss_vl', 'nemotronomni',
-              'nemotron_parse', 'qwen25omni',
+              'diffusiongemma', 'embgemma2', 'gemma4', 'janus', 'keye-vl2',
+              'mage_vl', 'marlin', 'minicpmo', 'minicpmv47', 'moondream3',
+              'moss_vl', 'nemotronomni', 'nemotron_parse', 'qwen25omni',
               'qwen2vl', 'qwen3_5', 'qwen3omni', 'qwen3vl', 'siglip', 'smolvlm',
               'videochat3', 'videojev', 'videomae', 'vjepa2',
           }

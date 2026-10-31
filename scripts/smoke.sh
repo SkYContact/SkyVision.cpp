@@ -43,6 +43,14 @@ cd "$(dirname "$0")/.."
 [ -f models/qwen3.5-2b-q8_0.gguf ] || [ -f models/Qwen3.5-2B/qwen3.5-2b-q8_0.gguf ] && \
   run "[5] qwen3.5 text" "$BIN" -m models/Qwen3.5-2B/qwen3.5-2b-q8_0.gguf -t models/Qwen3.5-2B \
       --ask "What is the capital of France?" -n 48 --cpu --temp 0 --threads 1
+# DiffusionGemma is a block-diffusion decoder, so there is no greedy path; the
+# sampler still runs off a fixed built-in seed, which makes the answer byte-stable
+# for byte-stable inputs. DG_STEPS caps the denoising passes per canvas (the 26B
+# MoE otherwise runs up to 48 of them, and this smoke test runs --threads 1).
+[ -f models/diffusiongemma-26b-a4b-it-q8_0.gguf ] && \
+  DG_STEPS=8 run "[6] diffusiongemma text" "$BIN" -m models/diffusiongemma-26b-a4b-it-q8_0.gguf \
+      -t models/diffusiongemma-26B-A4B-it --ask "What is the capital of France?" -n 64 \
+      --cpu --threads 1
 
 if [ -n "$GOLDEN" ]; then
   if diff "$GOLDEN" "$OUT"; then echo "SMOKE: PASS (byte-identical to $GOLDEN)"

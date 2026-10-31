@@ -161,6 +161,12 @@ const ArchEntry kArchs[] = {
     // checkpoint ships the Qwen3 151748-vocab tokenizer (Qwen2 BPE family).
     { { "minicpmo", "minicpm_o", nullptr }, create_minicpmo,
       TokenizerMode::Qwen2Regex, "models/minicpmo45", 151748, false, false, "" },
+    // Google DiffusionGemma 26B-A4B-it: ONE shared 30-layer sparse-MoE trunk
+    // driven twice - causally by the encoder (fills the KV cache) and
+    // bidirectionally by the canvas decoder (block diffusion, <=48 steps).
+    // Gemma4 vision tower (27 layers, 3x3 patch pooling, 280 soft tokens).
+    { { "diffusiongemma", "diffusion_gemma", nullptr }, create_diffusiongemma,
+      TokenizerMode::GemmaSP, "models/diffusiongemma-26B-A4B-it", 262144, false, false, "" },
 };
 
 const ArchEntry * find_arch(const std::string & arch) {

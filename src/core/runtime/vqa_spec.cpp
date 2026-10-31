@@ -145,6 +145,12 @@ const SpecRow kSpecs[] = {
       "plus the CosyVoice2 token2wav vocoder (sibling minicpmo-vocoder.gguf, "
       "auto-discovered; MINICPMO_VOCODER overrides) and writes a 24 kHz wav "
       "(plus <wav>.codes.txt with the 6562-codebook ids as a gate hook)" },
+    { "diffusiongemma", "diffusion_gemma", "image text", "ask",
+      false, false, false, false, "models/diffusiongemma-26B-A4B-it", "",
+      "block-diffusion decoder (not autoregressive): 30-layer MoE trunk, 256-token "
+      "canvas refined by up to 48 entropy-bounded denoising passes per block; "
+      "gemma4 vision tower (280 soft tokens/image). Truncates the self-conditioning "
+      "expectation to the top-256 tokens (DG_SC_TOPK overrides)" },
 };
 
 ArchSpec row_to_spec(const SpecRow & r) {

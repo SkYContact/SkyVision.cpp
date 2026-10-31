@@ -242,6 +242,12 @@ set(EMBG2_SRC
 set(GEMMA4_SRC
     src/models/gemma4/gemma4_model.cpp)
 
+#   src/models/diffusiongemma/  Google DiffusionGemma 26B-A4B-it (block-diffusion
+#                            MoE trunk: one encoder prefill + canvas decoder,
+#                            Gemma4 vision tower)
+set(DIFFUSIONGEMMA_SRC
+    src/models/diffusiongemma/diffusiongemma_model.cpp)
+
 #   src/models/siglip/       SigLIP image tower (pooled embedding / classifier base)
 set(SIGLIP_SRC
     src/models/siglip/siglip_model.cpp)
@@ -306,6 +312,7 @@ add_executable(vqa-cli
     ${QWEN25OMNI_SRC}
     ${EMBG2_SRC}
     ${GEMMA4_SRC}
+    ${DIFFUSIONGEMMA_SRC}
     ${SIGLIP_SRC}
     ${KEYE_VL_SRC}
     ${QWEN3OMNI_SRC}
@@ -365,6 +372,17 @@ endif()
 add_executable(vram-probe tools/vram_probe.cpp src/core/runtime/vram_guard.cpp)
 target_link_libraries(vram-probe PRIVATE ggml ggml-cpu)
 target_include_directories(vram-probe PRIVATE ${GGML_INC} ${SRC_INC})
+
+# --- DiffusionGemma batched mat-mul probe: feeds an input whose 64 columns are
+#     all identical into one mul_mat and checks the 64 output columns match.
+#     Runs the same graph on CPU and (when available) CUDA, so a divergence can
+#     be pinned on a backend instead of on the model graph. ---
+add_executable(diffusiongemma-mm-probe tools/diffusiongemma_mm_probe.cpp)
+target_link_libraries(diffusiongemma-mm-probe PRIVATE ggml ggml-cpu)
+target_include_directories(diffusiongemma-mm-probe PRIVATE ${GGML_INC})
+if (TARGET ggml-cuda)
+    target_link_libraries(diffusiongemma-mm-probe PRIVATE ggml-cuda CUDA::cudart)
+endif()
 
 # --- Nemotron-Parse answer renderer test: np_markup.hpp is header-only and pulls
 #     in nothing but the C++ standard library, so this target needs no ggml and no

@@ -49,6 +49,7 @@ Full per-backend details are in the hand-maintained table below:
 | `nemotron_parse` | `nemotron-parse` | image + text | ask | — | — |
 | `nemotronomni` | — | image + audio + text | ask | — | — |
 | `minicpmo` | `minicpm_o` | image + audio + text | ask | — | speech output |
+| `diffusiongemma` | `diffusion_gemma` | image + text | ask | — | — |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | Backend | Architecture tag | Input | Notes |
@@ -71,6 +72,7 @@ Full per-backend details are in the hand-maintained table below:
 | **Nemotron-3.5-Parse (0.63B)** | `nemotron_parse` (`nemotron-parse`) | image (document page) | NVIDIA's document parser: **C-RADIOv4-SO400M tower** (27 layers, patch 16, d=1152, ten class tokens in front of the sequence, learned 128×128 position table resampled onto the content area, no rope, GELU(erf), no norm at the end of the tower) + a **conv neck** (1×1 Conv1d → LN → width 4:1 Conv2d → LN; class tokens 0/1 become one summary token appended at the end) + a **10-layer mBART-style prefix decoder** (d=1024, 16/8 GQA, pre-LN, `√d` embedding scale, tied lm_head, **no positional encoding at all**, the visual features being the KV prefix). The answer is a **control-token stream carrying layout classes and normalised boxes**; `--mode markdown/json` renders it into markdown (LaTeX `tabular`→HTML table) or blocks with bboxes. Parity: position field 2.7e-7, all 159 greedy tokens of a page identical to the official stack. Converts via `convert/convert_nemotron_parse.py`; MCP tool `parse_document` |
 | **Nemotron-3-Nano-Omni-30B-A3B (Reasoning)** | `nemotronomni` | image + audio | NVIDIA's 30B-A3B omni reasoning MoE: a **52-layer Mamba2/Attention/MoE hybrid trunk** (23 Mamba2 + 6 NoPE attention + 23 MoE; sigmoid ×2.5 router with e_score_correction_bias, relu² non-gated 1856 experts, one 3712 shared expert) + a C-RADIOv4-H vision tower (32 blocks, d=1280, 10 register tokens dropped after the trunk, learned 128×128 position table, T=2 tubelet video patching) + a Parakeet/FastConformer audio tower (BatchNorm folded engine-side). English only, **thinking on by default**, 256k ctx, **text output only** (no talker). Parity: greedy argmax 100% identical to the official stack, audio transcription verbatim, RoPE ruled NoPE (partial84 corrupts the media path at step 0). Per-tensor hybrid quantization: %256-wide towers/trunk at Q6_K + experts Q5_0 + embeddings Q8_0 (row widths 2688/1856/3712 are not multiples of 256, so a plain k-quant tier covers only 5% of the bytes - there is no pure Q4_K/Q6_K tier). Converts via `convert/convert_nemotronomni.py`; prebuilt: `modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF` (same name on HF, tokenizer included) |
 | **MiniCPM-o 4.5** | `minicpmo` (`minicpm_o`) | image + audio | OpenBMB's 8B omni model (official Qwen3-8B dense base): 36L d=4096 GQA 32:8 trunk (vocab 151748, ctx 40960, per-head q/k RMSNorm) + SigLIP NaFiT vision tower (27L d=1152 @448px, learned 70x70 position table, dynamic multi-tile slicing) + 64-query Perceiver resampler + Whisper-medium audio tower (24L, 80 mel, 1s chunk-diagonal mask) + Llama-768x20L TTS sub-tower (6562 codebook) + CosyVoice2 token2wav vocoder (sibling GGUF, auto-discovered); text out + `--speak` 24 kHz speech out. **TTS needs the official sampler params** (greedy collapses the codes). Parity: text greedy "Paris", vision resampler cos 0.99994, audio proj cos 0.9999980, same-noise vocoder gate mel cos 0.999999986. Two quant tiers: q8_0 10.09 GB (only vision fc2 x27 kept F16) + q6k_mixed 8.19 GB (1152-wide x136 + fc2 in F16). Converts via `convert/convert_minicpmo45.py`; prebuilt: `modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF` (same name on HF, tokenizer + vocoder included) |
+| **DiffusionGemma 26B-A4B-it** | `diffusiongemma` (`diffusion_gemma`) | image + text | Google's **block-diffusion decoder - not autoregressive**: ONE shared 30-layer sparse-MoE trunk (hidden 2816, 128 experts top-8 plus a parallel dense MLP FFN, SWA 8×256/window 1024 interleaved with full 2×512/theta 1e6 proportional 0.25 layers, Gemma sandwich post-norms, logit softcap 30, tied embeddings ×sqrt(2816)) runs twice - the encoder prefills causally into the KV cache, and the canvas decoder denoises a 256-token block with **bidirectional attention** over that same read-only cache. Up to 48 steps per block: EntropyBound sampling (entropy bound 0.1, temperature annealed 0.8→0.4, non-accepted slots renoised) plus a stable-and-confident adaptive stop, with self-conditioning fed by the previous step's embedding expectation; the finished argmax canvas is appended and re-encoded causally, overwriting the decoder's scratch KV rows. Vision is the Gemma4 tower (27 layers d=1152, patch 16, learned 2-D position table, axial 2-D RoPE, 3×3 spatial pooling → 280 soft tokens). Converts via `convert/convert_diffusiongemma.py`; `DG_STEPS` / `DG_SC_TOPK` tune the denoising step count and the self-conditioning truncation |
 | **SmolVLM (256M, Idefics3)** | `smolvlm` | image | the smallest usable backend here: SigLIP-base tower (12 layers, patch 16, 512², learned positions, LN/attention/MLP all with bias, `gelu_tanh`) + **4×4 pixel shuffle** connector (12288→576) + SmolLM2-135M trunk (30 layers, no bias, GQA 9:3, rope 1e5). Official Idefics3 preprocessing: longest edge **2048** → pad to multiples of 512 → **512² tiles** (row-major) + one global view, 64 tokens per tile. 515 MB at f16 / ~270 MB at q8 |
 | **EmbeddingGemma-2 (740M)** | `embgemma2` | image + video + audio + text (embeddings) | multimodal embedding model (no text generation): Gemma3 text tower (24 layers, d=512, GQA 4:1, interleaved SWA/full, **per-layer PLE**) + Gemma4 ViT (16 layers, patch 16, axial 2D RoPE, 3×3 position pooling) + Gemma4 audio tower (USM conformer: dual 3×3 stride-2 conv subsampling + 12 layers of macaron FFN×2 / LightConv1d / **chunked local attention with Transformer-XL relative position bias**, ClippableLinear clamps throughout). `--embed` emits 768-d vectors (Matryoshka truncation to 512/256/128/64), `--embed-preset` official task prefixes, `--embed-file` batch JSONL. All four modalities vs the fp32 HF reference: **0.99999+** |
 | **Keye-VL-2.0 (30B-A3B)** | `keye-vl2` | image + video | Kwai's Keye-VL-2.0-30B-A3B: Qwen3-style **MoE text trunk** (48 layers, 128 routed experts with top-8 norm-topk softmax routing, mRoPE 16/24/24 theta 1e7, per-head qk-norm) + a per-layer **DSA lightning indexer** for sparse attention (16 heads x 64 dims, Walsh-Hadamard rotated MQA indexer keys, top-2048 KV sparse mask, separate indexer K cache) + a SigLIP-so400m lineage tower (27 layers patch 14, in-ViT 2D mRoPE, bilinearly interpolated 729-entry learned position table, post-LN, 2x2 merge + GELU projector). Video encodes frames independently with `<|frame|><hh:mm:ss>` markers; image mRoPE follows the (t=base, y=base+row, x=base+col) layout; image pads are injected as ids, not through a text round-trip (the Qwen tokenizer drops the piece). **Official GGUF runs as-is** (`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` plus its tokenizer.json; the mmproj sibling is auto-discovered). Three placements for the 19 GB checkpoint on a 12 GB card: default auto-fallback to pure CPU (~28 tok/s decode); `VQA_SPLIT=1` dense weights on GPU + experts in host RAM (ggml_backend_sched routes by weight location); `KEYE_EXPERTCACHE=1` **expert-granularity GPU residency cache** (ExpertCache: LRU + async prefetch + slot-table mul_mat_id batching that hits the CUDA backend's fused mul_mat_id+GLU pass, ~19 tok/s decode on 12 GB) |
@@ -966,6 +968,61 @@ absent from ggml's existing models.
 | vocab / context | 151936 (Qwen2 BPE); 262144 text context, engine KV default 8192 |
 | prompt | `<|im_start|>user\n<|vision_start|>` + N×`<|image_pad|>` + `<|vision_end|>` + question |
 
+### DiffusionGemma: placement, performance, limits
+
+**Placement.** The q8_0 checkpoint is 28.89 GB of weights, which does not fit in a 12 GB
+class card, so a CUDA build places the model in **two stages**: the vision tower
+(1.19 GB) and its graphs run on `CUDA0`, the language trunk (27.70 GB) stays in the host
+mmap and is computed by the CPU backend. Every graph belongs to exactly one backend and
+no tensor is copied between the stages (encoder/decoder only on the CPU, vision/projection
+only on the card).
+
+| Switch | Placement |
+|---|---|
+| `--cpu` | everything on the CPU |
+| default (CUDA build) | vision tower → card, language trunk → host mmap |
+| `DG_GPU=1` | everything on the card (needs ~30 GB VRAM) |
+| `DG_TEXT_GPU=1` | trunk on the card too (large-VRAM machines only) |
+| `DG_ALL_HOST=1` | reference path: ignore the device backend, all CPU |
+
+**Performance** (i7-14700K, 20C/28T; RTX 4070 SUPER 12 GB; q8_0):
+
+| Case | default (two-stage) | `--cpu` |
+|---|---|---|
+| text prefill, 26 tokens | 1.7 s | 1.8 s |
+| one denoising step | 4.0 s | 4.0 s |
+| one canvas (256 slots, 7–21 steps) | 28–85 s | 28–79 s |
+| vision tower, 260 soft tokens | **0.24 s** | 7.03 s |
+| end-to-end image QA (one image, one sentence) | ≈90 s | ≈91 s |
+
+The cost unit here is the **denoising step**, not the token: a canvas produces 256 slots
+at once, of which only a few are real answer tokens, so ~0.27–0.39 tok/s is not directly
+comparable to an autoregressive backend. Nearly all of the wall time is the trunk on the
+CPU (256 tokens × ~4B active parameters per step); the tower is ~29× faster on the card
+but only saves ~7 s per image. For real throughput the trunk has to go on the card too
+(`DG_GPU=1` / `DG_TEXT_GPU=1`). The backend prints a `[perf] vision … / prefill … /
+decode …` breakdown.
+
+**Quantization**: dense weights and expert tables Q8_0; the **vision tower and the tied
+embedding stay F16** (the embedding doubles as the lm_head, so F16 also keeps the
+quantization noise out of every logit).
+
+**Validation**: the vision tower matches the official `Gemma4VisionModel` at
+`corr = 0.999991` (`scripts/parity_diffusiongemma_vision.py`); end to end,
+`test_shapes.png` → "This image features a red circle, a blue square, and a black
+triangle against a light gray background."
+
+**Known limits**
+
+- Video is decoded as a single image (frame 0); the checkpoint has one image path.
+- Output is committed per canvas (256 slots), so even a short answer pays a full denoise.
+- With the trunk on the CPU a step costs ~4 s, so long answers take minutes.
+
+**Debug switches**: `DG_VISION_LAYERS=N`, `DG_VISION_SKIP=mlp|attn|all|pos`,
+`DG_VISION_CONST=1`, `DG_VISION_GRID="w h"`, `DG_VISION_ECHO=1`, `DG_VISION_ONLY=1`,
+`DG_DUMP_WEIGHTS=<dir>`, `DG_DUMP_DIR=<dir>` (with `scripts/ref_diffusiongemma.py` and
+`scripts/parity_diffusiongemma_vision.py`).
+
 ## Performance
 
 VideoChat3-4B at Q8_0 is memory-bandwidth bound on CPU; smaller quantizations or a CUDA build
@@ -975,6 +1032,7 @@ help a lot (measured here, 37-token prompt, greedy decoding — numbers move wit
 |---|---|---|---|---|
 | VideoChat3-4B Q8_0 (4.83 GB) | CPU, 14 threads | i7-14700K | ~71 tok/s | ~10.4 tok/s |
 | VideoChat3-4B Q8_0 (4.83 GB) | CUDA | RTX 4070 SUPER | ~401 tok/s | ~49.8 tok/s |
+| DiffusionGemma 26B-A4B Q8_0 (28.89 GB) | two-stage (tower CUDA / trunk CPU, 28 threads) | i7-14700K + RTX 4070 SUPER | 26 tok in 1.7 s | 4.0 s per denoising step (≈0.27–0.39 tok/s) |
 
 Every run prints a `[perf] prefill ... | decode ...` line on stderr so you can check your own
 setup. moondream3.1 numbers are in [Status](#status).

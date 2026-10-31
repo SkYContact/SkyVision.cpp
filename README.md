@@ -46,6 +46,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | `nemotron_parse` | `nemotron-parse` | 图像 + 文本 | ask | — | — |
 | `nemotronomni` | — | 图像 + 音频 + 文本 | ask | — | — |
 | `minicpmo` | `minicpm_o` | 图像 + 音频 + 文本 | ask | — | 语音输出 |
+| `diffusiongemma` | `diffusion_gemma` | 图像 + 文本 | ask | — | — |
 <!-- /AUTO-GENERATED capability matrix -->
 
 | 后端 | 架构标签 | 输入 | 说明 |
@@ -68,6 +69,7 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 | **Nemotron-3.5-Parse（0.63B）** | `nemotron_parse`（`nemotron-parse`） | 图像（文档页） | NVIDIA 文档解析模型：**C-RADIOv4-SO400M 视觉塔**（27 层、patch16、d=1152、10 个 class token 排在最前、学出来的 128×128 位置表按内容区插值、无 rope、GELU(erf)、塔末无 norm）+ 卷积 **neck**（1×1 Conv1d → LN → 宽度 4 合 1 的 Conv2d → LN；前两个 class token 投影成 1 个 summary token 追加在末尾）+ **10 层 mBART 式前缀解码器**（d=1024、16/8 GQA、pre-LN、`√d` 嵌入缩放、tied lm_head、**没有任何位置编码**，视觉特征即 KV 前缀）。输出是带版面类别与归一化框的**控制 token 流**，`--mode markdown/json` 渲染成 markdown（LaTeX `tabular`→HTML 表）或带 bbox 的 blocks。对拍：位置场 2.7e-7、整页 159 步贪心与官方逐 token 相同。转换 `convert/convert_nemotron_parse.py`，MCP 工具 `parse_document` |
 | **Nemotron-3-Nano-Omni-30B-A3B（Reasoning）** | `nemotronomni` | 图像 + 音频 | NVIDIA 30B-A3B 全模态 MoE 推理模型：**52 层 Mamba2/Attention/MoE 混合主干**（23 Mamba2 + 6 NoPE attention + 23 MoE；sigmoid ×2.5 路由带 e_score_correction_bias、relu² 非门控专家 1856、1 个 3712 共享专家）+ C-RADIOv4-H 视觉塔（32 层 d=1280、10 个 register token 前置后整块丢弃、学出的 128×128 位置表、T=2 tubelet 视频嵌入已转换）+ Parakeet/FastConformer 音频塔（BatchNorm 引擎侧折叠）。英文 only、**thinking 默认开**、256k ctx、**纯文本输出**（无 talker）。对拍：文本贪心 argmax 与官方栈 100% 一致、音频转写逐字一致、RoPE 判决=NoPE（partial84 媒体路径 step0 即 cos 0.85 语义损坏）。逐张量混合量化：%256 宽的塔/主干 Q6_K + 专家 Q5_0 + 嵌入 Q8_0（行宽 2688/1856/3712 非 256 倍数，裸 k-quant 档只能覆盖 5% 字节，故无纯 Q4_K/Q6_K 档）。转换 `convert/convert_nemotronomni.py`。预置权重：`modelscope download --model SkyContact/Nemotron3-Nano-Omni-30B-A3B-GGUF`（HF 同名，含 tokenizer） |
 | **MiniCPM-o 4.5** | `minicpmo`（`minicpm_o`） | 图像 + 音频 | OpenBMB 8B 级全模态（官方 Qwen3-8B 稠密底座）：36 层 d=4096 GQA 32:8 主干（词表 151748、ctx 40960、q/k 逐 head RMSNorm）+ SigLIP NaFiT 视觉塔（27 层 d=1152 @448px，学出的 70×70 位置表按图动态多瓦片切片）+ 64-query Perceiver 重采样器 + Whisper-medium 音频塔（24 层、80 mel、1s 块对角掩码）+ Llama-768×20L TTS 副塔（6562 码本）+ CosyVoice2 token2wav 声码器（兄弟 GGUF，同目录自动发现）；文本出 + `--speak` 24kHz 语音出。**TTS 必须官方采样参数**（贪心会码塌缩）。对拍：文本贪心 "Paris" 与官方一致、视觉重采样 cos 0.99994、音频投影 cos 0.9999980、同噪声声码器门 mel cos 0.999999986。量化两档：q8_0 10.09GB（仅视觉 fc2×27 保 F16）+ q6k_mixed 8.19GB（1152 系×136+fc2 F16）。转换 `convert/convert_minicpmo45.py`。预置权重：`modelscope download --model SkyContact/MiniCPM-o-4.5-GGUF`（HF 同名，含 tokenizer 与声码器） |
+| **DiffusionGemma 26B-A4B-it** | `diffusiongemma`（`diffusion_gemma`） | 图像 + 文本 | Google 的**块扩散（block-diffusion）解码器，不是自回归**：同一套 30 层稀疏 MoE 主干（hidden 2816、128 专家 top-8 + 并行的 dense MLP 双 FFN、SWA 8×256/窗 1024 与 full 2×512/theta 1e6 proportional 0.25 交织、三明治 post-norm、logit softcap 30、tied embedding ×sqrt(2816)）被跑两遍——encoder 因果 prefill 写 KV，canvas decoder 对 256 token 的块做**双向注意力**去噪（只读同一份 KV）；每块最多 48 步，EntropyBound 采样（熵界 0.1、温度 0.8→0.4 线性退火、未接受 token 重加噪）+ "稳定且自信"自适应停止，self-conditioning 吃上一步 logits 的嵌入期望；块定稿后 argmax canvas 追加进序列并重新按因果编码覆盖 KV 暂存槽。视觉走 Gemma4 塔（27 层 d=1152、patch16、学习式 2D 位置表、轴向 2D RoPE、3×3 空间池化 → 280 soft token）。转换 `convert/convert_diffusiongemma.py`；`DG_STEPS` / `DG_SC_TOPK` 可调去噪步数与 self-conditioning 截断 |
 | **SmolVLM（256M，Idefics3）** | `smolvlm` | 图像 | 目前最小的可用后端：SigLIP-base 视觉塔（12 层、patch16、512²、learned pos、LN/注意力/MLP 全带 bias、`gelu_tanh`）+ **4×4 pixel shuffle** 连接器（12288→576）+ SmolLM2-135M 文本主干（30 层、无 bias、GQA 9:3、rope 1e5）。预处理按官方 Idefics3：长边缩到 **2048** → 补齐到 512 的倍数 → 切 **512² 瓦片**（行优先）+ 一张全局视图，每块 64 token。f16 515 MB / q8 ≈ 270 MB |
 | **EmbeddingGemma-2（740M）** | `embgemma2` | 图像 + 视频 + 音频 + 文本（嵌入） | 多模态嵌入模型（不生成文本）：Gemma3 文本塔（24 层 d=512、GQA 4:1、SWA/full 交错、**逐层 PLE**）+ Gemma4 ViT（16 层 patch16、轴向 2D RoPE、3×3 位置池化）+ Gemma4 音频塔（USM conformer：双 3×3 stride-2 卷积子采样 + 12 层 macaron FFN×2 / LightConv1d / **分块局部注意力 + Transformer-XL 相对位置偏置**，ClippableLinear 全程带 clamp）。`--embed` 输出 768 维（Matryoshka 可截 512/256/128/64）、`--embed-preset` 官方任务前缀、`--embed-file` 批量 JSONL。四模态对 fp32 HF 参考 **0.99999+** |
 | **Keye-VL-2.0（30B-A3B）** | `keye-vl2` | 图像 + 视频 | 快手 Keye-VL-2.0-30B-A3B：Qwen3 式 **MoE 文本主干**（48 层、128 路由专家激活 8、norm-topk softmax 路由、mRoPE 16/24/24 theta 1e7、per-head qk-norm）+ 每层 **DSA lightning indexer 稀疏注意力**（16 头×64 维、Walsh-Hadamard 旋转 MQA indexer、top-2048 KV 稀疏掩码、独立 indexer K 缓存）+ SigLIP-so400m 系视觉塔（27 层 patch14、ViT 内 2D mRoPE、729 学习式位置表双线性插值、post-LN、2×2 merge + GELU 投影）。视频=官方默认逐帧路径（mRoPE 官方 get_rope_index 逐位对齐；官方 packing 表在该路径为死代码；opt-in fast 双流未实现）+ `<|frame|><hh:mm:ss>` 时间戳标记；图像 mRoPE 为 (t=base, y=base+row, x=base+col) 布局；image_pad 按 id 注入不走文本往返（Qwen 分词器会吞掉该 piece）。**官方 GGUF 直接用**（`Kwai-Keye/Keye-VL-2.0-30B-A3B-GGUF` + 同仓 tokenizer.json；mmproj 姊妹文件自动发现）。19GB 检查点放不进 12GB 显卡时有三种放置：默认自动回退纯 CPU（decode ~28 tok/s）；`VQA_SPLIT=1` 稠密权重上 GPU + 专家留内存（`ggml_backend_sched` 按权重归属分流）；`KEYE_EXPERTCACHE=1` **专家粒度 GPU 驻留缓存**（ExpertCache：LRU + 异步预取 + slot 表 `mul_mat_id` 批处理，命中 CUDA 后端 mul_mat_id+GLU 融合，12GB 卡 decode ~19 tok/s） |
@@ -76,6 +78,42 @@ stdio JSON-RPC 服务，暴露 9 个工具（看图问答 / 图像描述 / 目�
 <|think>
 <turn\|>
 ` 开局，输出剥离 `<|channel>thought` 块。CUDA fattn 需 KV 视图与 mask 宽度按 FATTN_KQ_STRIDE(256) 对齐（mask 补列 -inf 惰性）。f16 24 GB / q6_K 9.8 GB（12GB 卡 decode 36 tok/s）。转换 `convert/convert_gemma4.py`（f16/q8_0/q6_K/q4_0），对拍裁判=llama.cpp 上游 mtmd-cli（文本/图像）+ 官方 Gemma4UnifiedProcessor 5.21.0.dev0（视频逐位）
+
+### DiffusionGemma：放置、性能与限制
+
+**放置**。q8_0 档权重 28.89 GB，12 GB 级显卡容纳不下，因此 CUDA 构建默认使用**两段式放置**：视觉塔（1.19 GB）及其计算图在 `CUDA0` 上，语言主干（27.70 GB）留在 host mmap 由 CPU 后端计算。每张计算图只属于一个后端，两个阶段之间没有跨后端张量拷贝（encoder / decoder 只在 CPU，vision / projection 只在卡上）。
+
+| 开关 | 放置 |
+|---|---|
+| `--cpu` | 全部 CPU |
+| 默认（CUDA 构建） | 视觉塔 → 显卡，语言主干 → host mmap |
+| `DG_GPU=1` | 全部上卡（约需 30 GB VRAM） |
+| `DG_TEXT_GPU=1` | 语言主干也上卡（仅大显存机器有意义） |
+| `DG_ALL_HOST=1` | 参考路径：忽略设备后端，全部 CPU |
+
+**性能**（i7-14700K 20C/28T、RTX 4070 SUPER 12 GB、q8_0 档）：
+
+| 场景 | 默认（两段式） | `--cpu` |
+|---|---|---|
+| 文本 prefill，26 token | 1.7 s | 1.8 s |
+| 单个去噪步 | 4.0 s | 4.0 s |
+| 一个 canvas（256 槽，7–21 步） | 28–85 s | 28–79 s |
+| 视觉塔，260 soft token | **0.24 s** | 7.03 s |
+| 端到端图像问答（单图、一句话） | ≈90 s | ≈91 s |
+
+这里的成本单元是**去噪步**而非 token：一个 canvas 一次性产出 256 个槽位，其中只有少数是有效答案 token，所以约 0.27–0.39 的 tok/s 不能与自回归后端横向比较。端到端时间几乎全部来自 CPU 上的主干（每步 256 token × 约 4B 激活参数）；视觉塔上卡快约 29×，但单图只省下约 7 s。要提高吞吐需要把主干也放上卡（`DG_GPU=1` / `DG_TEXT_GPU=1`）。引擎会打印 `[perf] vision … / prefill … / decode …` 三段分解。
+
+**量化**：dense 权重与专家表 Q8_0；视觉塔与 tied embedding 保持 F16（`t.embed` 同时充当 lm_head，F16 可避免 logits 的量化噪声）。
+
+**验证**：视觉塔与官方 `Gemma4VisionModel` 对拍 `corr = 0.999991`（`scripts/parity_diffusiongemma_vision.py`）；端到端 `test_shapes.png` → "This image features a red circle, a blue square, and a black triangle against a light gray background."
+
+**已知限制**
+
+- 视频按单帧处理（取第 0 帧），checkpoint 只有一条图像路径。
+- 输出以 canvas（256 槽）为粒度，短回答也要付一次完整去噪。
+- 主干留在 CPU 时约 4 s/步，长回答的端到端时间以分钟计。
+
+**调试开关**：`DG_VISION_LAYERS=N`、`DG_VISION_SKIP=mlp|attn|all|pos`、`DG_VISION_CONST=1`、`DG_VISION_GRID="w h"`、`DG_VISION_ECHO=1`、`DG_VISION_ONLY=1`、`DG_DUMP_WEIGHTS=<dir>`、`DG_DUMP_DIR=<dir>`（配合 `scripts/ref_diffusiongemma.py` 与 `scripts/parity_diffusiongemma_vision.py` 使用）。
 
 ## 当前状态
 
@@ -975,6 +1013,7 @@ CPU 上 Q8_0 的 VideoChat3-4B 受内存带宽限制；换成更小的量化或 
 | VideoChat3-4B Q8_0（4.83GB） | CPU 14 线程 | i7-14700K | ~71 tok/s | ~10.4 tok/s |
 | VideoChat3-4B Q8_0（4.83GB） | CUDA | RTX 4070 SUPER | ~401 tok/s | ~49.8 tok/s |
 | Marlin-2B Q8_0（2.67GB） | CUDA | RTX 5070 Ti Laptop | ~9.7k tok/s | ~121 tok/s（视觉编码 112ms/300tok） |
+| DiffusionGemma 26B-A4B Q8_0（28.89GB） | 两段式（塔 CUDA / 主干 CPU 28 线程） | i7-14700K + RTX 4070 SUPER | 26 tok 1.7 s | 4.0 s/去噪步（≈0.27–0.39 tok/s） |
 
 每次推理都会在 stderr 打印一行 `[perf] prefill ... | decode ...`，便于自行核对。
 moondream3.1 的数字见[当前状态](#当前状态)（官方标注来自 5070 Ti Laptop）。
